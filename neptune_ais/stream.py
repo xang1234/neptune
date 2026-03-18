@@ -220,7 +220,13 @@ class NeptuneStream:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         self._running = False
-        # Signal the queue that we're done.
+        # Drain any remaining messages and put a single sentinel.
+        # This ensures no orphaned sentinels accumulate.
+        while not self._message_queue.empty():
+            try:
+                self._message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         await self._message_queue.put(None)
         logger.info(
             "NeptuneStream stopped: %d messages received, %d delivered, %d deduped",
@@ -235,6 +241,8 @@ class NeptuneStream:
         return self
 
     async def __anext__(self) -> dict[str, Any]:
+        if not self._running and self._message_queue.empty():
+            raise StopAsyncIteration
         msg = await self._message_queue.get()
         if msg is None:
             raise StopAsyncIteration
@@ -260,7 +268,7 @@ class NeptuneStream:
             return False
 
         # Evict oldest hash if window is full.
-        if len(self._dedup_queue) == self._config.dedup_window_size:
+        if len(self._dedup_queue) == self._dedup_queue.maxlen:
             self._dedup_set.discard(self._dedup_queue[0])
         self._dedup_queue.append(msg_hash)
         self._dedup_set.add(msg_hash)

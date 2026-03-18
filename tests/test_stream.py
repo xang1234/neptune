@@ -224,21 +224,18 @@ class TestIngestion:
 
 class TestAsyncIteration:
     def test_iterate_messages(self):
+        """Ingest messages, then use run_sink to consume them."""
         async def _test():
+            sink = MockSink()
             async with NeptuneStream() as stream:
                 await stream.ingest(_sample_message(mmsi=111))
                 await stream.ingest(_sample_message(mmsi=222))
+                await stream.run_sink(sink, max_messages=2)
 
-                stream._running = False
-                await stream._message_queue.put(None)
-
-                messages = []
-                async for msg in stream:
-                    messages.append(msg)
-
-                assert len(messages) == 2
-                assert messages[0]["mmsi"] == 111
-                assert messages[1]["mmsi"] == 222
+            assert sink.total_messages == 2
+            msgs = [m for batch in sink.batches for m in batch]
+            assert msgs[0]["mmsi"] == 111
+            assert msgs[1]["mmsi"] == 222
         _run(_test())
 
 
