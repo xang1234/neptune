@@ -153,7 +153,10 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
     # Parse timestamp. AISStream uses "2022-12-29 18:22:32.318353 +0000 UTC".
     time_str = meta.get("time_utc", "")
     try:
-        cleaned = time_str.replace(" UTC", "").strip().replace(" ", "T")
+        cleaned = time_str.strip()
+        if cleaned.endswith(" UTC"):
+            cleaned = cleaned[:-4]
+        cleaned = cleaned.replace(" ", "T", 1)  # date-time boundary only
         ts = datetime.fromisoformat(cleaned)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)

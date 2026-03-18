@@ -119,11 +119,12 @@ def capabilities(source_id: str) -> SourceCapabilities:
 def compare(*source_ids: str) -> list[dict[str, str]]:
     """Return side-by-side capability summaries for the given sources.
 
-    If no source_ids are given, compares all registered sources.
-    Returns a list of dicts (one per source) suitable for table display.
+    If no source_ids are given, compares all registered sources
+    (archival + streaming). Returns a list of dicts suitable for
+    table display.
     """
-    ids = list(source_ids) if source_ids else sorted(_ADAPTERS)
-    return [get_adapter(sid).capabilities.summary() for sid in ids]
+    ids = list(source_ids) if source_ids else registered_sources()
+    return [info(sid).summary() for sid in ids]
 
 
 def registered_sources() -> list[str]:
