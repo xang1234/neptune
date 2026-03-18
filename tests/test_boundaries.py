@@ -166,9 +166,21 @@ class TestBboxContains:
     def test_on_boundary_inclusive(self):
         assert _bbox_contains((0.0, 0.0, 10.0, 10.0), 0.0, 0.0)
         assert _bbox_contains((0.0, 0.0, 10.0, 10.0), 10.0, 10.0)
+        # Isolate lat boundary (lon in middle).
+        assert _bbox_contains((0.0, 0.0, 10.0, 10.0), 10.0, 5.0)
+        # Isolate lon boundary (lat in middle).
+        assert _bbox_contains((0.0, 0.0, 10.0, 10.0), 5.0, 10.0)
 
     def test_outside_longitude(self):
         assert not _bbox_contains((0.0, 0.0, 10.0, 10.0), 5.0, 15.0)
+
+    def test_asymmetric_bbox(self):
+        """Verify lat and lon are not swapped — asymmetric bbox."""
+        # bbox: west=1, south=40, east=5, north=42
+        # Point lat=41 (in lat range), lon=3 (in lon range) → inside
+        assert _bbox_contains((1.0, 40.0, 5.0, 42.0), 41.0, 3.0)
+        # Point lat=3 (outside lat range), lon=41 (outside lon range) → outside
+        assert not _bbox_contains((1.0, 40.0, 5.0, 42.0), 3.0, 41.0)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +283,16 @@ class TestLookupColumn:
         assert result.dtype == pl.String
         assert result.name == "region"
 
+    def test_null_coordinates_return_none(self):
+        reg = BoundaryRegistry()
+        reg.register(_port_dataset())
+        df = pl.DataFrame({
+            "lat": pl.Series([51.9, None, 1.3], dtype=pl.Float64),
+            "lon": pl.Series([4.0, 4.0, None], dtype=pl.Float64),
+        })
+        result = reg.lookup_column(df, "world_ports")
+        assert result.to_list() == ["Rotterdam", None, None]
+
     def test_empty_dataframe(self):
         reg = BoundaryRegistry()
         reg.register(_port_dataset())
@@ -290,10 +312,6 @@ class TestProvenanceIntegration:
 
     def test_provenance_tag_in_event_upstream(self):
         from neptune_ais.derive.events import EventProvenance
-
-        reg = BoundaryRegistry()
-        reg.register(_eez_dataset())
-        tags = reg.provenance_tags()
 
         prov = EventProvenance(
             source="noaa",

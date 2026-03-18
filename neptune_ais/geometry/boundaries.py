@@ -213,6 +213,9 @@ class BoundaryRegistry:
 
         results: list[str | None] = []
         for lat, lon in zip(lats, lons):
+            if lat is None or lon is None:
+                results.append(None)
+                continue
             found = None
             for region in ds.regions:
                 if _bbox_contains(region.bbox, lat, lon):
