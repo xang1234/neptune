@@ -20,7 +20,7 @@ containment. Without shapely, only bounding-box containment is available.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import polars as pl
@@ -189,8 +189,10 @@ class BoundaryRegistry:
     ) -> pl.Series:
         """Add a region-name column by looking up each row's (lat, lon).
 
-        Returns a String Series with the region name for each row, or
-        None if no region in the named dataset contains the point.
+        Returns a String Series with the **first matching** region name
+        for each row, or None if no region in the named dataset contains
+        the point. Unlike ``lookup()`` which returns all matches, this
+        method returns at most one region per row (first match wins).
 
         This is a row-level operation suitable for small-to-medium
         DataFrames. For large datasets, consider spatial indexing.
@@ -253,6 +255,9 @@ def _bbox_contains(
     return south <= lat <= north and west <= lon <= east
 
 
+_shapely_Point: Any = None
+
+
 def _point_in_geometry(geometry: Any, lat: float, lon: float) -> bool:
     """Check if a point is within a shapely geometry.
 
@@ -267,9 +272,12 @@ def _point_in_geometry(geometry: Any, lat: float, lon: float) -> bool:
     Raises:
         ImportError: If shapely is not installed.
     """
-    try:
-        from shapely.geometry import Point
-    except ImportError:
-        raise _missing_geo_extra("shapely") from None
+    global _shapely_Point
+    if _shapely_Point is None:
+        try:
+            from shapely.geometry import Point
+        except ImportError:
+            raise _missing_geo_extra("shapely") from None
+        _shapely_Point = Point
 
-    return geometry.contains(Point(lon, lat))
+    return geometry.contains(_shapely_Point(lon, lat))

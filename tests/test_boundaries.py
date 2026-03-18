@@ -97,11 +97,9 @@ class TestBoundaryDataset:
         ds = _port_dataset()
         assert ds.provenance_tag() == "world_ports/2024.1"
 
-    def test_provenance_tag_format(self):
+    def test_provenance_tag_eez(self):
         ds = _eez_dataset()
-        tag = ds.provenance_tag()
-        assert "/" in tag
-        assert tag == "eez/11.0"
+        assert ds.provenance_tag() == "eez/11.0"
 
     def test_frozen(self):
         ds = _port_dataset()
