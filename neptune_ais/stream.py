@@ -464,7 +464,6 @@ async def run_with_reconnect(
     delivered_baseline = stream.stats.messages_delivered
 
     while stream.is_running:
-        delivered_before = stream.stats.messages_delivered
         try:
             await connect_fn()
             # Normal exit — save checkpoint and stop.
