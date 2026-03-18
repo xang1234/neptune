@@ -258,79 +258,47 @@ class TestCatalogRegistration:
 
 
 class TestEventCacheKey:
+    # Shared baseline kwargs — sensitivity tests override one field at a time.
+    _BASE = dict(
+        event_type="port_call",
+        source="noaa",
+        date="2024-06-15",
+        config_hash="abc",
+        upstream_schema_version="tracks/v1",
+        events_schema_version="events/v1",
+        upstream_manifest_hash="def",
+    )
+
     def test_cache_key_format(self):
-        key = EventCacheKey(
-            event_type="port_call",
-            source="noaa",
-            date="2024-06-15",
-            config_hash="abc123",
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1",
-            upstream_manifest_hash="def456",
-        )
-        ck = key.cache_key()
+        ck = EventCacheKey(**self._BASE).cache_key()
         assert isinstance(ck, str)
         assert len(ck) == 16
         assert all(c in "0123456789abcdef" for c in ck)
 
     def test_cache_key_deterministic(self):
-        kwargs = dict(
-            event_type="port_call",
-            source="noaa",
-            date="2024-06-15",
-            config_hash="abc",
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1",
-            upstream_manifest_hash="def",
+        assert (
+            EventCacheKey(**self._BASE).cache_key()
+            == EventCacheKey(**self._BASE).cache_key()
         )
-        assert EventCacheKey(**kwargs).cache_key() == EventCacheKey(**kwargs).cache_key()
 
     def test_cache_key_changes_with_event_type(self):
-        base = dict(
-            source="noaa", date="2024-06-15", config_hash="abc",
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1",
-            upstream_manifest_hash="def",
-        )
-        a = EventCacheKey(event_type="port_call", **base).cache_key()
-        b = EventCacheKey(event_type="encounter", **base).cache_key()
+        a = EventCacheKey(**{**self._BASE, "event_type": "port_call"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "event_type": "encounter"}).cache_key()
         assert a != b
 
     def test_cache_key_changes_with_config(self):
-        base = dict(
-            event_type="port_call", source="noaa", date="2024-06-15",
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1",
-            upstream_manifest_hash="def",
-        )
-        a = EventCacheKey(config_hash="abc", **base).cache_key()
-        b = EventCacheKey(config_hash="xyz", **base).cache_key()
+        a = EventCacheKey(**{**self._BASE, "config_hash": "abc"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "config_hash": "xyz"}).cache_key()
         assert a != b
 
     def test_cache_key_changes_with_upstream_hash(self):
-        base = dict(
-            event_type="port_call", source="noaa", date="2024-06-15",
-            config_hash="abc",
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1",
-        )
-        a = EventCacheKey(upstream_manifest_hash="hash1", **base).cache_key()
-        b = EventCacheKey(upstream_manifest_hash="hash2", **base).cache_key()
+        a = EventCacheKey(**{**self._BASE, "upstream_manifest_hash": "hash1"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "upstream_manifest_hash": "hash2"}).cache_key()
         assert a != b
 
     def test_cache_key_changes_with_schema_version(self):
-        base = dict(
-            event_type="port_call", source="noaa", date="2024-06-15",
-            config_hash="abc", upstream_manifest_hash="def",
-        )
-        a = EventCacheKey(
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v1", **base
-        ).cache_key()
-        b = EventCacheKey(
-            upstream_schema_version="tracks/v1",
-            events_schema_version="events/v2", **base
-        ).cache_key()
+        a = EventCacheKey(**{**self._BASE, "events_schema_version": "events/v1"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "events_schema_version": "events/v2"}).cache_key()
         assert a != b
 
     def test_from_manifest_factory(self):

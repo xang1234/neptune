@@ -12,6 +12,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+from neptune_ais.datasets.events import SCHEMA_VERSION as _EVENTS_SCHEMA_VERSION
+from neptune_ais.datasets.tracks import SCHEMA_VERSION as _TRACKS_SCHEMA_VERSION
+
 
 # ---------------------------------------------------------------------------
 # Event cache key — determines when cached events are valid
@@ -98,8 +101,8 @@ class EventCacheKey:
         date: str,
         config_hash: str,
         upstream_manifest_hash: str,
-        upstream_schema_version: str = "tracks/v1",
-        events_schema_version: str = "events/v1",
+        upstream_schema_version: str = _TRACKS_SCHEMA_VERSION,
+        events_schema_version: str = _EVENTS_SCHEMA_VERSION,
     ) -> EventCacheKey:
         """Create a cache key from an upstream manifest and detector config.
 
