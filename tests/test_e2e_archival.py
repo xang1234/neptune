@@ -14,6 +14,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
+import pytest
+
+try:
+    import duckdb  # noqa: F401
+    _has_duckdb = True
+except ImportError:
+    _has_duckdb = False
+
+try:
+    import click  # noqa: F401
+    _has_click = True
+except ImportError:
+    _has_click = False
 
 from neptune_ais.adapters.base import RawArtifact
 from neptune_ais.adapters.noaa import NOAAAdapter
@@ -120,6 +133,7 @@ def test_noaa_normalize_vessels():
         assert "record_provenance" in vessels.columns
 
 
+@pytest.mark.skipif(not _has_duckdb, reason="duckdb not installed")
 def test_end_to_end_archival_pipeline():
     """Full pipeline: write synthetic data → catalog → query → inspect."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -255,6 +269,8 @@ def test_end_to_end_archival_pipeline():
         assert health == [], f"Unexpected health issues: {health}"
 
 
+@pytest.mark.skipif(not _has_click, reason="click not installed (cli extra)")
+@pytest.mark.skipif(not _has_duckdb, reason="duckdb not installed")
 def test_cli_commands():
     """Test CLI commands with --cache-dir pointing to synthetic data."""
     from click.testing import CliRunner

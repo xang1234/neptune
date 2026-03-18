@@ -12,6 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
+import pytest
+
+try:
+    import duckdb  # noqa: F401
+    _has_duckdb = True
+except ImportError:
+    _has_duckdb = False
 
 from neptune_ais.adapters.base import RawArtifact, SourceAdapter
 from neptune_ais.adapters.dma import DMAAdapter, SOURCE_ID
@@ -273,6 +280,9 @@ def test_dma_noaa_schema_compatibility():
         assert len(combined) == len(dma_df) + len(noaa_df)
 
 
+@pytest.mark.skipif(
+    not _has_duckdb, reason="duckdb not installed"
+)
 def test_dma_multi_source_catalog():
     """DMA and NOAA partitions coexist in the same catalog."""
     with tempfile.TemporaryDirectory() as tmp:
