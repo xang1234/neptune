@@ -343,20 +343,31 @@ def detect_port_calls(
     if len(df) == 0:
         return pl.DataFrame(schema=SCHEMA)
 
+    # Ensure sorted by (mmsi, timestamp) after filtering.
+    df = df.sort(["mmsi", "timestamp"])
+
     # Step 3: detect boundaries between port-call groups.
+    # Use .over("mmsi") for timestamp diff so vessel boundaries are
+    # handled correctly even if vessels are interleaved.
     gap_us = config.gap_seconds * 1_000_000
 
+    df = df.with_columns(
+        pl.col("timestamp").diff().dt.total_microseconds()
+        .over("mmsi")
+        .alias("_dt_us"),
+    )
     df = df.with_columns(
         (
             (pl.col("mmsi") != pl.col("mmsi").shift(1))
             | (pl.col("_port_region") != pl.col("_port_region").shift(1))
-            | pl.col("timestamp").diff().dt.total_microseconds().is_null()
-            | (pl.col("timestamp").diff().dt.total_microseconds() > gap_us)
+            | pl.col("_dt_us").is_null()
+            | (pl.col("_dt_us") > gap_us)
         )
         .cast(pl.Int64)
         .cum_sum()
         .alias("_group_id")
     )
+    df = df.drop("_dt_us")
 
     # Step 4: aggregate each group into a candidate event.
     candidates = df.group_by("_group_id").agg(
@@ -386,9 +397,8 @@ def detect_port_calls(
         return pl.DataFrame(schema=SCHEMA)
 
     # Step 6: compute confidence and build output.
-    # Confidence based on: duration (longer = more confident),
-    # point count (more points = more confident),
-    # mean speed (lower = more confident).
+    # Confidence is based on stay duration:
+    #   >= 4 hours → 0.9 (high), >= 2 hours → 0.7, else → 0.5 (medium).
     candidates = candidates.with_columns(
         (
             pl.when(pl.col("_duration_s") >= 14400)  # >= 4 hours

@@ -202,11 +202,11 @@ class TestDetectPortCalls:
     def test_temporal_bounds(self):
         events = self._detect()
         assert (events[EventCol.START_TIME] <= events[EventCol.END_TIME]).all()
-        # Start should be around minute 10, end around minute 130.
+        # In-port positions span minutes 10–130 (120 min = 7200s).
         start = events[EventCol.START_TIME][0]
         end = events[EventCol.END_TIME][0]
         duration = (end - start).total_seconds()
-        assert duration >= 3600  # at least 1 hour
+        assert duration >= 7000  # full 2-hour stay captured (with rounding)
 
     def test_representative_location(self):
         events = self._detect()
@@ -351,6 +351,11 @@ class TestPortCallFiltering:
         })
         events = self._detect(positions)
         assert len(events) == 2
+        # Both events are for vessel 111.
+        assert (events[EventCol.MMSI] == 111).all()
+        # Second event starts after first event ends (no overlap).
+        sorted_events = events.sort(EventCol.START_TIME)
+        assert sorted_events[EventCol.START_TIME][1] > sorted_events[EventCol.END_TIME][0]
 
     def test_empty_positions(self):
         """Empty positions → empty events."""
