@@ -81,10 +81,11 @@ def _rich_positions() -> pl.DataFrame:
     for i in range(11):
         rows.append((333, _ts(i * 6), 30.0 + i * 0.0001, -80.0 + i * 0.0001, 0.3, "noaa"))
 
-    # Encounter: vessels 111 and 222 near each other (lat ~52.0, lon ~4.5)
-    for i in range(7):
-        rows.append((111, _ts(200 + i * 5), 52.0, 4.5, 1.0, "noaa"))
-        rows.append((222, _ts(200 + i * 5), 52.001, 4.501, 1.0, "noaa"))
+    # Encounter: vessels 111 and 222 near each other (lat ~52.0, lon ~4.5).
+    # Use 2-min spacing (not 5-min) to avoid time_bucket_s boundary issues.
+    for i in range(15):
+        rows.append((111, _ts(200 + i * 2), 52.0, 4.5, 1.0, "noaa"))
+        rows.append((222, _ts(200 + i * 2), 52.001, 4.501, 1.0, "noaa"))
 
     return pl.DataFrame({
         "mmsi": pl.Series([r[0] for r in rows], dtype=pl.Int64),
@@ -205,15 +206,15 @@ class TestConfidenceRegression:
     """Verify specific confidence behaviors across detectors."""
 
     def test_port_call_confidence_tiers(self):
-        """Port call: 2h stay → 0.7, 5h stay → 0.9."""
+        """Port call: 2h stay → confidence 0.7 (>= 7200s tier)."""
         positions = _rich_positions()
         reg = _boundary_registry()
         port_regions = reg.lookup_column(positions, "ports")
         events = detect_port_calls(positions, port_regions, source="noaa")
         assert len(events) > 0, "detector produced no events — check fixture"
-        for score in events[EventCol.CONFIDENCE_SCORE].to_list():
-            band = classify_confidence(score)
-            assert band in ("high", "medium"), f"Unexpected band: {band} for score {score}"
+        # Fixture has a 2-hour stay → hits the >= 7200s tier (0.7).
+        score = events[EventCol.CONFIDENCE_SCORE][0]
+        assert score == 0.7, f"Expected 0.7 for 2h stay, got {score}"
 
     def test_loitering_confidence_bands(self):
         """Loitering: 1h tight cluster → at least medium confidence."""
@@ -361,11 +362,17 @@ class TestEventIdDeterminism:
         assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
 
     def test_ids_change_with_config(self):
-        """Different configs produce different event IDs."""
+        """Different configs produce different event IDs via config_hash.
+
+        Uses two configs that detect the same events (fixture loitering
+        duration exceeds both thresholds) but differ in config_hash.
+        """
         positions = _rich_positions()
-        a = detect_loitering(positions, config=LoiteringConfig(max_speed_knots=2.0), source="noaa")
-        b = detect_loitering(positions, config=LoiteringConfig(max_speed_knots=5.0), source="noaa")
+        a = detect_loitering(positions, config=LoiteringConfig(min_duration_s=1800), source="noaa")
+        b = detect_loitering(positions, config=LoiteringConfig(min_duration_s=1799), source="noaa")
         assert len(a) > 0 and len(b) > 0, "detectors produced no events — check fixture"
+        # Same events detected, but different config_hash → different IDs.
+        assert len(a) == len(b), "Expected same event count for both configs"
         ids_a = set(a[EventCol.EVENT_ID].to_list())
         ids_b = set(b[EventCol.EVENT_ID].to_list())
         assert ids_a != ids_b
