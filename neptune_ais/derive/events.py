@@ -10,7 +10,7 @@ Individual event detectors will be added in subsequent tasks.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from neptune_ais.datasets.events import SCHEMA_VERSION as _EVENTS_SCHEMA_VERSION
 from neptune_ais.datasets.tracks import SCHEMA_VERSION as _TRACKS_SCHEMA_VERSION
@@ -126,3 +126,106 @@ class EventCacheKey:
             events_schema_version=events_schema_version,
             upstream_manifest_hash=upstream_manifest_hash,
         )
+
+
+# ---------------------------------------------------------------------------
+# Event provenance — structured lineage for inferred events
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EventProvenance:
+    """Structured provenance for an inferred event.
+
+    Captures enough context to explain *how* an event was detected and
+    *from what data*, without requiring access to the original detector
+    state. Serializes to a compact ``record_provenance`` string.
+
+    Token format::
+
+        <source>:<detector>/<version>[<upstream>]
+
+    Examples::
+
+        "noaa:port_call_detector/0.1.0[tracks]"
+        "dma:encounter_detector/0.2.0[positions]"
+        "noaa:loitering_detector/0.1.0[tracks+boundaries]"
+
+    The token is designed to be:
+    - Human-readable in a DataFrame column.
+    - Parseable back into components via ``parse_provenance()``.
+    - Compatible with the fusion provenance token format (both use
+      ``source:tag`` as the leading structure).
+
+    Usage::
+
+        prov = EventProvenance(
+            source="noaa",
+            detector="port_call_detector",
+            detector_version="0.1.0",
+            upstream_datasets=["tracks"],
+        )
+        token = prov.to_token()  # "noaa:port_call_detector/0.1.0[tracks]"
+    """
+
+    source: str
+    """Source identifier for the upstream data."""
+
+    detector: str
+    """Detector name (e.g. ``"port_call_detector"``)."""
+
+    detector_version: str
+    """Detector version string (e.g. ``"0.1.0"``)."""
+
+    upstream_datasets: list[str] = field(default_factory=lambda: ["tracks"])
+    """Upstream datasets this event was derived from.
+    Common values: ``["tracks"]``, ``["positions"]``,
+    ``["tracks", "boundaries"]``."""
+
+    def to_token(self) -> str:
+        """Serialize to a compact provenance token string.
+
+        Returns:
+            A string like ``"noaa:port_call_detector/0.1.0[tracks]"``.
+        """
+        upstream = "+".join(sorted(self.upstream_datasets))
+        return f"{self.source}:{self.detector}/{self.detector_version}[{upstream}]"
+
+
+def parse_provenance(token: str) -> EventProvenance:
+    """Parse a provenance token back into an ``EventProvenance``.
+
+    Args:
+        token: A provenance string produced by ``EventProvenance.to_token()``.
+
+    Returns:
+        An ``EventProvenance`` instance.
+
+    Raises:
+        ValueError: If the token cannot be parsed.
+
+    Example::
+
+        prov = parse_provenance("noaa:port_call_detector/0.1.0[tracks]")
+        assert prov.source == "noaa"
+        assert prov.detector == "port_call_detector"
+        assert prov.detector_version == "0.1.0"
+        assert prov.upstream_datasets == ["tracks"]
+    """
+    try:
+        source, rest = token.split(":", 1)
+        # rest = "port_call_detector/0.1.0[tracks]"
+        detector_and_version, bracket_part = rest.split("[", 1)
+        upstream_str = bracket_part.rstrip("]")
+        detector, version = detector_and_version.split("/", 1)
+        upstream = sorted(upstream_str.split("+"))
+        return EventProvenance(
+            source=source,
+            detector=detector,
+            detector_version=version,
+            upstream_datasets=upstream,
+        )
+    except (ValueError, IndexError) as e:
+        raise ValueError(
+            f"Cannot parse event provenance token: {token!r}"
+        ) from e

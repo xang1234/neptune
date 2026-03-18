@@ -13,6 +13,9 @@ import pytest
 from neptune_ais.catalog import current_schema_version, is_compatible
 from neptune_ais.datasets.events import (
     Col,
+    CONFIDENCE_BANDS,
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
     DATASET_NAME,
     EVENT_TYPE_PORT_CALL,
     EVENT_TYPE_EEZ_CROSSING,
@@ -24,10 +27,15 @@ from neptune_ais.datasets.events import (
     SCHEMA,
     SCHEMA_VERSION,
     VALID_RANGES,
+    classify_confidence,
     make_event_id,
     validate_schema,
 )
-from neptune_ais.derive.events import EventCacheKey
+from neptune_ais.derive.events import (
+    EventCacheKey,
+    EventProvenance,
+    parse_provenance,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +348,132 @@ class TestEventCacheKey:
             events_schema_version="events/v1",
         )
         assert key.upstream_schema_version == "positions/v1"
+
+
+# ---------------------------------------------------------------------------
+# Confidence semantics
+# ---------------------------------------------------------------------------
+
+
+class TestConfidenceSemantics:
+    """Validate confidence bands and classification."""
+
+    def test_band_thresholds(self):
+        assert CONFIDENCE_HIGH == 0.7
+        assert CONFIDENCE_LOW == 0.3
+
+    def test_bands_cover_full_range(self):
+        """Bands should cover [0, 1] without gaps."""
+        assert CONFIDENCE_BANDS["low"] == (0.0, 0.3)
+        assert CONFIDENCE_BANDS["medium"] == (0.3, 0.7)
+        assert CONFIDENCE_BANDS["high"] == (0.7, 1.0)
+
+    def test_bands_are_contiguous(self):
+        """Each band's upper bound equals the next band's lower bound."""
+        assert CONFIDENCE_BANDS["low"][1] == CONFIDENCE_BANDS["medium"][0]
+        assert CONFIDENCE_BANDS["medium"][1] == CONFIDENCE_BANDS["high"][0]
+
+    def test_classify_high(self):
+        assert classify_confidence(0.9) == "high"
+        assert classify_confidence(0.7) == "high"
+        assert classify_confidence(1.0) == "high"
+
+    def test_classify_medium(self):
+        assert classify_confidence(0.5) == "medium"
+        assert classify_confidence(0.3) == "medium"
+        assert classify_confidence(0.69) == "medium"
+
+    def test_classify_low(self):
+        assert classify_confidence(0.1) == "low"
+        assert classify_confidence(0.0) == "low"
+        assert classify_confidence(0.29) == "low"
+
+    def test_classify_boundaries(self):
+        """Boundary values are inclusive on the lower side."""
+        assert classify_confidence(CONFIDENCE_HIGH) == "high"
+        assert classify_confidence(CONFIDENCE_LOW) == "medium"
+        assert classify_confidence(0.0) == "low"
+
+
+# ---------------------------------------------------------------------------
+# Event provenance
+# ---------------------------------------------------------------------------
+
+
+class TestEventProvenance:
+    """Validate provenance token construction and parsing."""
+
+    def test_to_token_basic(self):
+        prov = EventProvenance(
+            source="noaa",
+            detector="port_call_detector",
+            detector_version="0.1.0",
+            upstream_datasets=["tracks"],
+        )
+        assert prov.to_token() == "noaa:port_call_detector/0.1.0[tracks]"
+
+    def test_to_token_multiple_upstream(self):
+        prov = EventProvenance(
+            source="noaa",
+            detector="eez_detector",
+            detector_version="0.2.0",
+            upstream_datasets=["tracks", "boundaries"],
+        )
+        # Upstream sorted alphabetically.
+        assert prov.to_token() == "noaa:eez_detector/0.2.0[boundaries+tracks]"
+
+    def test_to_token_default_upstream(self):
+        prov = EventProvenance(
+            source="dma",
+            detector="loitering_detector",
+            detector_version="0.1.0",
+        )
+        assert prov.to_token() == "dma:loitering_detector/0.1.0[tracks]"
+
+    def test_parse_roundtrip(self):
+        original = EventProvenance(
+            source="noaa",
+            detector="port_call_detector",
+            detector_version="0.1.0",
+            upstream_datasets=["tracks"],
+        )
+        parsed = parse_provenance(original.to_token())
+        assert parsed.source == original.source
+        assert parsed.detector == original.detector
+        assert parsed.detector_version == original.detector_version
+        assert parsed.upstream_datasets == original.upstream_datasets
+
+    def test_parse_multiple_upstream(self):
+        token = "noaa:eez_detector/0.2.0[boundaries+tracks]"
+        prov = parse_provenance(token)
+        assert prov.source == "noaa"
+        assert prov.detector == "eez_detector"
+        assert prov.detector_version == "0.2.0"
+        assert prov.upstream_datasets == ["boundaries", "tracks"]
+
+    def test_parse_invalid_raises(self):
+        with pytest.raises(ValueError, match="Cannot parse"):
+            parse_provenance("not-a-valid-token")
+
+    def test_parse_missing_brackets_raises(self):
+        with pytest.raises(ValueError, match="Cannot parse"):
+            parse_provenance("noaa:detector/0.1.0")
+
+    def test_to_token_deterministic(self):
+        prov = EventProvenance(
+            source="noaa",
+            detector="detector",
+            detector_version="1.0",
+            upstream_datasets=["positions", "tracks"],
+        )
+        assert prov.to_token() == prov.to_token()
+
+    def test_upstream_sort_order(self):
+        """Upstream datasets are always sorted in the token."""
+        prov = EventProvenance(
+            source="noaa",
+            detector="det",
+            detector_version="1.0",
+            upstream_datasets=["tracks", "boundaries", "positions"],
+        )
+        assert "[boundaries+positions+tracks]" in prov.to_token()

@@ -175,6 +175,54 @@ def make_event_id(
 
 
 # ---------------------------------------------------------------------------
+# Confidence semantics — what confidence_score means for events
+# ---------------------------------------------------------------------------
+
+CONFIDENCE_HIGH = 0.7
+"""Threshold above which an event is considered high-confidence.
+High-confidence events have strong heuristic support: multiple
+confirming signals, long duration, clear spatial pattern."""
+
+CONFIDENCE_LOW = 0.3
+"""Threshold below which an event is considered low-confidence.
+Low-confidence events are speculative: sparse data, ambiguous
+pattern, or single weak signal."""
+
+CONFIDENCE_BANDS: dict[str, tuple[float, float]] = {
+    "high": (CONFIDENCE_HIGH, 1.0),
+    "medium": (CONFIDENCE_LOW, CONFIDENCE_HIGH),
+    "low": (0.0, CONFIDENCE_LOW),
+}
+"""Named confidence bands for filtering and reporting.
+
+Usage::
+
+    # Filter to high-confidence events only
+    events.filter(pl.col("confidence_score") >= CONFIDENCE_HIGH)
+
+    # Or use the band thresholds
+    lo, hi = CONFIDENCE_BANDS["medium"]
+    events.filter(pl.col("confidence_score").is_between(lo, hi))
+"""
+
+
+def classify_confidence(score: float) -> str:
+    """Classify a confidence score into a named band.
+
+    Args:
+        score: Confidence value in [0.0, 1.0].
+
+    Returns:
+        ``"high"``, ``"medium"``, or ``"low"``.
+    """
+    if score >= CONFIDENCE_HIGH:
+        return "high"
+    if score >= CONFIDENCE_LOW:
+        return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
 # Valid value ranges
 # ---------------------------------------------------------------------------
 
