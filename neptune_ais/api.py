@@ -686,10 +686,18 @@ class Neptune:
                 extra_columns="ignore",
             )
 
-        # Use self.events() to inherit bbox/mmsi filters.
+        # Scan events without instance-level MMSI filter so that
+        # encounters where the target vessel is OTHER_MMSI are included.
+        # (self.events() would pre-filter by self._mmsi on the primary
+        # MMSI column, excluding encounters where the vessel is secondary.)
         events_lf = None
-        if self._dataset_files("events"):
-            events_lf = self.events()
+        events_files = self._dataset_files("events")
+        if events_files:
+            events_lf = pl.scan_parquet(
+                events_files,
+                missing_columns="insert",
+                extra_columns="ignore",
+            )
 
         return vessel_history(
             mmsi,

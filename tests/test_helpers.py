@@ -171,6 +171,7 @@ class TestVesselHistory:
         assert "events" in hist
         events_result = hist["events"].collect()
         assert len(events_result) == 1
+        assert events_result[EventCol.MMSI][0] == 111
 
     def test_with_events_other_mmsi(self):
         """vessel_history includes events where the vessel is OTHER_MMSI."""
