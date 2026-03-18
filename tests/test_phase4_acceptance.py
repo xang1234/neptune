@@ -122,64 +122,60 @@ def _boundary_registry() -> BoundaryRegistry:
 # ---------------------------------------------------------------------------
 
 
+def _detect_all() -> pl.DataFrame:
+    """Run all 4 detectors on the rich fixture and concatenate results."""
+    positions = _rich_positions()
+    reg = _boundary_registry()
+
+    port_regions = reg.lookup_column(positions, "ports")
+    port_calls = detect_port_calls(positions, port_regions, source="noaa")
+
+    eez_regions = reg.lookup_column(positions, "eez")
+    eez_crossings = detect_eez_crossings(positions, eez_regions, source="noaa")
+
+    encounters = detect_encounters(positions, source="noaa")
+    loitering = detect_loitering(positions, source="noaa")
+
+    all_events = [df for df in [port_calls, eez_crossings, encounters, loitering] if len(df) > 0]
+    if not all_events:
+        return pl.DataFrame(schema=SCHEMA)
+    return pl.concat(all_events)
+
+
 class TestCrossDetectorIntegration:
     """Run all detectors on the same dataset and verify combined output."""
 
-    def _detect_all(self) -> pl.DataFrame:
-        positions = _rich_positions()
-        reg = _boundary_registry()
-
-        port_regions = reg.lookup_column(positions, "ports")
-        port_calls = detect_port_calls(
-            positions, port_regions, source="noaa"
-        )
-
-        eez_regions = reg.lookup_column(positions, "eez")
-        eez_crossings = detect_eez_crossings(
-            positions, eez_regions, source="noaa"
-        )
-
-        encounters = detect_encounters(positions, source="noaa")
-
-        loitering = detect_loitering(positions, source="noaa")
-
-        # Combine all events.
-        all_events = [df for df in [port_calls, eez_crossings, encounters, loitering] if len(df) > 0]
-        if not all_events:
-            return pl.DataFrame(schema=SCHEMA)
-        return pl.concat(all_events)
-
     def test_combined_schema_valid(self):
         """All detectors produce schema-conformant output that concatenates."""
-        events = self._detect_all()
+        events = _detect_all()
         errors = validate_schema(events)
         assert errors == [], f"Schema errors: {errors}"
 
     def test_required_columns_present(self):
-        events = self._detect_all()
+        events = _detect_all()
         for col in REQUIRED_COLUMNS:
             assert col in events.columns, f"Missing: {col}"
 
     def test_multiple_event_types_present(self):
         """At least 2 different event types should be detected."""
-        events = self._detect_all()
+        events = _detect_all()
         types = set(events[EventCol.EVENT_TYPE].to_list())
         assert len(types) >= 2, f"Only found: {types}"
 
     def test_event_ids_unique(self):
         """All event IDs should be unique across detectors."""
-        events = self._detect_all()
+        events = _detect_all()
         ids = events[EventCol.EVENT_ID].to_list()
         assert len(ids) == len(set(ids)), "Duplicate event IDs found"
 
     def test_all_events_have_confidence(self):
-        events = self._detect_all()
+        events = _detect_all()
         assert events[EventCol.CONFIDENCE_SCORE].is_not_null().all()
         assert (events[EventCol.CONFIDENCE_SCORE] >= 0.0).all()
         assert (events[EventCol.CONFIDENCE_SCORE] <= 1.0).all()
 
     def test_all_events_have_provenance(self):
-        events = self._detect_all()
+        events = _detect_all()
         assert events[EventCol.RECORD_PROVENANCE].is_not_null().all()
         # All provenance tokens should be parseable.
         for token in events[EventCol.RECORD_PROVENANCE].to_list():
@@ -189,11 +185,11 @@ class TestCrossDetectorIntegration:
             assert len(prov.detector_version) > 0
 
     def test_temporal_bounds_valid(self):
-        events = self._detect_all()
+        events = _detect_all()
         assert (events[EventCol.START_TIME] <= events[EventCol.END_TIME]).all()
 
     def test_spatial_bounds_valid(self):
-        events = self._detect_all()
+        events = _detect_all()
         assert (events[EventCol.LAT] >= -90).all()
         assert (events[EventCol.LAT] <= 90).all()
         assert (events[EventCol.LON] >= -180).all()
@@ -214,23 +210,23 @@ class TestConfidenceRegression:
         reg = _boundary_registry()
         port_regions = reg.lookup_column(positions, "ports")
         events = detect_port_calls(positions, port_regions, source="noaa")
-        if len(events) > 0:
-            for score in events[EventCol.CONFIDENCE_SCORE].to_list():
-                band = classify_confidence(score)
-                assert band in ("high", "medium"), f"Unexpected band: {band} for score {score}"
+        assert len(events) > 0, "detector produced no events — check fixture"
+        for score in events[EventCol.CONFIDENCE_SCORE].to_list():
+            band = classify_confidence(score)
+            assert band in ("high", "medium"), f"Unexpected band: {band} for score {score}"
 
     def test_loitering_confidence_bands(self):
         """Loitering: 1h tight cluster → at least medium confidence."""
         events = detect_loitering(_rich_positions(), source="noaa")
-        if len(events) > 0:
-            assert (events[EventCol.CONFIDENCE_SCORE] >= CONFIDENCE_LOW).all()
+        assert len(events) > 0, "detector produced no events — check fixture"
+        assert (events[EventCol.CONFIDENCE_SCORE] >= CONFIDENCE_LOW).all()
 
     def test_encounter_confidence_range(self):
         """Encounters should produce valid confidence scores."""
         events = detect_encounters(_rich_positions(), source="noaa")
-        if len(events) > 0:
-            assert (events[EventCol.CONFIDENCE_SCORE] >= 0.0).all()
-            assert (events[EventCol.CONFIDENCE_SCORE] <= 1.0).all()
+        assert len(events) > 0, "detector produced no events — check fixture"
+        assert (events[EventCol.CONFIDENCE_SCORE] >= 0.0).all()
+        assert (events[EventCol.CONFIDENCE_SCORE] <= 1.0).all()
 
     def test_classify_confidence_consistency(self):
         """classify_confidence agrees with CONFIDENCE_HIGH/LOW thresholds."""
@@ -253,39 +249,39 @@ class TestProvenanceRegression:
         reg = _boundary_registry()
         port_regions = reg.lookup_column(positions, "ports")
         events = detect_port_calls(positions, port_regions, source="noaa")
-        if len(events) > 0:
-            prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
-            assert prov.detector == "port_call_detector"
-            assert "boundaries" in prov.upstream_datasets
-            assert "positions" in prov.upstream_datasets
+        assert len(events) > 0, "detector produced no events — check fixture"
+        prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
+        assert prov.detector == "port_call_detector"
+        assert "boundaries" in prov.upstream_datasets
+        assert "positions" in prov.upstream_datasets
 
     def test_eez_crossing_provenance(self):
         positions = _rich_positions()
         reg = _boundary_registry()
         eez_regions = reg.lookup_column(positions, "eez")
         events = detect_eez_crossings(positions, eez_regions, source="noaa")
-        if len(events) > 0:
-            prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
-            assert prov.detector == "eez_crossing_detector"
-            assert "boundaries" in prov.upstream_datasets
+        assert len(events) > 0, "detector produced no events — check fixture"
+        prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
+        assert prov.detector == "eez_crossing_detector"
+        assert "boundaries" in prov.upstream_datasets
 
     def test_encounter_provenance(self):
         events = detect_encounters(_rich_positions(), source="noaa")
-        if len(events) > 0:
-            prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
-            assert prov.detector == "encounter_detector"
-            assert "positions" in prov.upstream_datasets
+        assert len(events) > 0, "detector produced no events — check fixture"
+        prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
+        assert prov.detector == "encounter_detector"
+        assert "positions" in prov.upstream_datasets
 
     def test_loitering_provenance(self):
         events = detect_loitering(_rich_positions(), source="noaa")
-        if len(events) > 0:
-            prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
-            assert prov.detector == "loitering_detector"
-            assert "positions" in prov.upstream_datasets
+        assert len(events) > 0, "detector produced no events — check fixture"
+        prov = parse_provenance(events[EventCol.RECORD_PROVENANCE][0])
+        assert prov.detector == "loitering_detector"
+        assert "positions" in prov.upstream_datasets
 
     def test_provenance_roundtrip_all_detectors(self):
         """All provenance tokens roundtrip through parse_provenance."""
-        all_events = TestCrossDetectorIntegration()._detect_all()
+        all_events = _detect_all()
         for token in all_events[EventCol.RECORD_PROVENANCE].unique().to_list():
             prov = parse_provenance(token)
             assert prov.to_token() == token
@@ -308,31 +304,31 @@ class TestEventToVizIntegration:
         assert len(result) == len(events)
 
     def test_combined_events_to_viz(self):
-        all_events = TestCrossDetectorIntegration()._detect_all()
+        all_events = _detect_all()
         result = prepare_events(all_events)
         assert len(result) == len(all_events)
 
     def test_viz_event_type_filter(self):
-        all_events = TestCrossDetectorIntegration()._detect_all()
+        all_events = _detect_all()
         for etype in [EVENT_TYPE_PORT_CALL, EVENT_TYPE_LOITERING]:
             result = prepare_events(all_events, event_type=etype)
-            if len(result) > 0:
-                assert (result[EventCol.EVENT_TYPE] == etype).all()
+            assert len(result) > 0, f"No {etype} events — check fixture"
+            assert (result[EventCol.EVENT_TYPE] == etype).all()
 
     def test_viz_viewport_clips_events(self):
-        all_events = TestCrossDetectorIntegration()._detect_all()
+        all_events = _detect_all()
         # Viewport covering only Rotterdam area.
         viewport = Viewport(west=3.5, south=51.5, east=5.0, north=52.5)
         result = prepare_events(all_events, viewport=viewport)
-        if len(result) > 0:
-            assert (result[EventCol.LAT] >= 51.5).all()
-            assert (result[EventCol.LAT] <= 52.5).all()
+        assert len(result) > 0, "No events in Rotterdam viewport — check fixture"
+        assert (result[EventCol.LAT] >= 51.5).all()
+        assert (result[EventCol.LAT] <= 52.5).all()
 
     def test_viz_confidence_filter(self):
-        all_events = TestCrossDetectorIntegration()._detect_all()
+        all_events = _detect_all()
         result = prepare_events(all_events, min_confidence=CONFIDENCE_HIGH)
-        if len(result) > 0:
-            assert (result[EventCol.CONFIDENCE_SCORE] >= CONFIDENCE_HIGH).all()
+        assert len(result) > 0, "No high-confidence events — check fixture"
+        assert (result[EventCol.CONFIDENCE_SCORE] >= CONFIDENCE_HIGH).all()
 
 
 # ---------------------------------------------------------------------------
@@ -349,27 +345,27 @@ class TestEventIdDeterminism:
         port_regions = reg.lookup_column(positions, "ports")
         a = detect_port_calls(positions, port_regions, source="noaa")
         b = detect_port_calls(positions, port_regions, source="noaa")
-        if len(a) > 0:
-            assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
+        assert len(a) > 0, "detector produced no events — check fixture"
+        assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
 
     def test_encounter_ids_stable(self):
         a = detect_encounters(_rich_positions(), source="noaa")
         b = detect_encounters(_rich_positions(), source="noaa")
-        if len(a) > 0:
-            assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
+        assert len(a) > 0, "detector produced no events — check fixture"
+        assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
 
     def test_loitering_ids_stable(self):
         a = detect_loitering(_rich_positions(), source="noaa")
         b = detect_loitering(_rich_positions(), source="noaa")
-        if len(a) > 0:
-            assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
+        assert len(a) > 0, "detector produced no events — check fixture"
+        assert a[EventCol.EVENT_ID].to_list() == b[EventCol.EVENT_ID].to_list()
 
     def test_ids_change_with_config(self):
         """Different configs produce different event IDs."""
         positions = _rich_positions()
         a = detect_loitering(positions, config=LoiteringConfig(max_speed_knots=2.0), source="noaa")
         b = detect_loitering(positions, config=LoiteringConfig(max_speed_knots=5.0), source="noaa")
-        if len(a) > 0 and len(b) > 0:
-            ids_a = set(a[EventCol.EVENT_ID].to_list())
-            ids_b = set(b[EventCol.EVENT_ID].to_list())
-            assert ids_a != ids_b
+        assert len(a) > 0 and len(b) > 0, "detectors produced no events — check fixture"
+        ids_a = set(a[EventCol.EVENT_ID].to_list())
+        ids_b = set(b[EventCol.EVENT_ID].to_list())
+        assert ids_a != ids_b
