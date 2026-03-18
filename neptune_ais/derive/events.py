@@ -441,17 +441,7 @@ def detect_port_calls(
         pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
     )
 
-    output_cols = [
-        EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
-        EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
-        EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
-        EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
-        EventCol.RECORD_PROVENANCE,
-    ]
-
-    return result.select(output_cols).sort(
-        [EventCol.MMSI, EventCol.START_TIME]
-    )
+    return _select_and_sort_events(result)
 
 
 # ---------------------------------------------------------------------------
@@ -651,17 +641,7 @@ def detect_eez_crossings(
         pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
     )
 
-    output_cols = [
-        EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
-        EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
-        EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
-        EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
-        EventCol.RECORD_PROVENANCE,
-    ]
-
-    return result.select(output_cols).sort(
-        [EventCol.MMSI, EventCol.START_TIME]
-    )
+    return _select_and_sort_events(result)
 
 
 # ---------------------------------------------------------------------------
@@ -899,14 +879,222 @@ def detect_encounters(
         pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
     )
 
-    output_cols = [
-        EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
-        EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
-        EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
-        EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
-        EventCol.RECORD_PROVENANCE,
-    ]
+    return _select_and_sort_events(result)
 
-    return result.select(output_cols).sort(
+
+# ---------------------------------------------------------------------------
+# Shared output helper
+# ---------------------------------------------------------------------------
+
+_EVENT_OUTPUT_COLS: list[str] = []  # populated lazily
+
+
+def _select_and_sort_events(df: pl.DataFrame) -> pl.DataFrame:
+    """Select canonical event columns and sort by (mmsi, start_time)."""
+    from neptune_ais.datasets.events import Col as EventCol
+
+    global _EVENT_OUTPUT_COLS
+    if not _EVENT_OUTPUT_COLS:
+        _EVENT_OUTPUT_COLS = [
+            EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
+            EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
+            EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
+            EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
+            EventCol.RECORD_PROVENANCE,
+        ]
+    return df.select(_EVENT_OUTPUT_COLS).sort(
         [EventCol.MMSI, EventCol.START_TIME]
     )
+
+
+# ---------------------------------------------------------------------------
+# Loitering detector
+# ---------------------------------------------------------------------------
+
+_LOITERING_DETECTOR_NAME = "loitering_detector"
+_LOITERING_DETECTOR_VERSION = "0.1.0"
+
+
+@dataclass(frozen=True)
+class LoiteringConfig:
+    """Configuration for loitering detection.
+
+    Detects vessels that stay in a small area for a sustained period.
+    Uses spatial radius and speed thresholds.
+
+    Args:
+        max_speed_knots: Maximum SOG for a position to count as
+            slow/stationary. Default 2.0.
+        max_radius_m: Maximum spatial radius (meters) of the cluster.
+            Default 1000.
+        min_duration_s: Minimum sustained duration (seconds).
+            Default 1800 (30 min).
+        min_points: Minimum slow-speed positions. Default 3.
+        gap_seconds: Maximum gap before splitting. Default 3600.
+    """
+
+    max_speed_knots: float = 2.0
+    max_radius_m: float = 1000.0
+    min_duration_s: int = 1800
+    min_points: int = 3
+    gap_seconds: int = 3600
+
+    def config_hash(self) -> str:
+        key = (
+            f"speed={self.max_speed_knots}"
+            f":radius={self.max_radius_m}"
+            f":dur={self.min_duration_s}"
+            f":pts={self.min_points}"
+            f":gap={self.gap_seconds}"
+        )
+        return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def detect_loitering(
+    positions: pl.DataFrame,
+    *,
+    config: LoiteringConfig | None = None,
+    source: str = "",
+) -> pl.DataFrame:
+    """Detect loitering events from positions.
+
+    A vessel is loitering when it has sustained low-speed positions
+    clustered in a small area. Unlike port calls, loitering does not
+    require boundary context — it is purely position-based.
+
+    Algorithm:
+    1. Filter to low-speed positions (SOG <= ``max_speed_knots``).
+    2. Sort by ``(mmsi, timestamp)`` and group by time gaps.
+    3. Compute spatial spread per group; filter by ``max_radius_m``.
+    4. Filter by ``min_duration_s`` and ``min_points``.
+    5. Emit loitering events with centroid and confidence.
+
+    Args:
+        positions: Positions DataFrame with ``mmsi``, ``timestamp``,
+            ``lat``, ``lon``, ``sog``, and ``source`` columns.
+        config: Detection configuration. Uses defaults if None.
+        source: Source identifier for provenance.
+
+    Returns:
+        A DataFrame conforming to ``events/v1`` with
+        ``event_type = "loitering"``.
+    """
+    from neptune_ais.datasets.events import (
+        Col as EventCol,
+        EVENT_TYPE_LOITERING,
+        SCHEMA,
+        make_event_id,
+    )
+
+    if config is None:
+        config = LoiteringConfig()
+
+    cfg_hash = config.config_hash()
+
+    # Step 1: filter to low-speed positions.
+    df = positions.filter(pl.col("sog") <= config.max_speed_knots)
+
+    if len(df) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Step 2: sort and group by time gaps per vessel.
+    df = df.sort(["mmsi", "timestamp"])
+    gap_us = config.gap_seconds * 1_000_000
+
+    df = df.with_columns(
+        pl.col("timestamp").diff().dt.total_microseconds()
+        .over("mmsi")
+        .alias("_dt_us"),
+    )
+    df = df.with_columns(
+        (
+            (pl.col("mmsi") != pl.col("mmsi").shift(1))
+            | pl.col("_dt_us").is_null()
+            | (pl.col("_dt_us") > gap_us)
+        )
+        .cast(pl.Int64)
+        .cum_sum()
+        .alias("_group_id")
+    )
+    df = df.drop("_dt_us")
+
+    # Step 3: aggregate and check spatial spread.
+    candidates = df.group_by("_group_id").agg(
+        pl.col("mmsi").first().alias(EventCol.MMSI),
+        pl.col("timestamp").min().alias(EventCol.START_TIME),
+        pl.col("timestamp").max().alias(EventCol.END_TIME),
+        pl.col("lat").mean().alias(EventCol.LAT),
+        pl.col("lon").mean().alias(EventCol.LON),
+        pl.len().cast(pl.Int64).alias("_point_count"),
+        (
+            (pl.col("timestamp").max() - pl.col("timestamp").min())
+            .dt.total_seconds().cast(pl.Float64)
+        ).alias("_duration_s"),
+        # Max deviation from centroid (approximate equirectangular).
+        (
+            (
+                ((pl.col("lat") - pl.col("lat").mean()) * _METERS_PER_DEG).pow(2)
+                + (
+                    (pl.col("lon") - pl.col("lon").mean())
+                    * _METERS_PER_DEG
+                    * pl.col("lat").mean().radians().cos()
+                ).pow(2)
+            ).sqrt().max()
+        ).alias("_max_radius_m"),
+        pl.col("source").first().alias(EventCol.SOURCE),
+    )
+
+    # Step 4: filter by thresholds.
+    candidates = candidates.filter(
+        (pl.col("_duration_s") >= config.min_duration_s)
+        & (pl.col("_point_count") >= config.min_points)
+        & (pl.col("_max_radius_m") <= config.max_radius_m)
+    )
+
+    if len(candidates) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Step 5: confidence and event IDs.
+    # Longer + tighter radius = higher confidence.
+    candidates = candidates.with_columns(
+        (
+            pl.when(
+                (pl.col("_duration_s") >= 7200) & (pl.col("_max_radius_m") <= 500)
+            ).then(0.9)
+            .when(
+                (pl.col("_duration_s") >= 1800) & (pl.col("_max_radius_m") <= 1000)
+            ).then(0.7)
+            .otherwise(0.5)
+        ).alias(EventCol.CONFIDENCE_SCORE),
+    )
+
+    candidates = candidates.with_columns(
+        pl.struct([EventCol.MMSI, EventCol.START_TIME, EventCol.SOURCE])
+        .map_elements(
+            lambda row: make_event_id(
+                EVENT_TYPE_LOITERING,
+                row[EventCol.MMSI],
+                int(row[EventCol.START_TIME].timestamp() * 1e6),
+                row[EventCol.SOURCE],
+                cfg_hash,
+            ),
+            return_dtype=pl.String,
+        )
+        .alias(EventCol.EVENT_ID),
+    )
+
+    prov = EventProvenance(
+        source=source or "derived",
+        detector=_LOITERING_DETECTOR_NAME,
+        detector_version=_LOITERING_DETECTOR_VERSION,
+        upstream_datasets=["positions"],
+    )
+
+    result = candidates.with_columns(
+        pl.lit(EVENT_TYPE_LOITERING).alias(EventCol.EVENT_TYPE),
+        pl.lit(None).cast(pl.Int64).alias(EventCol.OTHER_MMSI),
+        pl.lit(None).cast(pl.Binary).alias(EventCol.GEOMETRY_WKB),
+        pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
+    )
+
+    return _select_and_sort_events(result)
