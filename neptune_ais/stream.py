@@ -52,9 +52,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import random
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -355,7 +359,6 @@ class Checkpoint:
 
     def to_json(self) -> str:
         """Serialize to JSON string."""
-        import json
         return json.dumps({
             "source": self.source,
             "last_timestamp": self.last_timestamp,
@@ -367,7 +370,6 @@ class Checkpoint:
     @classmethod
     def from_json(cls, data: str) -> Checkpoint:
         """Deserialize from JSON string."""
-        import json
         d = json.loads(data)
         return cls(
             source=d.get("source", ""),
@@ -384,20 +386,10 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_dir: str) -> None:
     Creates the directory if it doesn't exist. The checkpoint file
     is named ``<source>.checkpoint.json``.
     """
-    from pathlib import Path
-    from datetime import datetime, timezone
-
     path = Path(checkpoint_dir)
     path.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = Checkpoint(
-        source=checkpoint.source,
-        last_timestamp=checkpoint.last_timestamp,
-        messages_total=checkpoint.messages_total,
-        session_count=checkpoint.session_count,
-        last_saved=datetime.now(timezone.utc).isoformat(),
-    )
-
+    checkpoint.last_saved = datetime.now(timezone.utc).isoformat()
     filepath = path / f"{checkpoint.source}.checkpoint.json"
     filepath.write_text(checkpoint.to_json())
     logger.debug("Checkpoint saved: %s", filepath)
@@ -405,8 +397,6 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_dir: str) -> None:
 
 def load_checkpoint(source: str, checkpoint_dir: str) -> Checkpoint | None:
     """Load a checkpoint from disk, or return None if not found."""
-    from pathlib import Path
-
     filepath = Path(checkpoint_dir) / f"{source}.checkpoint.json"
     if not filepath.exists():
         return None
@@ -447,8 +437,6 @@ async def run_with_reconnect(
     the initial delay and doubles on each attempt up to
     ``stream.config.max_reconnect_delay_s``, with ±25% jitter.
     """
-    import random
-
     config = stream.config
     delay = config.reconnect_delay_s
     attempts = 0
@@ -471,19 +459,19 @@ async def run_with_reconnect(
         else:
             checkpoint = Checkpoint(source=config.source, session_count=1)
 
+    # Track delivered count at the start so we compute deltas, not
+    # cumulative totals (which would double-count across reconnections).
+    delivered_baseline = stream.stats.messages_delivered
+
     while stream.is_running:
+        delivered_before = stream.stats.messages_delivered
         try:
             await connect_fn()
             # Normal exit — save checkpoint and stop.
+            delta = stream.stats.messages_delivered - delivered_baseline
             if config.checkpoint_dir and checkpoint:
-                checkpoint = Checkpoint(
-                    source=config.source,
-                    last_timestamp=_now_iso(),
-                    messages_total=(
-                        checkpoint.messages_total + stream.stats.messages_delivered
-                    ),
-                    session_count=checkpoint.session_count,
-                )
+                checkpoint.last_timestamp = _now_iso()
+                checkpoint.messages_total += delta
                 save_checkpoint(checkpoint, config.checkpoint_dir)
             break
 
@@ -499,16 +487,13 @@ async def run_with_reconnect(
                 break
 
             # Save checkpoint before reconnecting.
+            delta = stream.stats.messages_delivered - delivered_baseline
             if config.checkpoint_dir and checkpoint:
-                checkpoint = Checkpoint(
-                    source=config.source,
-                    last_timestamp=_now_iso(),
-                    messages_total=(
-                        checkpoint.messages_total + stream.stats.messages_delivered
-                    ),
-                    session_count=checkpoint.session_count,
-                )
+                checkpoint.last_timestamp = _now_iso()
+                checkpoint.messages_total += delta
                 save_checkpoint(checkpoint, config.checkpoint_dir)
+            # Reset baseline so next iteration doesn't re-count.
+            delivered_baseline = stream.stats.messages_delivered
 
             # Exponential backoff with jitter.
             jitter = delay * random.uniform(-0.25, 0.25)
@@ -518,6 +503,8 @@ async def run_with_reconnect(
                 e, wait, attempts,
             )
             await asyncio.sleep(wait)
+            if not stream.is_running:
+                break
             delay = min(delay * 2, config.max_reconnect_delay_s)
 
 
@@ -528,7 +515,6 @@ async def run_with_reconnect(
 
 def _now_iso() -> str:
     """Return current UTC time as ISO-8601 string."""
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
 
 
