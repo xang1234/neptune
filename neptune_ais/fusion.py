@@ -641,8 +641,11 @@ def _build_provenance_token(mode_tag: str) -> pl.Expr:
 
     Examples:
     - ``"noaa:best"`` — single source, no dedup needed
-    - ``"noaa:best[+dma]"`` — noaa won, dma also contributed
-    - ``"noaa:prefer:noaa[+dma+aishub]"`` — noaa preferred, others contributed
+    - ``"noaa:best[+dma+noaa]"`` — noaa won, both dma and noaa contributed
+    - ``"noaa:prefer:noaa[+dma+noaa]"`` — noaa preferred, both contributed
+
+    The bracketed portion lists ALL contributing sources (including the
+    winner) so the contributor set is self-contained and parseable.
 
     Requires ``_contributors`` column (List[String]) with sorted unique
     source IDs that contributed to each dedup group.

@@ -493,16 +493,82 @@ class Neptune:
         registry = self._get_registry()
         return registry.inventory()
 
-    def provenance(self):
-        """Return provenance summary for positions in the configured scope."""
+    def provenance(self, dataset: str = "positions"):
+        """Return provenance summary for a dataset in the configured scope."""
         date_from, date_to = self._date_range
         return self._get_registry().provenance(
-            "positions", date_from=date_from, date_to=date_to,
+            dataset, date_from=date_from, date_to=date_to,
         )
 
-    def quality_report(self):
-        """Return quality report for positions in the configured scope."""
+    def quality_report(self, dataset: str = "positions"):
+        """Return quality report for a dataset in the configured scope."""
         date_from, date_to = self._date_range
         return self._get_registry().quality_report(
-            "positions", date_from=date_from, date_to=date_to,
+            dataset, date_from=date_from, date_to=date_to,
         )
+
+    def fusion_info(self) -> dict:
+        """Return information about the configured fusion behavior.
+
+        Provides a combined view of:
+        - Fusion configuration (mode, precedence, tolerances)
+        - Multi-source inventory (which sources have data)
+        - Per-source partition and row counts
+
+        This is the primary inspection surface for understanding how
+        multi-source results are assembled.
+        """
+        from neptune_ais.fusion import MergeMode
+
+        registry = self._get_registry()
+        date_from, date_to = self._date_range
+
+        # Per-source breakdown.
+        source_details: list[dict] = []
+        total_partitions = 0
+        total_rows = 0
+
+        for source_id in self._sources:
+            parts = registry.partitions(
+                "positions",
+                source=source_id,
+                date_from=date_from,
+                date_to=date_to,
+            )
+            rows = sum(p.record_count for p in parts)
+            source_details.append({
+                "source": source_id,
+                "partitions": len(parts),
+                "rows": rows,
+            })
+            total_partitions += len(parts)
+            total_rows += rows
+
+        # Fusion config summary.
+        fc = self._fusion_config
+        config_summary = {
+            "mode": fc.mode.value,
+            "source_precedence": fc.source_precedence or self._sources,
+            "timestamp_tolerance_seconds": fc.timestamp_tolerance_seconds,
+            "coordinate_tolerance_degrees": fc.coordinate_tolerance_degrees,
+        }
+        if fc.mode == MergeMode.PREFER:
+            config_summary["prefer_source"] = fc.prefer_source
+        if fc.field_precedence:
+            config_summary["field_precedence"] = fc.field_precedence
+        if fc.source_confidence_weights:
+            config_summary["source_confidence_weights"] = fc.source_confidence_weights
+
+        return {
+            "sources": self._sources,
+            "dates": {
+                "from": date_from,
+                "to": date_to,
+                "count": len(self._dates),
+            },
+            "fusion": config_summary,
+            "per_source": source_details,
+            "total_partitions": total_partitions,
+            "total_rows_before_fusion": total_rows,
+            "multi_source": len(self._sources) > 1,
+        }

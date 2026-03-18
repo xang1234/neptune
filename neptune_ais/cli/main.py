@@ -150,6 +150,7 @@ def qc(
 @click.option("--start", "start_str", help="Start date.")
 @click.option("--end", "end_str", help="End date.")
 @click.option("--source", "-s", multiple=True, help="Source(s).")
+@click.option("--merge", "-m", "merge_mode", default="best", help="Merge mode: union, best, prefer:<source>.")
 @click.option("--cache-dir", type=click.Path(), help="Override store root.")
 def sql_cmd(
     query: str,
@@ -157,6 +158,7 @@ def sql_cmd(
     start_str: str | None,
     end_str: str | None,
     source: tuple[str, ...],
+    merge_mode: str,
     cache_dir: str | None,
 ) -> None:
     """Execute a SQL query over stored datasets."""
@@ -165,7 +167,7 @@ def sql_cmd(
     dates = _resolve_dates(date_str, start_str, end_str)
     sources = list(source) if source else None
 
-    n = Neptune(dates, sources=sources, cache_dir=cache_dir)
+    n = Neptune(dates, sources=sources, merge=merge_mode, cache_dir=cache_dir)
     result = n.sql(query)
     click.echo(result)
 
@@ -253,6 +255,104 @@ def sources(source_id: str | None) -> None:
                 f"{(caps.history_start or '?'):<12} "
                 f"{caps.delivery_format}"
             )
+
+
+# ---------------------------------------------------------------------------
+# fusion
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--date", "-d", "date_str", help="Single date (YYYY-MM-DD).")
+@click.option("--start", "start_str", help="Start date.")
+@click.option("--end", "end_str", help="End date.")
+@click.option("--source", "-s", multiple=True, help="Source(s).")
+@click.option("--merge", "-m", "merge_mode", default="best", help="Merge mode.")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+def fusion(
+    date_str: str | None,
+    start_str: str | None,
+    end_str: str | None,
+    source: tuple[str, ...],
+    merge_mode: str,
+    cache_dir: str | None,
+) -> None:
+    """Show fusion configuration and multi-source breakdown."""
+    from neptune_ais.api import Neptune
+
+    dates = _resolve_dates(date_str, start_str, end_str)
+    sources = list(source) if source else None
+
+    n = Neptune(dates, sources=sources, merge=merge_mode, cache_dir=cache_dir)
+    info = n.fusion_info()
+
+    click.echo(f"\nFusion: {info['fusion']['mode']} mode")
+    click.echo(f"  Sources:     {', '.join(info['sources'])}")
+    click.echo(f"  Dates:       {info['dates']['from']} → {info['dates']['to']} ({info['dates']['count']} day(s))")
+    click.echo(f"  Precedence:  {', '.join(info['fusion']['source_precedence'])}")
+    click.echo(f"  Tolerance:   {info['fusion']['timestamp_tolerance_seconds']}s time, {info['fusion']['coordinate_tolerance_degrees']}° coord")
+
+    if "prefer_source" in info["fusion"]:
+        click.echo(f"  Prefer:      {info['fusion']['prefer_source']}")
+    if "field_precedence" in info["fusion"]:
+        for field, order in info["fusion"]["field_precedence"].items():
+            click.echo(f"  Field {field}: {' > '.join(order)}")
+
+    click.echo(f"\nPer source:")
+    for sd in info["per_source"]:
+        click.echo(f"  {sd['source']:<12} {sd['partitions']} partition(s), {sd['rows']:,} rows")
+    click.echo(f"  {'Total':<12} {info['total_partitions']} partition(s), {info['total_rows_before_fusion']:,} rows")
+
+    if info["multi_source"]:
+        click.echo(f"\n  Multi-source fusion will be applied on query.")
+    else:
+        click.echo(f"\n  Single source — no fusion needed.")
+
+
+# ---------------------------------------------------------------------------
+# provenance
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--dataset", default="positions", help="Dataset to inspect.")
+@click.option("--date", "-d", "date_str", help="Single date (YYYY-MM-DD).")
+@click.option("--start", "start_str", help="Start date.")
+@click.option("--end", "end_str", help="End date.")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+def provenance(
+    dataset: str,
+    date_str: str | None,
+    start_str: str | None,
+    end_str: str | None,
+    cache_dir: str | None,
+) -> None:
+    """Show provenance summary for stored data."""
+    from neptune_ais.catalog import CatalogRegistry
+    from neptune_ais.storage import DEFAULT_STORE_ROOT
+    from pathlib import Path
+
+    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    registry = CatalogRegistry(store)
+    registry.scan()
+
+    date_from, date_to = _resolve_date_range(date_str, start_str, end_str)
+
+    prov = registry.provenance(
+        dataset, date_from=date_from, date_to=date_to,
+    )
+
+    click.echo(f"Provenance: {dataset}")
+    click.echo(f"  Partitions:       {prov.partitions_scanned}")
+    click.echo(f"  Schema versions:  {', '.join(prov.schema_versions) or 'none'}")
+    click.echo(f"  Adapter versions: {', '.join(prov.adapter_versions) or 'none'}")
+    click.echo(f"  Raw policies:     {', '.join(prov.raw_policies) or 'none'}")
+    click.echo(f"  Raw artifacts:    {prov.total_raw_artifacts}")
+    click.echo(f"    With local:     {prov.artifacts_with_local_copy}")
+    click.echo(f"    Without local:  {prov.artifacts_without_local_copy}")
+    click.echo(f"  Can rebuild:      {'yes' if prov.can_rebuild_locally else 'no'}")
+    if prov.has_mixed_versions:
+        click.echo(f"  ⚠ Mixed versions detected")
 
 
 # ---------------------------------------------------------------------------
