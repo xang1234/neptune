@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -155,7 +156,9 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
     try:
         cleaned = time_str.strip()
         if cleaned.endswith(" UTC"):
-            cleaned = cleaned[:-4]
+            cleaned = cleaned[:-4].strip()
+        # Normalize bare offset "+0000" → "+00:00" for fromisoformat.
+        cleaned = re.sub(r"([+-])(\d{2})(\d{2})$", r"\1\2:\3", cleaned)
         cleaned = cleaned.replace(" ", "T", 1)  # date-time boundary only
         ts = datetime.fromisoformat(cleaned)
         if ts.tzinfo is None:

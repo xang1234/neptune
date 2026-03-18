@@ -104,11 +104,19 @@ def available(date_str: str) -> list[str]:
 def info(source_id: str) -> SourceCapabilities:
     """Return capabilities for a specific source (archival or streaming).
 
-    Raises ``KeyError`` if the source is not registered.
+    Archival adapters take priority over streaming-only registrations
+    (consistent with ``catalog()``).
+
+    Raises ``KeyError`` if the source is not registered in either registry.
     """
+    if source_id in _ADAPTERS:
+        return get_adapter(source_id).capabilities
     if source_id in _STREAMING_CAPABILITIES:
         return _STREAMING_CAPABILITIES[source_id]
-    return get_adapter(source_id).capabilities
+    raise KeyError(
+        f"Unknown source {source_id!r}. "
+        f"Available: {registered_sources()}"
+    )
 
 
 def capabilities(source_id: str) -> SourceCapabilities:
