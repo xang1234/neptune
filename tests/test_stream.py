@@ -1,0 +1,297 @@
+"""Tests for NeptuneStream async interface and lifecycle.
+
+Covers: stream lifecycle (context manager), async iteration,
+message ingestion, deduplication, sink runner, and statistics.
+
+Uses asyncio.run() directly instead of pytest-asyncio to avoid
+requiring the optional pytest-asyncio dependency.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from neptune_ais.stream import (
+    NeptuneStream,
+    StreamConfig,
+    StreamSink,
+    StreamStats,
+    _message_hash,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _sample_message(mmsi: int = 111, ts: str = "2024-06-15T00:00:00") -> dict:
+    return {
+        "mmsi": mmsi,
+        "timestamp": ts,
+        "lat": 40.0,
+        "lon": -74.0,
+        "sog": 5.0,
+        "source": "aisstream",
+    }
+
+
+class MockSink:
+    """In-memory sink for testing."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[dict[str, Any]]] = []
+        self.flushed = False
+        self.closed = False
+
+    async def write(self, messages: list[dict[str, Any]]) -> None:
+        self.batches.append(list(messages))
+
+    async def flush(self) -> None:
+        self.flushed = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+    @property
+    def total_messages(self) -> int:
+        return sum(len(b) for b in self.batches)
+
+
+def _run(coro):
+    """Run an async coroutine synchronously."""
+    return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# StreamConfig
+# ---------------------------------------------------------------------------
+
+
+class TestStreamConfig:
+    def test_defaults(self):
+        config = StreamConfig()
+        assert config.source == "aisstream"
+        assert config.reconnect_delay_s == 5.0
+        assert config.dedup_window_size == 10_000
+        assert config.flush_interval_s == 60
+
+    def test_custom_config(self):
+        config = StreamConfig(
+            source="finland",
+            api_key="test-key",
+            bbox=(10.0, 55.0, 30.0, 70.0),
+            mmsi=[111, 222],
+        )
+        assert config.source == "finland"
+        assert config.api_key == "test-key"
+        assert config.bbox == (10.0, 55.0, 30.0, 70.0)
+        assert config.mmsi == [111, 222]
+
+
+# ---------------------------------------------------------------------------
+# StreamStats
+# ---------------------------------------------------------------------------
+
+
+class TestStreamStats:
+    def test_initial_stats(self):
+        stats = StreamStats()
+        assert stats.messages_received == 0
+        assert stats.messages_delivered == 0
+        assert stats.dedup_rate == 0.0
+
+    def test_dedup_rate(self):
+        stats = StreamStats(messages_received=100, messages_deduplicated=20)
+        assert stats.dedup_rate == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Message hash
+# ---------------------------------------------------------------------------
+
+
+class TestMessageHash:
+    def test_deterministic(self):
+        msg = _sample_message()
+        assert _message_hash(msg) == _message_hash(msg)
+
+    def test_differs_by_mmsi(self):
+        a = _message_hash(_sample_message(mmsi=111))
+        b = _message_hash(_sample_message(mmsi=222))
+        assert a != b
+
+    def test_differs_by_timestamp(self):
+        a = _message_hash(_sample_message(ts="2024-06-15T00:00:00"))
+        b = _message_hash(_sample_message(ts="2024-06-15T00:01:00"))
+        assert a != b
+
+    def test_format(self):
+        h = _message_hash(_sample_message())
+        assert isinstance(h, str)
+        assert len(h) == 16  # SHA-1 hex prefix
+
+
+# ---------------------------------------------------------------------------
+# NeptuneStream lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestStreamLifecycle:
+    def test_context_manager(self):
+        async def _test():
+            async with NeptuneStream(source="aisstream") as stream:
+                assert stream.is_running
+            assert not stream.is_running
+        _run(_test())
+
+    def test_config_via_constructor(self):
+        async def _test():
+            async with NeptuneStream(source="test", api_key="key123") as stream:
+                assert stream.config.source == "test"
+                assert stream.config.api_key == "key123"
+        _run(_test())
+
+    def test_config_object(self):
+        async def _test():
+            config = StreamConfig(source="custom", dedup_window_size=500)
+            async with NeptuneStream(config=config) as stream:
+                assert stream.config.source == "custom"
+                assert stream.config.dedup_window_size == 500
+        _run(_test())
+
+    def test_stats_initial(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                assert stream.stats.messages_received == 0
+        _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Message ingestion and dedup
+# ---------------------------------------------------------------------------
+
+
+class TestIngestion:
+    def test_ingest_accepted(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                accepted = await stream.ingest(_sample_message())
+                assert accepted is True
+                assert stream.stats.messages_received == 1
+                assert stream.stats.messages_delivered == 1
+        _run(_test())
+
+    def test_duplicate_rejected(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                msg = _sample_message()
+                await stream.ingest(msg)
+                accepted = await stream.ingest(msg)
+                assert accepted is False
+                assert stream.stats.messages_received == 2
+                assert stream.stats.messages_delivered == 1
+                assert stream.stats.messages_deduplicated == 1
+        _run(_test())
+
+    def test_different_messages_accepted(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                await stream.ingest(_sample_message(mmsi=111))
+                await stream.ingest(_sample_message(mmsi=222))
+                assert stream.stats.messages_delivered == 2
+        _run(_test())
+
+    def test_dedup_window_size(self):
+        """Old hashes are evicted from the dedup window."""
+        async def _test():
+            config = StreamConfig(dedup_window_size=3)
+            async with NeptuneStream(config=config) as stream:
+                for i in range(4):
+                    await stream.ingest(_sample_message(mmsi=i))
+                accepted = await stream.ingest(_sample_message(mmsi=0))
+                assert accepted is True
+        _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Async iteration
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncIteration:
+    def test_iterate_messages(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                await stream.ingest(_sample_message(mmsi=111))
+                await stream.ingest(_sample_message(mmsi=222))
+
+                stream._running = False
+                await stream._message_queue.put(None)
+
+                messages = []
+                async for msg in stream:
+                    messages.append(msg)
+
+                assert len(messages) == 2
+                assert messages[0]["mmsi"] == 111
+                assert messages[1]["mmsi"] == 222
+        _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Sink runner
+# ---------------------------------------------------------------------------
+
+
+class TestSinkRunner:
+    def test_sink_receives_messages(self):
+        async def _test():
+            sink = MockSink()
+            async with NeptuneStream() as stream:
+                for i in range(5):
+                    await stream.ingest(
+                        _sample_message(mmsi=i, ts=f"2024-06-15T00:0{i}:00")
+                    )
+                await stream.run_sink(sink, max_messages=5, batch_size=2)
+
+            assert sink.total_messages == 5
+            assert sink.flushed
+            assert sink.closed
+        _run(_test())
+
+    def test_sink_batch_size(self):
+        async def _test():
+            sink = MockSink()
+            async with NeptuneStream() as stream:
+                for i in range(4):
+                    await stream.ingest(
+                        _sample_message(mmsi=i, ts=f"2024-06-15T00:0{i}:00")
+                    )
+                await stream.run_sink(sink, max_messages=4, batch_size=3)
+
+            assert len(sink.batches) == 2
+            assert len(sink.batches[0]) == 3
+            assert len(sink.batches[1]) == 1
+        _run(_test())
+
+    def test_sink_protocol_conformance(self):
+        """MockSink satisfies StreamSink protocol."""
+        assert isinstance(MockSink(), StreamSink)
+
+    def test_sink_cleanup_on_max_messages(self):
+        async def _test():
+            sink = MockSink()
+            async with NeptuneStream() as stream:
+                for i in range(10):
+                    await stream.ingest(
+                        _sample_message(mmsi=i, ts=f"2024-06-15T00:{i:02d}:00")
+                    )
+                await stream.run_sink(sink, max_messages=3)
+
+            assert sink.total_messages == 3
+            assert sink.closed
+        _run(_test())
