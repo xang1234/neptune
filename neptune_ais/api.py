@@ -452,8 +452,10 @@ class Neptune:
         generalize: str = "0",
         include_geometry: bool = False,
         refresh: bool = False,
-    ) -> pl.LazyFrame:
-        """Derive and return tracks as a Polars LazyFrame.
+        as_geo: bool = False,
+        as_movingpandas: bool = False,
+    ):
+        """Derive and return tracks.
 
         Runs the full track derivation pipeline on positions data:
         sort → detect boundaries → filter segments → aggregate.
@@ -494,11 +496,15 @@ class Neptune:
         derived_files = self._dataset_files("tracks")
         if derived_files and not config.refresh:
             logger.info("Using cached tracks (%d file(s))", len(derived_files))
-            return pl.scan_parquet(
+            lf = pl.scan_parquet(
                 derived_files,
                 missing_columns="insert",
                 extra_columns="ignore",
             )
+            if as_geo:
+                from neptune_ais.geometry.bridges import tracks_to_geodataframe
+                return tracks_to_geodataframe(lf)
+            return lf
 
         # Compute tracks from positions.
         positions = self.positions().collect()
@@ -527,6 +533,14 @@ class Neptune:
             len(result),
             len(positions),
         )
+
+        # Optional geometry conversions.
+        if as_geo:
+            from neptune_ais.geometry.bridges import tracks_to_geodataframe
+            return tracks_to_geodataframe(result)
+        if as_movingpandas:
+            from neptune_ais.geometry.bridges import tracks_to_movingpandas
+            return tracks_to_movingpandas(result, positions)
 
         return result.lazy()
 
