@@ -45,15 +45,40 @@ from neptune_ais.viz import (
 
 
 # ---------------------------------------------------------------------------
-# Shared fixtures — positions DataFrames for segmentation tests
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 _BASE = datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
+
+# Permissive config that keeps all segments (for boundary detection tests).
+_PERMISSIVE = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
 
 
 def _ts(minutes: float) -> datetime:
     """Helper: timestamp at *minutes* after base time."""
     return _BASE + timedelta(minutes=minutes)
+
+
+def _run_pipeline(
+    df: pl.DataFrame,
+    *,
+    include_geometry: bool = False,
+    config: TrackConfig | None = None,
+) -> pl.DataFrame:
+    """Run detect → filter → aggregate and return tracks."""
+    if config is None:
+        config = TrackConfig(
+            min_points=1, min_duration_seconds=0, min_distance_m=0,
+            include_geometry=include_geometry,
+        )
+    segmented = detect_boundaries(df, config)
+    filtered = filter_segments(segmented, config)
+    return aggregate_tracks(filtered, config, source="noaa")
+
+
+# ---------------------------------------------------------------------------
+# Position fixtures
+# ---------------------------------------------------------------------------
 
 
 def _two_vessel_positions() -> pl.DataFrame:
@@ -154,16 +179,14 @@ class TestDetectBoundaries:
     def test_single_vessel_no_gaps(self):
         """Continuous positions → single segment."""
         df = _two_vessel_positions().filter(pl.col("mmsi") == 111)
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        result = detect_boundaries(df, config)
+        result = detect_boundaries(df, _PERMISSIVE)
         assert "_segment_id" in result.columns
         assert result["_segment_id"].n_unique() == 1
 
     def test_two_vessels_separate_segments(self):
         """Different vessels get different segment IDs."""
         df = _two_vessel_positions()
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        result = detect_boundaries(df, config)
+        result = detect_boundaries(df, _PERMISSIVE)
         # Group by mmsi and check each vessel has unique segment IDs.
         seg_per_vessel = (
             result.group_by("mmsi")
@@ -177,8 +200,7 @@ class TestDetectBoundaries:
     def test_time_gap_creates_boundary(self):
         """45-minute gap exceeds 30m default → 2 segments."""
         df = _gapped_positions()
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        result = detect_boundaries(df, config)
+        result = detect_boundaries(df, _PERMISSIVE)
         assert result["_segment_id"].n_unique() == 2
 
     def test_time_gap_with_larger_threshold(self):
@@ -194,15 +216,13 @@ class TestDetectBoundaries:
     def test_speed_jump_creates_boundary(self):
         """GPS jump (implausible speed) → segment break."""
         df = _speed_jump_positions()
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        result = detect_boundaries(df, config)
+        result = detect_boundaries(df, _PERMISSIVE)
         assert result["_segment_id"].n_unique() == 2
 
     def test_nonmonotonic_timestamp_creates_boundary(self):
         """Decreasing timestamp → segment break."""
         df = _nonmonotonic_positions()
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        result = detect_boundaries(df, config)
+        result = detect_boundaries(df, _PERMISSIVE)
         # Non-monotonic at point 2 should create a boundary.
         assert result["_segment_id"].n_unique() >= 2
 
@@ -240,7 +260,7 @@ class TestFilterSegments:
         df = _two_vessel_positions()
         config = TrackConfig(
             min_points=1,
-            min_duration_seconds=360,  # 6 minutes
+            min_duration_seconds=300,  # 5m: above v111's 4m, below v222's 6m
             min_distance_m=0,
         )
         segmented = detect_boundaries(df, config)
@@ -278,34 +298,15 @@ class TestFilterSegments:
 class TestAggregateTracksSchema:
     """Tests for aggregate_tracks output conformance to tracks/v1 schema."""
 
-    def _derive(
-        self,
-        df: pl.DataFrame | None = None,
-        *,
-        include_geometry: bool = False,
-    ) -> pl.DataFrame:
-        """Helper: run full pipeline and return tracks."""
-        if df is None:
-            df = _two_vessel_positions()
-        config = TrackConfig(
-            min_points=1,
-            min_duration_seconds=0,
-            min_distance_m=0,
-            include_geometry=include_geometry,
-        )
-        segmented = detect_boundaries(df, config)
-        filtered = filter_segments(segmented, config)
-        return aggregate_tracks(filtered, config, source="noaa")
-
     def test_required_columns_present(self):
         """All tracks/v1 required columns must be present."""
-        tracks = self._derive()
+        tracks = _run_pipeline(_two_vessel_positions())
         for col in TRACK_REQUIRED:
             assert col in tracks.columns, f"Missing required column: {col}"
 
     def test_column_dtypes_match_schema(self):
         """Column dtypes match the tracks/v1 schema."""
-        tracks = self._derive()
+        tracks = _run_pipeline(_two_vessel_positions())
         for col_name, expected_dtype in TRACK_SCHEMA.items():
             if col_name in tracks.columns:
                 actual = tracks[col_name].dtype
@@ -315,14 +316,14 @@ class TestAggregateTracksSchema:
 
     def test_one_row_per_segment(self):
         """Two vessels → two track rows."""
-        tracks = self._derive()
+        tracks = _run_pipeline(_two_vessel_positions())
         assert len(tracks) == 2
 
     def test_track_id_is_deterministic(self):
         """Same input → same track_id."""
-        tracks_a = self._derive()
-        tracks_b = self._derive()
-        assert tracks_a["track_id"].to_list() == tracks_b["track_id"].to_list()
+        tracks_a = _run_pipeline(_two_vessel_positions())
+        tracks_b = _run_pipeline(_two_vessel_positions())
+        assert tracks_a[TrackCol.TRACK_ID].to_list() == tracks_b[TrackCol.TRACK_ID].to_list()
 
     def test_track_id_changes_with_config(self):
         """Different config → different track_ids."""
@@ -333,52 +334,50 @@ class TestAggregateTracksSchema:
         config_b = TrackConfig(
             gap_seconds=900, min_points=1, min_duration_seconds=0, min_distance_m=0,
         )
-        seg_a = detect_boundaries(df, config_a)
-        seg_b = detect_boundaries(df, config_b)
-        tracks_a = aggregate_tracks(filter_segments(seg_a, config_a), config_a, "noaa")
-        tracks_b = aggregate_tracks(filter_segments(seg_b, config_b), config_b, "noaa")
+        tracks_a = _run_pipeline(df, config=config_a)
+        tracks_b = _run_pipeline(df, config=config_b)
         # IDs should differ because config_hash changed.
-        ids_a = set(tracks_a["track_id"].to_list())
-        ids_b = set(tracks_b["track_id"].to_list())
+        ids_a = set(tracks_a[TrackCol.TRACK_ID].to_list())
+        ids_b = set(tracks_b[TrackCol.TRACK_ID].to_list())
         assert ids_a != ids_b
 
     def test_temporal_bounds_correct(self):
         """start_time <= end_time for every track."""
-        tracks = self._derive()
-        assert (tracks["start_time"] <= tracks["end_time"]).all()
+        tracks = _run_pipeline(_two_vessel_positions())
+        assert (tracks[TrackCol.START_TIME] <= tracks[TrackCol.END_TIME]).all()
 
     def test_spatial_bounds_correct(self):
         """bbox_west <= bbox_east and bbox_south <= bbox_north."""
-        tracks = self._derive()
-        assert (tracks["bbox_west"] <= tracks["bbox_east"]).all()
-        assert (tracks["bbox_south"] <= tracks["bbox_north"]).all()
+        tracks = _run_pipeline(_two_vessel_positions())
+        assert (tracks[TrackCol.BBOX_WEST] <= tracks[TrackCol.BBOX_EAST]).all()
+        assert (tracks[TrackCol.BBOX_SOUTH] <= tracks[TrackCol.BBOX_NORTH]).all()
 
     def test_point_count_matches_input(self):
         """point_count per track matches number of input positions."""
-        tracks = self._derive()
+        tracks = _run_pipeline(_two_vessel_positions())
         # Vessel 111: 5 points, vessel 222: 4 points.
-        counts = tracks.sort("mmsi")["point_count"].to_list()
+        counts = tracks.sort(TrackCol.MMSI)[TrackCol.POINT_COUNT].to_list()
         assert counts == [5, 4]
 
     def test_source_and_provenance(self):
         """source and record_provenance are set correctly."""
-        tracks = self._derive()
-        assert (tracks["source"] == "noaa").all()
-        assert (tracks["record_provenance"] == "noaa:tracks").all()
+        tracks = _run_pipeline(_two_vessel_positions())
+        assert (tracks[TrackCol.SOURCE] == "noaa").all()
+        assert (tracks[TrackCol.RECORD_PROVENANCE] == "noaa:tracks").all()
 
     def test_sorted_by_mmsi_start_time(self):
         """Output is sorted by (mmsi, start_time)."""
-        tracks = self._derive()
-        mmsis = tracks["mmsi"].to_list()
+        tracks = _run_pipeline(_two_vessel_positions())
+        mmsis = tracks[TrackCol.MMSI].to_list()
         assert mmsis == sorted(mmsis)
 
     def test_mean_speed_from_sog(self):
         """mean_speed is derived from SOG when available."""
-        tracks = self._derive()
+        tracks = _run_pipeline(_two_vessel_positions())
         # All SOG values are 5.0 or 3.0 — mean_speed should reflect that.
-        assert tracks["mean_speed"].is_not_null().all()
+        assert tracks[TrackCol.MEAN_SPEED].is_not_null().all()
         for row in tracks.iter_rows(named=True):
-            assert row["mean_speed"] > 0
+            assert row[TrackCol.MEAN_SPEED] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -426,18 +425,24 @@ class TestGeometryEncoding:
         assert x == -74.0  # lon first
         assert y == 40.0   # lat second
 
+    def test_wkb_minimum_two_points(self):
+        """Exactly 2 points is the minimum valid LineString."""
+        wkb = _encode_wkb_linestring([40.0, 41.0], [-74.0, -73.0])
+        assert wkb is not None
+        _, _, n_points = struct.unpack_from("<BII", wkb, 0)
+        assert n_points == 2
+        assert len(wkb) == 9 + 2 * 16
+
     def test_wkb_returns_none_for_single_point(self):
         """WKB LineString requires >= 2 points."""
         assert _encode_wkb_linestring([40.0], [-74.0]) is None
         assert _encode_wkb_linestring([], []) is None
 
-    def test_timestamp_offsets_monotonic(self):
-        """Offsets are non-negative and monotonically increasing."""
+    def test_timestamp_offsets_values(self):
+        """Offsets are milliseconds from segment start."""
         timestamps = [_ts(0), _ts(1), _ts(5), _ts(10)]
         offsets = _compute_timestamp_offsets(timestamps)
-        assert offsets == [0, 60000, 300000, 600000]  # milliseconds
-        assert offsets[0] == 0
-        assert all(a <= b for a, b in zip(offsets, offsets[1:]))
+        assert offsets == [0, 60_000, 300_000, 600_000]
 
     def test_timestamp_offsets_empty(self):
         assert _compute_timestamp_offsets([]) == []
@@ -492,25 +497,9 @@ class TestTrackConfig:
 class TestDerivationToVizIntegration:
     """End-to-end: positions → tracks → viz layer preparation."""
 
-    def _full_pipeline(
-        self, *, include_geometry: bool = False
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Run derivation and return (positions, tracks)."""
-        positions = _two_vessel_positions()
-        config = TrackConfig(
-            min_points=1,
-            min_duration_seconds=0,
-            min_distance_m=0,
-            include_geometry=include_geometry,
-        )
-        segmented = detect_boundaries(positions, config)
-        filtered = filter_segments(segmented, config)
-        tracks = aggregate_tracks(filtered, config, source="noaa")
-        return positions, tracks
-
     def test_prepare_tracks_accepts_derived_output(self):
         """Derived tracks feed directly into prepare_tracks."""
-        _, tracks = self._full_pipeline()
+        tracks = _run_pipeline(_two_vessel_positions())
         result = prepare_tracks(tracks)
         assert len(result) == 2
         # Has all the required track columns.
@@ -519,23 +508,23 @@ class TestDerivationToVizIntegration:
 
     def test_prepare_tracks_viewport_clips_derived(self):
         """Viewport clipping works on derived tracks."""
-        _, tracks = self._full_pipeline()
+        tracks = _run_pipeline(_two_vessel_positions())
         # Viewport covers only vessel 111's area (lat ~40, lon ~-74).
         viewport = Viewport(west=-75.0, south=39.0, east=-73.0, north=41.0)
         result = prepare_tracks(tracks, viewport=viewport)
         assert len(result) == 1
-        assert result["mmsi"][0] == 111
+        assert result[TrackCol.MMSI].to_list() == [111]
 
     def test_prepare_trips_requires_geometry(self):
         """prepare_trips returns empty when tracks lack geometry."""
-        _, tracks = self._full_pipeline(include_geometry=False)
+        tracks = _run_pipeline(_two_vessel_positions(), include_geometry=False)
         result = prepare_trips(tracks)
         assert len(result) == 0
         assert _TRIP_PROGRESS in result.columns
 
     def test_prepare_trips_with_geometry(self):
         """prepare_trips works when tracks have geometry."""
-        _, tracks = self._full_pipeline(include_geometry=True)
+        tracks = _run_pipeline(_two_vessel_positions(), include_geometry=True)
         result = prepare_trips(tracks)
         assert len(result) == 2
         assert _TRIP_PROGRESS in result.columns
@@ -546,24 +535,20 @@ class TestDerivationToVizIntegration:
 
     def test_prepare_positions_with_source_data(self):
         """Positions used for derivation also work with prepare_positions."""
-        positions, _ = self._full_pipeline()
+        positions = _two_vessel_positions()
         result = prepare_positions(positions)
         assert len(result) == 9  # all positions
 
     def test_prepare_density_with_source_data(self):
         """Density preparation works with the positions used for derivation."""
-        positions, _ = self._full_pipeline()
+        positions = _two_vessel_positions()
         result = prepare_density(positions)
         assert result["count"].sum() == 9
         assert "h3_index" in result.columns
 
     def test_gapped_tracks_through_viz(self):
         """Gapped positions → 2 tracks → viewport can select one."""
-        positions = _gapped_positions()
-        config = TrackConfig(min_points=1, min_duration_seconds=0, min_distance_m=0)
-        segmented = detect_boundaries(positions, config)
-        filtered = filter_segments(segmented, config)
-        tracks = aggregate_tracks(filtered, config, source="noaa")
+        tracks = _run_pipeline(_gapped_positions())
         assert len(tracks) == 2
 
         # First segment is around lat 40.0-40.03, second around 40.10-40.12.
@@ -571,7 +556,7 @@ class TestDerivationToVizIntegration:
         viewport = Viewport(west=-75.0, south=40.05, east=-73.0, north=41.0)
         result = prepare_tracks(tracks, viewport=viewport)
         assert len(result) == 1
-        assert result["bbox_south"][0] >= 40.05
+        assert result[TrackCol.BBOX_SOUTH][0] >= 40.05
 
 
 # ---------------------------------------------------------------------------
