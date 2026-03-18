@@ -3,8 +3,47 @@
 Infers maritime events from positions and tracks using configurable
 heuristics and spatial reference data.
 
-This module defines the cache identity contract for derived events.
-Individual event detectors will be added in subsequent tasks.
+Heuristic assumptions and limits
+---------------------------------
+All detectors in this module are **heuristic** — they infer events from
+AIS position patterns, not from ground truth. Users should understand:
+
+1. **Port calls** depend on boundary data quality. A vessel flagged as
+   "in port" is one whose positions fall within a port boundary bbox at
+   low speed. If the boundary is wrong or missing, the port call is
+   missed or misattributed. Confidence is duration-based only.
+
+2. **EEZ crossings** are inferred from consecutive positions in different
+   EEZ regions. Sparse position data (large gaps) can miss crossings
+   entirely, and the crossing location is an approximation (midpoint
+   between the two nearest positions). The ``max_distance_m`` filter
+   excludes crossings where the two positions are far apart.
+
+3. **Encounters** use time-bucketed self-joins. The ``time_bucket_s``
+   parameter controls temporal resolution — vessels whose observations
+   straddle a bucket boundary are handled by double-bucketing, but
+   very sparse data may still miss short encounters. The ``max_distance_m``
+   threshold is equirectangular (not geodesic), which is adequate for
+   the <1 km scales typical of encounters but introduces error at
+   high latitudes.
+
+4. **Loitering** uses a spatial radius check (max distance from
+   centroid). This is a simple cluster measure, not a convex hull or
+   DBSCAN. Vessels that drift in a figure-8 pattern may exceed the
+   radius threshold even though they stay in a small area.
+
+Confidence scoring is deliberately simple (duration/distance tiers)
+rather than probabilistic. Scores of 0.5 indicate the heuristic
+matched but with weak signal; 0.7 is moderate; 0.9 is strong.
+
+Non-goals for the current implementation:
+- Berth-level port call resolution.
+- Geodesic distance computation (equirectangular is used throughout).
+- Probabilistic confidence models.
+- Antimeridian-crossing boundary support.
+- Streaming / real-time event detection.
+
+See ``HEURISTICS.md`` in the project root for a user-facing summary.
 """
 
 from __future__ import annotations
