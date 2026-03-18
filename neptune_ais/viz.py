@@ -213,14 +213,18 @@ def prepare_trips(
     """
     # Check schema before collecting — avoids materializing a large
     # LazyFrame only to discover the required columns are absent.
-    cols = df.columns
+    if isinstance(df, pl.LazyFrame):
+        cols = df.collect_schema().names()
+    else:
+        cols = df.columns
     required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
     if not required.issubset(cols):
-        schema = df.schema if isinstance(df, pl.DataFrame) else dict(df.schema)
-        empty = pl.DataFrame(schema=schema)
-        return empty.with_columns(
-            pl.lit(None).cast(pl.Float64).alias(_TRIP_PROGRESS),
-        )
+        if isinstance(df, pl.LazyFrame):
+            schema = dict(df.collect_schema())
+        else:
+            schema = dict(df.schema)
+        schema[_TRIP_PROGRESS] = pl.Float64
+        return pl.DataFrame(schema=schema)
 
     result = _collect(df)
 
@@ -308,7 +312,9 @@ def prepare_density(
 
     try:
         return _density_h3(result, resolution)
-    except ImportError:
+    except (ImportError, AttributeError):
+        # ImportError: h3 not installed.
+        # AttributeError: h3 v3 installed (different API names).
         return _density_grid_fallback(result, resolution)
 
 
@@ -348,7 +354,7 @@ def _density_grid_fallback(df: pl.DataFrame, resolution: int) -> pl.DataFrame:
     size. Not as accurate as H3, but works without the h3 dependency.
     """
     # Map H3 resolution to approximate decimal places for rounding.
-    # H3 res 0 → ~0 decimals, res 4 → ~1 decimal, res 8 → ~2, etc.
+    # H3 res 0 → 0 decimals, res 2 → 1, res 5 → 2, res 8 → 3, etc.
     decimals = max(0, (resolution - 1) // 3 + 1)
 
     grid = df.select(

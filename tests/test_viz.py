@@ -211,6 +211,12 @@ class TestPrepareTrips:
         assert len(result) == 0
         assert _TRIP_PROGRESS in result.columns
 
+    def test_without_geometry_lazyframe_returns_empty(self):
+        df = _sample_tracks(5, with_geometry=False)
+        result = prepare_trips(df.lazy())
+        assert len(result) == 0
+        assert _TRIP_PROGRESS in result.columns
+
     def test_viewport_clipping(self):
         df = _sample_tracks(10, with_geometry=True)
         viewport = Viewport(west=-74.1, south=39.9, east=-73.8, north=40.15)
