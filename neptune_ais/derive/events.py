@@ -662,3 +662,236 @@ def detect_eez_crossings(
     return result.select(output_cols).sort(
         [EventCol.MMSI, EventCol.START_TIME]
     )
+
+
+# ---------------------------------------------------------------------------
+# Encounter detector
+# ---------------------------------------------------------------------------
+
+_ENCOUNTER_DETECTOR_NAME = "encounter_detector"
+_ENCOUNTER_DETECTOR_VERSION = "0.1.0"
+
+
+@dataclass(frozen=True)
+class EncounterConfig:
+    """Configuration for encounter detection.
+
+    Args:
+        max_distance_m: Maximum distance (meters) between two vessels
+            for a proximity observation. Default 500.
+        min_duration_s: Minimum sustained proximity (seconds) to
+            qualify as an encounter. Default 600 (10 min).
+        min_observations: Minimum time-coincident observations.
+            Default 2.
+        time_bucket_s: Bucket width (seconds) for aligning
+            observations from different vessels. Default 300 (5 min).
+        gap_seconds: Maximum gap (seconds) between consecutive
+            proximity observations before splitting. Default 3600.
+    """
+
+    max_distance_m: float = 500.0
+    min_duration_s: int = 600
+    min_observations: int = 2
+    time_bucket_s: int = 300
+    gap_seconds: int = 3600
+
+    def config_hash(self) -> str:
+        key = (
+            f"dist={self.max_distance_m}"
+            f":dur={self.min_duration_s}"
+            f":obs={self.min_observations}"
+            f":bucket={self.time_bucket_s}"
+            f":gap={self.gap_seconds}"
+        )
+        return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def detect_encounters(
+    positions: pl.DataFrame,
+    *,
+    config: EncounterConfig | None = None,
+    source: str = "",
+) -> pl.DataFrame:
+    """Detect encounter events between vessel pairs.
+
+    Buckets positions by time, self-joins to find co-located pairs,
+    groups consecutive proximity observations, and emits encounter
+    events for sustained close-range interactions.
+
+    Only pairs where ``mmsi_a < mmsi_b`` are kept (no duplicates/self).
+
+    Args:
+        positions: Positions DataFrame with ``mmsi``, ``timestamp``,
+            ``lat``, ``lon``, and ``source`` columns.
+        config: Detection configuration. Uses defaults if None.
+        source: Source identifier for provenance.
+
+    Returns:
+        A DataFrame conforming to ``events/v1`` with
+        ``event_type = "encounter"`` and ``other_mmsi`` populated.
+    """
+    from neptune_ais.datasets.events import (
+        Col as EventCol,
+        EVENT_TYPE_ENCOUNTER,
+        SCHEMA,
+        make_event_id,
+    )
+
+    if config is None:
+        config = EncounterConfig()
+
+    cfg_hash = config.config_hash()
+
+    if len(positions) == 0 or positions["mmsi"].n_unique() < 2:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Step 1: bucket positions by time.
+    bucket_us = config.time_bucket_s * 1_000_000
+    df = positions.with_columns(
+        (pl.col("timestamp").dt.epoch(time_unit="us") // bucket_us)
+        .alias("_time_bucket"),
+    )
+
+    # Step 2: self-join within time buckets.
+    df_a = df.select(
+        pl.col("mmsi").alias("_mmsi_a"),
+        pl.col("lat").alias("_lat_a"),
+        pl.col("lon").alias("_lon_a"),
+        pl.col("timestamp").alias("_ts_a"),
+        pl.col("source").alias("_source_a"),
+        pl.col("_time_bucket"),
+    )
+    df_b = df.select(
+        pl.col("mmsi").alias("_mmsi_b"),
+        pl.col("lat").alias("_lat_b"),
+        pl.col("lon").alias("_lon_b"),
+        pl.col("timestamp").alias("_ts_b"),
+        pl.col("_time_bucket"),
+    )
+
+    pairs = df_a.join(df_b, on="_time_bucket", how="inner")
+    pairs = pairs.filter(pl.col("_mmsi_a") < pl.col("_mmsi_b"))
+
+    if len(pairs) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Step 3: distance and proximity filter.
+    pairs = pairs.with_columns(
+        (
+            (
+                ((pl.col("_lat_a") - pl.col("_lat_b")) * _METERS_PER_DEG).pow(2)
+                + (
+                    (pl.col("_lon_a") - pl.col("_lon_b"))
+                    * _METERS_PER_DEG
+                    * ((pl.col("_lat_a") + pl.col("_lat_b")) / 2).radians().cos()
+                ).pow(2)
+            ).sqrt()
+        ).alias("_dist_m"),
+    )
+
+    proximate = pairs.filter(pl.col("_dist_m") <= config.max_distance_m)
+    if len(proximate) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    proximate = proximate.with_columns(
+        pl.min_horizontal("_ts_a", "_ts_b").alias("_obs_ts"),
+    )
+
+    # Step 4: group consecutive observations by pair.
+    proximate = proximate.sort(["_mmsi_a", "_mmsi_b", "_obs_ts"])
+    gap_us = config.gap_seconds * 1_000_000
+
+    proximate = proximate.with_columns(
+        pl.col("_obs_ts").diff().dt.total_microseconds()
+        .over(["_mmsi_a", "_mmsi_b"])
+        .alias("_dt_us"),
+    )
+    proximate = proximate.with_columns(
+        (
+            (pl.col("_mmsi_a") != pl.col("_mmsi_a").shift(1))
+            | (pl.col("_mmsi_b") != pl.col("_mmsi_b").shift(1))
+            | pl.col("_dt_us").is_null()
+            | (pl.col("_dt_us") > gap_us)
+        )
+        .cast(pl.Int64)
+        .cum_sum()
+        .alias("_encounter_id")
+    )
+
+    # Step 5: aggregate and filter.
+    encounters = proximate.group_by("_encounter_id").agg(
+        pl.col("_mmsi_a").first().alias(EventCol.MMSI),
+        pl.col("_mmsi_b").first().alias(EventCol.OTHER_MMSI),
+        pl.col("_obs_ts").min().alias(EventCol.START_TIME),
+        pl.col("_obs_ts").max().alias(EventCol.END_TIME),
+        ((pl.col("_lat_a") + pl.col("_lat_b")) / 2).mean().alias(EventCol.LAT),
+        ((pl.col("_lon_a") + pl.col("_lon_b")) / 2).mean().alias(EventCol.LON),
+        pl.len().cast(pl.Int64).alias("_obs_count"),
+        (
+            (pl.col("_obs_ts").max() - pl.col("_obs_ts").min())
+            .dt.total_seconds().cast(pl.Float64)
+        ).alias("_duration_s"),
+        pl.col("_dist_m").mean().alias("_mean_dist_m"),
+        pl.col("_source_a").first().alias(EventCol.SOURCE),
+    )
+
+    encounters = encounters.filter(
+        (pl.col("_duration_s") >= config.min_duration_s)
+        & (pl.col("_obs_count") >= config.min_observations)
+    )
+
+    if len(encounters) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Confidence: closer + longer = higher.
+    encounters = encounters.with_columns(
+        (
+            pl.when(
+                (pl.col("_duration_s") >= 3600) & (pl.col("_mean_dist_m") <= 200)
+            ).then(0.9)
+            .when(
+                (pl.col("_duration_s") >= 600) & (pl.col("_mean_dist_m") <= 500)
+            ).then(0.7)
+            .otherwise(0.5)
+        ).alias(EventCol.CONFIDENCE_SCORE),
+    )
+
+    encounters = encounters.with_columns(
+        pl.struct([EventCol.MMSI, EventCol.START_TIME, EventCol.SOURCE])
+        .map_elements(
+            lambda row: make_event_id(
+                EVENT_TYPE_ENCOUNTER,
+                row[EventCol.MMSI],
+                int(row[EventCol.START_TIME].timestamp() * 1e6),
+                row[EventCol.SOURCE],
+                cfg_hash,
+            ),
+            return_dtype=pl.String,
+        )
+        .alias(EventCol.EVENT_ID),
+    )
+
+    prov = EventProvenance(
+        source=source or "derived",
+        detector=_ENCOUNTER_DETECTOR_NAME,
+        detector_version=_ENCOUNTER_DETECTOR_VERSION,
+        upstream_datasets=["positions"],
+    )
+
+    result = encounters.with_columns(
+        pl.lit(EVENT_TYPE_ENCOUNTER).alias(EventCol.EVENT_TYPE),
+        pl.lit(None).cast(pl.Binary).alias(EventCol.GEOMETRY_WKB),
+        pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
+    )
+
+    output_cols = [
+        EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
+        EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
+        EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
+        EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
+        EventCol.RECORD_PROVENANCE,
+    ]
+
+    return result.select(output_cols).sort(
+        [EventCol.MMSI, EventCol.START_TIME]
+    )
