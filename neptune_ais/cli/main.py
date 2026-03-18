@@ -345,13 +345,14 @@ def events(
     n = Neptune(dates, sources=sources, mmsi=mmsi_list, cache_dir=cache_dir)
     lf = n.events(kind=kind, min_confidence=min_confidence)
 
+    if row_limit is not None:
+        # Push limit into the lazy plan so Polars can short-circuit I/O.
+        lf = lf.head(row_limit)
+
     df = lf.collect()
     if len(df) == 0:
         click.echo("No events found.")
         return
-
-    if row_limit:
-        df = df.head(row_limit)
 
     click.echo(f"Events: {len(df)} row(s)")
     click.echo(df)

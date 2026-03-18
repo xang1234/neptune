@@ -587,6 +587,15 @@ class Neptune:
                 pl.col(EventCol.CONFIDENCE_SCORE) >= min_confidence
             )
 
+        if self._bbox:
+            west, south, east, north = self._bbox
+            lf = lf.filter(
+                (pl.col(EventCol.LAT) >= south)
+                & (pl.col(EventCol.LAT) <= north)
+                & (pl.col(EventCol.LON) >= west)
+                & (pl.col(EventCol.LON) <= east)
+            )
+
         if self._mmsi:
             lf = lf.filter(pl.col(EventCol.MMSI).is_in(self._mmsi))
 

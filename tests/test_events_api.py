@@ -178,6 +178,20 @@ class TestEventsAccessor:
             assert len(result) == 2  # port_call + encounter for mmsi 111
             assert (result[Col.MMSI] == 111).all()
 
+    def test_events_filter_by_bbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            _write_events_partition(store)
+            # bbox covers only the port_call at lat=40, lon=-74
+            n = Neptune(
+                "2024-06-15", sources=["noaa"],
+                bbox=(-75.0, 39.0, -73.0, 41.0),
+                cache_dir=store,
+            )
+            result = n.events().collect()
+            assert len(result) == 1
+            assert result[Col.LAT][0] == 40.0
+
     def test_events_empty_when_no_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             n = Neptune("2024-06-15", sources=["noaa"], cache_dir=tmp)
