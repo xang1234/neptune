@@ -476,7 +476,6 @@ async def run_with_reconnect(
 
         except Exception as e:
             attempts += 1
-            stream._stats.reconnections += 1
             stream._stats.errors += 1
 
             if max_retries is not None and attempts > max_retries:
@@ -484,6 +483,9 @@ async def run_with_reconnect(
                     "Max retries (%d) exceeded, stopping", max_retries
                 )
                 break
+
+            # Only count as a reconnection if we're actually going to retry.
+            stream._stats.reconnections += 1
 
             # Save checkpoint before reconnecting.
             delta = stream.stats.messages_delivered - delivered_baseline

@@ -407,9 +407,11 @@ class TestReconnect:
             async with NeptuneStream(config=config) as stream:
                 await run_with_reconnect(stream, connect, max_retries=2)
 
-            # 1 initial + 2 retries = 3 calls.
+            # 1 initial + 2 retries = 3 calls total.
             assert call_count == 3
-            assert stream.stats.reconnections == 3
+            # reconnections counts only actual retries (not the terminal failure).
+            assert stream.stats.reconnections == 2
+            # errors counts all failures including the terminal one.
             assert stream.stats.errors == 3
 
         _run(_test())
