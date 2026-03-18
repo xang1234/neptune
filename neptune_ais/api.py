@@ -442,6 +442,94 @@ class Neptune:
 
         return lf
 
+    def tracks(
+        self,
+        *,
+        gap: str = "30m",
+        min_points: int = 3,
+        min_duration: str = "5m",
+        min_distance_m: float = 100.0,
+        generalize: str = "0",
+        include_geometry: bool = False,
+        refresh: bool = False,
+    ) -> pl.LazyFrame:
+        """Derive and return tracks as a Polars LazyFrame.
+
+        Runs the full track derivation pipeline on positions data:
+        sort → detect boundaries → filter segments → aggregate.
+
+        Results are cached in the derived store. Subsequent calls with
+        the same parameters and unchanged upstream data return cached
+        results without recomputation.
+
+        Args:
+            gap: Max observation gap before segment break (e.g. "30m").
+            min_points: Minimum positions per segment.
+            min_duration: Minimum segment duration (e.g. "5m").
+            min_distance_m: Minimum segment distance in meters.
+            generalize: Douglas-Peucker tolerance (e.g. "1m", "0" to disable).
+            include_geometry: Whether to include WKB geometry and timestamp offsets.
+            refresh: If True, recompute even if cached.
+        """
+        from neptune_ais.derive.tracks import (
+            TrackConfig,
+            aggregate_tracks,
+            detect_boundaries,
+            filter_segments,
+            parse_track_args,
+        )
+        from neptune_ais.datasets.tracks import SCHEMA
+
+        config = parse_track_args(
+            gap=gap,
+            min_points=min_points,
+            min_duration=min_duration,
+            min_distance_m=min_distance_m,
+            generalize=generalize,
+            include_geometry=include_geometry,
+            refresh=refresh,
+        )
+
+        # Check for cached tracks in the derived store.
+        derived_files = self._dataset_files("tracks")
+        if derived_files and not config.refresh:
+            logger.info("Using cached tracks (%d file(s))", len(derived_files))
+            return pl.scan_parquet(
+                derived_files,
+                missing_columns="insert",
+                extra_columns="ignore",
+            )
+
+        # Compute tracks from positions.
+        positions = self.positions().collect()
+        if len(positions) == 0:
+            return pl.DataFrame(schema=SCHEMA).lazy()
+
+        positions = positions.sort(["mmsi", "timestamp"])
+
+        # Run pipeline per source.
+        all_tracks: list[pl.DataFrame] = []
+        for source_id in positions["source"].unique().to_list():
+            source_df = positions.filter(pl.col("source") == source_id)
+            segmented = detect_boundaries(source_df, config)
+            filtered = filter_segments(segmented, config)
+            if len(filtered) > 0:
+                tracks_df = aggregate_tracks(filtered, config, source=source_id)
+                all_tracks.append(tracks_df)
+
+        if not all_tracks:
+            return pl.DataFrame(schema=SCHEMA).lazy()
+
+        result = pl.concat(all_tracks) if len(all_tracks) > 1 else all_tracks[0]
+
+        logger.info(
+            "Derived %d tracks from %d positions",
+            len(result),
+            len(positions),
+        )
+
+        return result.lazy()
+
     def vessels(self) -> pl.LazyFrame:
         """Return vessels as a Polars LazyFrame."""
         files = self._dataset_files("vessels")

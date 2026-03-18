@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+import polars as pl
+
 
 @dataclass(frozen=True)
 class TrackConfig:
@@ -237,6 +239,365 @@ def compute_upstream_hash(
     """
     key = f"n={record_count}:" + "+".join(manifest_checksums)
     return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# Segmentation — boundary detection and segment ID assignment
+# ---------------------------------------------------------------------------
+
+# Knots to meters-per-second conversion factor.
+_KNOTS_TO_MPS = 1852.0 / 3600.0
+
+# Approximate meters per degree of latitude (constant, good enough for speed).
+_METERS_PER_DEG_LAT = 111_320.0
+
+
+def _equirect_distance_expr() -> pl.Expr:
+    """Equirectangular distance expression between consecutive points.
+
+    Computes approximate distance in meters using ``.diff()`` on ``lat``
+    and ``lon`` columns. Suitable for use inside ``group_by().agg()``
+    where ``.diff()`` operates within each group.
+
+    Note: ``detect_boundaries`` uses its own variant with pre-computed
+    ``.over("mmsi")`` diffs because it needs per-vessel (not per-group)
+    differencing.
+    """
+    return (
+        (
+            (pl.col("lat").diff() * _METERS_PER_DEG_LAT).pow(2)
+            + (
+                pl.col("lon").diff()
+                * _METERS_PER_DEG_LAT
+                * pl.col("lat").radians().cos()
+            ).pow(2)
+        ).sqrt()
+    )
+
+
+def detect_boundaries(
+    df: pl.DataFrame,
+    config: TrackConfig,
+) -> pl.DataFrame:
+    """Detect segment boundaries in a sorted positions DataFrame.
+
+    The input must be sorted by ``(mmsi, timestamp)``. Returns the same
+    DataFrame with an added ``_segment_id`` column (Int64) that assigns
+    a unique segment number to each contiguous group of positions.
+
+    Boundary triggers (any one causes a new segment):
+    1. **Different vessel** — MMSI changes between consecutive rows.
+    2. **Time gap** — time difference exceeds ``config.gap_seconds``.
+    3. **Non-monotonic timestamp** — timestamp decreases (data corruption).
+    4. **Implausible jump** — implied speed between consecutive points
+       exceeds ``config.max_speed_knots``.
+
+    This is a pure Polars columnar operation — no Python row iteration.
+    """
+    gap_us = config.gap_seconds * 1_000_000  # microseconds
+    max_speed_mps = config.max_speed_knots * _KNOTS_TO_MPS
+
+    # Compute differences within each vessel group.
+    df = df.with_columns(
+        # Time diff in microseconds.
+        pl.col("timestamp").diff().dt.total_microseconds()
+        .over("mmsi")
+        .alias("_dt_us"),
+
+        # Lat/lon diffs for distance estimation.
+        pl.col("lat").diff().over("mmsi").alias("_dlat"),
+        pl.col("lon").diff().over("mmsi").alias("_dlon"),
+
+        # MMSI change detection (first row of each vessel).
+        (pl.col("mmsi") != pl.col("mmsi").shift(1)).alias("_new_vessel"),
+    )
+
+    # Approximate distance in meters (equirectangular projection).
+    # Good enough for speed plausibility checks at AIS scales.
+    df = df.with_columns(
+        (
+            (
+                (pl.col("_dlat") * _METERS_PER_DEG_LAT).pow(2)
+                + (
+                    pl.col("_dlon")
+                    * _METERS_PER_DEG_LAT
+                    * pl.col("lat").radians().cos()
+                ).pow(2)
+            ).sqrt()
+        ).alias("_dist_m"),
+    )
+
+    # Implied speed in m/s.
+    df = df.with_columns(
+        (
+            pl.col("_dist_m")
+            / (pl.col("_dt_us").cast(pl.Float64) / 1e6)
+        ).alias("_speed_mps"),
+    )
+
+    # Detect boundaries.
+    df = df.with_columns(
+        (
+            pl.col("_new_vessel")                        # new vessel
+            | pl.col("_dt_us").is_null()                 # first row
+            | (pl.col("_dt_us") > gap_us)                # time gap
+            | (pl.col("_dt_us") <= 0)                    # non-monotonic
+            | (pl.col("_speed_mps") > max_speed_mps)     # implausible jump
+        ).alias("_is_boundary"),
+    )
+
+    # Assign segment IDs via cumulative sum of boundaries.
+    df = df.with_columns(
+        pl.col("_is_boundary").cast(pl.Int64).cum_sum().alias("_segment_id"),
+    )
+
+    # Drop intermediate columns.
+    df = df.drop([
+        "_dt_us", "_dlat", "_dlon", "_new_vessel",
+        "_dist_m", "_speed_mps", "_is_boundary",
+    ])
+
+    return df
+
+
+def filter_segments(
+    df: pl.DataFrame,
+    config: TrackConfig,
+) -> pl.DataFrame:
+    """Remove segments that don't meet minimum thresholds.
+
+    Filters out segments with fewer than ``min_points``, shorter duration
+    than ``min_duration_seconds``, or less distance than ``min_distance_m``.
+
+    The input must have a ``_segment_id`` column (from ``detect_boundaries``).
+    """
+    # Compute per-segment stats for filtering.
+    seg_stats = (
+        df.group_by("_segment_id")
+        .agg(
+            pl.len().alias("_seg_points"),
+            (
+                (pl.col("timestamp").max() - pl.col("timestamp").min())
+                .dt.total_seconds()
+            ).alias("_seg_duration_s"),
+            # Sum of pairwise distances (approximate total distance).
+            _equirect_distance_expr().sum().alias("_seg_distance_m"),
+        )
+    )
+
+    # Filter to segments meeting all thresholds.
+    valid_ids = (
+        seg_stats
+        .filter(
+            (pl.col("_seg_points") >= config.min_points)
+            & (pl.col("_seg_duration_s") >= config.min_duration_seconds)
+            & (pl.col("_seg_distance_m") >= config.min_distance_m)
+        )
+        .select("_segment_id")
+    )
+
+    return df.join(valid_ids, on="_segment_id", how="semi")
+
+
+# ---------------------------------------------------------------------------
+# Aggregation — compute per-track statistics and optional geometry
+# ---------------------------------------------------------------------------
+
+
+def aggregate_tracks(
+    df: pl.DataFrame,
+    config: TrackConfig,
+    source: str = "",
+) -> pl.DataFrame:
+    """Aggregate segmented positions into canonical track records.
+
+    Takes a positions DataFrame with ``_segment_id`` column (from
+    ``detect_boundaries`` + ``filter_segments``) and produces one row
+    per segment matching the ``tracks/v1`` schema.
+
+    Args:
+        df: Positions with ``_segment_id``, sorted by (mmsi, timestamp).
+        config: Track derivation configuration.
+        source: Source identifier for provenance.
+
+    Returns:
+        A DataFrame conforming to ``datasets.tracks.SCHEMA``.
+    """
+    from neptune_ais.datasets.tracks import Col, make_track_id
+
+    cfg_hash = config.config_hash()
+
+    # Core aggregation: one row per segment.
+    agg_exprs = [
+        # Identity.
+        pl.col("mmsi").first().alias(Col.MMSI),
+
+        # Temporal bounds.
+        pl.col("timestamp").min().alias(Col.START_TIME),
+        pl.col("timestamp").max().alias(Col.END_TIME),
+
+        # Statistics.
+        pl.len().cast(pl.Int64).alias(Col.POINT_COUNT),
+        (
+            (pl.col("timestamp").max() - pl.col("timestamp").min())
+            .dt.total_seconds()
+            .cast(pl.Float64)
+        ).alias(Col.DURATION_S),
+
+        # Distance: sum of pairwise distances.
+        _equirect_distance_expr().sum().alias(Col.DISTANCE_M),
+
+        # Speed: from SOG column if available.
+        pl.col("sog").mean().alias(Col.MEAN_SPEED)
+        if "sog" in df.columns
+        else pl.lit(None).cast(pl.Float64).alias(Col.MEAN_SPEED),
+
+        pl.col("sog").max().alias(Col.MAX_SPEED)
+        if "sog" in df.columns
+        else pl.lit(None).cast(pl.Float64).alias(Col.MAX_SPEED),
+
+        # Spatial bounds.
+        pl.col("lon").min().alias(Col.BBOX_WEST),
+        pl.col("lat").min().alias(Col.BBOX_SOUTH),
+        pl.col("lon").max().alias(Col.BBOX_EAST),
+        pl.col("lat").max().alias(Col.BBOX_NORTH),
+
+        # Provenance.
+        pl.col("source").first().alias(Col.SOURCE),
+    ]
+
+    tracks = df.group_by("_segment_id").agg(agg_exprs)
+
+    # Compute derived speed from distance/duration if SOG not available.
+    if "sog" not in df.columns:
+        tracks = tracks.with_columns(
+            (
+                pl.col(Col.DISTANCE_M)
+                / pl.col(Col.DURATION_S).clip(lower_bound=1.0)
+                / _KNOTS_TO_MPS
+            ).alias(Col.MEAN_SPEED),
+        )
+
+    # Generate deterministic track_id.
+    tracks = tracks.with_columns(
+        pl.struct([Col.MMSI, Col.START_TIME, Col.SOURCE])
+        .map_elements(
+            lambda row: make_track_id(
+                row[Col.MMSI],
+                int(row[Col.START_TIME].timestamp() * 1e6),
+                row[Col.SOURCE],
+                cfg_hash,
+            ),
+            return_dtype=pl.String,
+        )
+        .alias(Col.TRACK_ID),
+    )
+
+    # Add provenance.
+    tracks = tracks.with_columns(
+        pl.lit(f"{source or 'derived'}:tracks").alias(Col.RECORD_PROVENANCE),
+    )
+
+    # Optional geometry.
+    if config.include_geometry:
+        tracks = _add_geometry(tracks, df)
+
+    # Drop internal segment_id, select final columns.
+    output_cols = [
+        Col.TRACK_ID, Col.MMSI, Col.START_TIME, Col.END_TIME,
+        Col.POINT_COUNT, Col.DISTANCE_M, Col.DURATION_S,
+        Col.MEAN_SPEED, Col.MAX_SPEED,
+        Col.BBOX_WEST, Col.BBOX_SOUTH, Col.BBOX_EAST, Col.BBOX_NORTH,
+        Col.SOURCE, Col.RECORD_PROVENANCE,
+    ]
+    if config.include_geometry:
+        output_cols.extend([Col.GEOMETRY_WKB, Col.TIMESTAMP_OFFSETS_MS])
+
+    available = [c for c in output_cols if c in tracks.columns]
+    return tracks.select(available).sort([Col.MMSI, Col.START_TIME])
+
+
+def _add_geometry(
+    tracks: pl.DataFrame,
+    positions: pl.DataFrame,
+) -> pl.DataFrame:
+    """Add WKB geometry and timestamp offsets to track records.
+
+    Collects lat/lon/timestamp per segment, encodes as WKB LineString,
+    and computes per-vertex timestamp offsets relative to segment start.
+    """
+    from neptune_ais.datasets.tracks import Col
+
+    # Collect per-segment coordinate and timestamp lists.
+    geo_data = (
+        positions.group_by("_segment_id")
+        .agg(
+            pl.col("lat").alias("_lats"),
+            pl.col("lon").alias("_lons"),
+            pl.col("timestamp").alias("_timestamps"),
+        )
+    )
+
+    # Compute geometry and timestamp offsets in a single pass.
+    geo_data = geo_data.with_columns(
+        pl.struct(["_lats", "_lons", "_timestamps"])
+        .map_elements(
+            lambda row: {
+                "wkb": _encode_wkb_linestring(row["_lats"], row["_lons"]),
+                "offsets": _compute_timestamp_offsets(row["_timestamps"]),
+            },
+            return_dtype=pl.Struct({
+                "wkb": pl.Binary,
+                "offsets": pl.List(pl.Int64),
+            }),
+        )
+        .alias("_geo_result"),
+    )
+    geo_data = geo_data.with_columns(
+        pl.col("_geo_result").struct.field("wkb").alias(Col.GEOMETRY_WKB),
+        pl.col("_geo_result").struct.field("offsets").alias(Col.TIMESTAMP_OFFSETS_MS),
+    ).drop("_geo_result")
+
+    # Join geometry columns back to tracks.
+    return tracks.join(
+        geo_data.select(["_segment_id", Col.GEOMETRY_WKB, Col.TIMESTAMP_OFFSETS_MS]),
+        on="_segment_id",
+        how="left",
+    )
+
+
+def _compute_timestamp_offsets(timestamps: list) -> list[int]:
+    """Compute per-vertex ms offsets from the first timestamp."""
+    if not timestamps:
+        return []
+    start = timestamps[0]
+    return [int((t - start).total_seconds() * 1000) for t in timestamps]
+
+
+def _encode_wkb_linestring(lats: list[float], lons: list[float]) -> bytes | None:
+    """Encode a list of lat/lon pairs as a WKB LineString (little-endian).
+
+    Returns None if fewer than 2 points (WKB LineString requires >= 2).
+
+    WKB format:
+    - 1 byte: byte order (01 = little-endian)
+    - 4 bytes: geometry type (02000000 = LineString)
+    - 4 bytes: number of points
+    - For each point: 8 bytes lon (double) + 8 bytes lat (double)
+    """
+    import struct
+
+    n = len(lats)
+    if n < 2:
+        return None
+
+    parts = [
+        struct.pack("<BII", 1, 2, n),  # byte order, type, num points
+    ]
+    for lat, lon in zip(lats, lons):
+        parts.append(struct.pack("<dd", lon, lat))  # WKB: x=lon, y=lat
+
+    return b"".join(parts)
 
 
 def parse_track_args(
