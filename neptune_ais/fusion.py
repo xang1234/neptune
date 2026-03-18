@@ -220,6 +220,85 @@ class FusionConfig:
 
 
 # ---------------------------------------------------------------------------
+# Near-duplicate matching — what constitutes the "same observation"
+# ---------------------------------------------------------------------------
+#
+# Two observations from different sources are considered near-duplicates
+# (i.e., the "same" real-world event) if ALL of these match:
+#
+# 1. MMSI — exact match (same vessel).
+# 2. Timestamp — within timestamp_tolerance_seconds of each other.
+# 3. Coordinates — within coordinate_tolerance_degrees of each other
+#    (set to 0.0 to skip coordinate matching).
+#
+# The dedup key does NOT use source_record_id because different sources
+# assign independent record IDs. Cross-source dedup must rely on the
+# physical observation properties (vessel, time, position).
+
+
+def compute_dedup_buckets(
+    df: pl.DataFrame,
+    config: FusionConfig,
+) -> pl.DataFrame:
+    """Add dedup bucket columns to a DataFrame for near-duplicate grouping.
+
+    Adds internal columns:
+    - ``_dedup_ts_bucket``: timestamp rounded to the tolerance window
+    - ``_dedup_lat_bucket``: lat rounded to tolerance grid (if enabled)
+    - ``_dedup_lon_bucket``: lon rounded to tolerance grid (if enabled)
+
+    Uses ``config.timestamp_tolerance_seconds`` and
+    ``config.coordinate_tolerance_degrees`` directly — no intermediate
+    objects needed.
+    """
+    tolerance_us = config.timestamp_tolerance_seconds * 1_000_000
+    exprs: list[pl.Expr] = []
+
+    if tolerance_us > 0:
+        exprs.append(
+            (pl.col("timestamp").dt.epoch("us") // tolerance_us * tolerance_us)
+            .alias("_dedup_ts_bucket")
+        )
+    else:
+        exprs.append(
+            pl.col("timestamp").dt.epoch("us").alias("_dedup_ts_bucket")
+        )
+
+    if config.coordinate_tolerance_degrees > 0.0:
+        tol = config.coordinate_tolerance_degrees
+        if "lat" in df.columns and "lon" in df.columns:
+            exprs.append((pl.col("lat") / tol).round(0).alias("_dedup_lat_bucket"))
+            exprs.append((pl.col("lon") / tol).round(0).alias("_dedup_lon_bucket"))
+
+    return df.with_columns(exprs)
+
+
+def dedup_subset_columns(config: FusionConfig, df: pl.DataFrame) -> list[str]:
+    """Return the column names that form the dedup group key.
+
+    Always includes ``mmsi`` and ``_dedup_ts_bucket``. Adds coordinate
+    buckets if coordinate tolerance is enabled and columns exist.
+    """
+    subset = ["mmsi", "_dedup_ts_bucket"]
+    if (
+        config.coordinate_tolerance_degrees > 0.0
+        and "_dedup_lat_bucket" in df.columns
+        and "_dedup_lon_bucket" in df.columns
+    ):
+        subset.extend(["_dedup_lat_bucket", "_dedup_lon_bucket"])
+    return subset
+
+
+DEDUP_INTERNAL_COLUMNS: frozenset[str] = frozenset({
+    "_dedup_ts_bucket",
+    "_dedup_lat_bucket",
+    "_dedup_lon_bucket",
+    "_fusion_rank",
+})
+"""Internal columns added during dedup that must be dropped before return."""
+
+
+# ---------------------------------------------------------------------------
 # Parsing helper — convert user-facing merge string to FusionConfig
 # ---------------------------------------------------------------------------
 
@@ -359,7 +438,7 @@ def _merge_best(
     5. Within each group, keep the row with the best (lowest) rank.
     6. Tag provenance on the winner.
     """
-    # Build source → rank mapping.
+    # Build source precedence.
     precedence = _build_precedence(config, list(frames.keys()))
 
     # Concatenate and add rank column.
@@ -375,25 +454,14 @@ def _merge_best(
     aligned = [_align_columns(df, all_cols) for df in tagged]
     combined = pl.concat(aligned, how="vertical_relaxed")
 
-    # Round timestamps to tolerance window for grouping.
-    tolerance_us = config.timestamp_tolerance_seconds * 1_000_000
-    if tolerance_us > 0:
-        combined = combined.with_columns(
-            (pl.col("timestamp").dt.epoch("us") // tolerance_us * tolerance_us)
-            .alias("_fusion_ts_bucket"),
-        )
-    else:
-        combined = combined.with_columns(
-            pl.col("timestamp").dt.epoch("us").alias("_fusion_ts_bucket"),
-        )
+    # Compute dedup buckets (timestamp + optional coordinates).
+    combined = compute_dedup_buckets(combined, config)
+    subset = dedup_subset_columns(config, combined)
 
-    # Within each (mmsi, ts_bucket), keep the row with the lowest rank.
-    # Use sort + unique to get deterministic dedup.
-    combined = combined.sort(["mmsi", "_fusion_ts_bucket", "_fusion_rank", "timestamp"])
-    deduped = combined.unique(
-        subset=["mmsi", "_fusion_ts_bucket"],
-        keep="first",
-    )
+    # Within each dedup group, keep the row with the best (lowest) rank.
+    sort_cols = subset + ["_fusion_rank", "timestamp"]
+    combined = combined.sort(sort_cols)
+    deduped = combined.unique(subset=subset, keep="first")
 
     # Count how many rows were deduped.
     n_before = len(combined)
@@ -422,7 +490,8 @@ def _merge_best(
         )
 
     # Drop internal columns.
-    deduped = deduped.drop(["_fusion_rank", "_fusion_ts_bucket"])
+    drop_cols = [c for c in DEDUP_INTERNAL_COLUMNS if c in deduped.columns]
+    deduped = deduped.drop(drop_cols)
 
     logger.info(
         "Best merge: %d sources, %d → %d rows (%d near-duplicates removed)",
