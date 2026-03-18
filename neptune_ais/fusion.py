@@ -216,6 +216,17 @@ class FusionConfig:
                     f"[0.0, 1.0], got {weight}"
                 )
 
+        # Field precedence must not include core observation columns
+        # that the fusion engine relies on (source, mmsi, timestamp, etc.).
+        protected = {"mmsi", "timestamp", "lat", "lon", "source",
+                      "record_provenance", "qc_severity", "ingest_id"}
+        for field_name in self.field_precedence:
+            if field_name in protected:
+                errors.append(
+                    f"field_precedence must not include protected column "
+                    f"{field_name!r}"
+                )
+
         return errors
 
 
@@ -461,33 +472,46 @@ def _merge_best(
     # Within each dedup group, keep the row with the best (lowest) rank.
     sort_cols = subset + ["_fusion_rank", "timestamp"]
     combined = combined.sort(sort_cols)
-    deduped = combined.unique(subset=subset, keep="first")
+
+    if config.field_precedence:
+        # Field-level conflict resolution: for specified fields, pick
+        # the best non-null value per-field within each dedup group.
+        deduped = _resolve_field_conflicts(combined, subset, config)
+    else:
+        # Simple row-level dedup: keep entire row from best source.
+        deduped = combined.unique(subset=subset, keep="first")
 
     # Count how many rows were deduped.
     n_before = len(combined)
     n_after = len(deduped)
     n_deduped = n_before - n_after
 
-    # Tag provenance — distinguish mode in the tag.
+    # Build provenance: collect contributing sources per dedup group.
     if config.tag_provenance:
-        if config.mode == MergeMode.PREFER:
-            tag_suffix = f":prefer:{config.prefer_source}"
-        else:
-            tag_suffix = ":best"
-        deduped = deduped.with_columns(
-            (pl.col("source") + pl.lit(tag_suffix)).alias("record_provenance"),
+        # Compute which sources contributed to each dedup group.
+        contributors = (
+            combined
+            .group_by(subset)
+            .agg(pl.col("source").unique().sort().alias("_contributors"))
         )
+        deduped = deduped.join(contributors, on=subset, how="left")
+
+        # Build provenance token: "winner:mode[+contributor1+contributor2]"
+        if config.mode == MergeMode.PREFER:
+            mode_tag = f"prefer:{config.prefer_source}"
+        else:
+            mode_tag = "best"
+
+        deduped = deduped.with_columns(
+            _build_provenance_token(mode_tag).alias("record_provenance"),
+        )
+
+        # Drop internal contributor column.
+        deduped = deduped.drop("_contributors")
 
     # Apply confidence weights if configured.
     if config.source_confidence_weights:
-        weight_expr = pl.lit(1.0)
-        for source_id, weight in config.source_confidence_weights.items():
-            weight_expr = pl.when(pl.col("source") == source_id).then(
-                pl.lit(weight)
-            ).otherwise(weight_expr)
-        deduped = deduped.with_columns(
-            weight_expr.alias("confidence_score"),
-        )
+        deduped = _apply_confidence_weights(deduped, config)
 
     # Drop internal columns.
     drop_cols = [c for c in DEDUP_INTERNAL_COLUMNS if c in deduped.columns]
@@ -502,6 +526,167 @@ def _merge_best(
     )
 
     return deduped
+
+
+# ---------------------------------------------------------------------------
+# Field-level conflict resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_field_conflicts(
+    combined: pl.DataFrame,
+    subset: list[str],
+    config: FusionConfig,
+) -> pl.DataFrame:
+    """Resolve per-field conflicts within dedup groups.
+
+    For each dedup group (identified by ``subset`` columns):
+    - Fields listed in ``config.field_precedence`` pick the best non-null
+      value according to that field's source priority.
+    - All other fields take the first value (from the best-ranked row,
+      since the input is pre-sorted by rank).
+
+    Protected columns (mmsi, timestamp, source, etc.) are rejected by
+    ``FusionConfig.validate()`` and cannot appear in ``field_precedence``.
+
+    Returns one row per dedup group.
+    """
+    # Build per-field rank columns for fields with custom precedence.
+    field_rank_exprs: list[pl.Expr] = []
+    field_rank_cols: dict[str, str] = {}  # field_name → rank_col_name
+
+    for field_name, source_order in config.field_precedence.items():
+        if field_name not in combined.columns:
+            continue
+        rank_col = f"_fprec_{field_name}"
+        # Build a when/then chain: source_order[0] → 0, source_order[1] → 1, etc.
+        expr = pl.lit(len(source_order))  # default rank for unlisted sources
+        for i, src in enumerate(source_order):
+            expr = (
+                pl.when(pl.col("source") == src)
+                .then(pl.lit(i))
+                .otherwise(expr)
+            )
+        field_rank_exprs.append(expr.alias(rank_col).cast(pl.Int32))
+        field_rank_cols[field_name] = rank_col
+
+    if field_rank_exprs:
+        combined = combined.with_columns(field_rank_exprs)
+
+    # Build aggregation expressions per column.
+    agg_exprs: list[pl.Expr] = []
+
+    for col_name in combined.columns:
+        if col_name in subset:
+            # Group-by key — not aggregated.
+            continue
+
+        if col_name in field_rank_cols:
+            # Custom field precedence: pick best non-null value by
+            # field-specific rank.
+            rank_col = field_rank_cols[col_name]
+            # Sort by field rank, drop nulls, take first.
+            agg_exprs.append(
+                pl.col(col_name)
+                .sort_by(rank_col)
+                .drop_nulls()
+                .first()
+                .alias(col_name)
+            )
+        elif col_name.startswith("_fprec_"):
+            # Internal field-precedence rank column — skip.
+            continue
+        else:
+            # Default: take first value (from best-ranked row due to sort).
+            agg_exprs.append(pl.col(col_name).first())
+
+    result = combined.group_by(subset).agg(agg_exprs)
+
+    # Drop field-precedence rank columns.
+    fprec_cols = [c for c in result.columns if c.startswith("_fprec_")]
+    if fprec_cols:
+        result = result.drop(fprec_cols)
+
+    return result
+
+
+def _apply_confidence_weights(
+    df: pl.DataFrame,
+    config: FusionConfig,
+) -> pl.DataFrame:
+    """Apply per-source confidence weights to a DataFrame.
+
+    Sets the ``confidence_score`` column based on the source of each row.
+    Sources not listed in ``config.source_confidence_weights`` default to 1.0.
+    """
+    weight_expr = pl.lit(1.0)
+    for source_id, weight in config.source_confidence_weights.items():
+        weight_expr = (
+            pl.when(pl.col("source") == source_id)
+            .then(pl.lit(weight))
+            .otherwise(weight_expr)
+        )
+    return df.with_columns(weight_expr.alias("confidence_score"))
+
+
+# ---------------------------------------------------------------------------
+# Provenance token construction
+# ---------------------------------------------------------------------------
+
+
+def _build_provenance_token(mode_tag: str) -> pl.Expr:
+    """Build a provenance token expression for fused rows.
+
+    Token format: ``"winner:mode"`` or ``"winner:mode[+src1+src2]"``
+
+    Examples:
+    - ``"noaa:best"`` — single source, no dedup needed
+    - ``"noaa:best[+dma]"`` — noaa won, dma also contributed
+    - ``"noaa:prefer:noaa[+dma+aishub]"`` — noaa preferred, others contributed
+
+    Requires ``_contributors`` column (List[String]) with sorted unique
+    source IDs that contributed to each dedup group.
+    """
+    winner = pl.col("source")
+    n_contributors = pl.col("_contributors").list.len()
+    all_sources = pl.col("_contributors").list.join("+")
+
+    base = winner + pl.lit(f":{mode_tag}")
+    return (
+        pl.when(n_contributors > 1)
+        .then(base + pl.lit("[+") + all_sources + pl.lit("]"))
+        .otherwise(base)
+    )
+
+
+@dataclass
+class FusionSummary:
+    """Summary of a fusion operation for inspection and debugging.
+
+    Returned by ``merge()`` when summary is requested, providing
+    row-level statistics and contributor breakdowns.
+    """
+
+    mode: str
+    """Merge mode used: 'union', 'best', 'prefer:<source>'."""
+
+    sources: list[str]
+    """Source IDs that were merged."""
+
+    rows_before: int
+    """Total rows across all sources before dedup."""
+
+    rows_after: int
+    """Rows after dedup."""
+
+    rows_deduped: int
+    """Number of near-duplicate rows removed."""
+
+    dedup_groups_with_conflicts: int = 0
+    """Number of dedup groups where sources disagreed on at least one field."""
+
+    field_precedence_applied: list[str] = field(default_factory=list)
+    """Fields that had custom precedence applied."""
 
 
 # ---------------------------------------------------------------------------
@@ -573,8 +758,11 @@ def _align_columns(
     df: pl.DataFrame, target_cols: dict[str, pl.DataType]
 ) -> pl.DataFrame:
     """Add missing columns as null and reorder to match target schema."""
-    for col_name, dtype in target_cols.items():
-        if col_name not in df.columns:
-            df = df.with_columns(pl.lit(None).cast(dtype).alias(col_name))
-    # Select in target order, keeping only columns that exist in target.
+    missing = [
+        pl.lit(None).cast(dtype).alias(col_name)
+        for col_name, dtype in target_cols.items()
+        if col_name not in df.columns
+    ]
+    if missing:
+        df = df.with_columns(missing)
     return df.select([c for c in target_cols if c in df.columns])
