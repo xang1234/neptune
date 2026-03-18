@@ -47,32 +47,36 @@ def _write_events_partition(store_root: Path) -> pl.DataFrame:
     from neptune_ais.storage import PartitionWriter, RawPolicy, shard_filename
 
     events_df = pl.DataFrame({
-        Col.EVENT_ID: ["evt_aaa", "evt_bbb", "evt_ccc", "evt_ddd"],
-        Col.EVENT_TYPE: ["port_call", "port_call", "encounter", "loitering"],
-        Col.MMSI: pl.Series([111, 222, 111, 333], dtype=pl.Int64),
-        Col.OTHER_MMSI: pl.Series([None, None, 222, None], dtype=pl.Int64),
+        Col.EVENT_ID: ["evt_aaa", "evt_bbb", "evt_ccc", "evt_ddd", "evt_eee"],
+        Col.EVENT_TYPE: ["port_call", "port_call", "encounter", "loitering", "eez_crossing"],
+        Col.MMSI: pl.Series([111, 222, 111, 333, 111], dtype=pl.Int64),
+        Col.OTHER_MMSI: pl.Series([None, None, 222, None, None], dtype=pl.Int64),
         Col.START_TIME: pl.Series([
             datetime(2024, 6, 15, 0, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 2, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 4, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+            datetime(2024, 6, 15, 8, 0, tzinfo=timezone.utc),
         ], dtype=pl.Datetime("us", "UTC")),
         Col.END_TIME: pl.Series([
             datetime(2024, 6, 15, 1, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 3, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 5, 0, tzinfo=timezone.utc),
             datetime(2024, 6, 15, 7, 0, tzinfo=timezone.utc),
+            datetime(2024, 6, 15, 9, 0, tzinfo=timezone.utc),
         ], dtype=pl.Datetime("us", "UTC")),
-        Col.LAT: [40.0, 55.0, 42.0, 30.0],
-        Col.LON: [-74.0, 12.0, -70.0, -80.0],
-        Col.GEOMETRY_WKB: pl.Series([None] * 4, dtype=pl.Binary),
-        Col.CONFIDENCE_SCORE: [0.9, 0.5, 0.8, 0.2],
-        Col.SOURCE: ["noaa", "noaa", "noaa", "noaa"],
+        Col.LAT: [40.0, 55.0, 42.0, 30.0, 41.0],
+        Col.LON: [-74.0, 12.0, -70.0, -80.0, -73.0],
+        Col.GEOMETRY_WKB: pl.Series([None] * 5, dtype=pl.Binary),
+        # 0.7 boundary value tests >= semantics in min_confidence filter.
+        Col.CONFIDENCE_SCORE: [0.9, 0.5, 0.8, 0.2, 0.7],
+        Col.SOURCE: ["noaa", "noaa", "noaa", "noaa", "noaa"],
         Col.RECORD_PROVENANCE: [
             "noaa:port_call_detector/0.1.0[tracks]",
             "noaa:port_call_detector/0.1.0[tracks]",
             "noaa:encounter_detector/0.1.0[tracks]",
             "noaa:loitering_detector/0.1.0[tracks]",
+            "noaa:eez_detector/0.1.0[tracks+boundaries]",
         ],
     })
 
@@ -137,7 +141,7 @@ class TestEventsAccessor:
         with tempfile.TemporaryDirectory() as tmp:
             n, events_df = self._setup(tmp)
             result = n.events().collect()
-            assert len(result) == len(events_df)
+            assert len(result) == 5
 
     def test_events_filter_by_kind(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,7 +161,8 @@ class TestEventsAccessor:
         with tempfile.TemporaryDirectory() as tmp:
             n, _ = self._setup(tmp)
             result = n.events(min_confidence=0.7).collect()
-            assert len(result) == 2  # 0.9 and 0.8
+            # 0.9 + 0.8 + 0.7 (boundary — >= includes exact match)
+            assert len(result) == 3
             assert (result[Col.CONFIDENCE_SCORE] >= 0.7).all()
 
     def test_events_filter_by_kind_and_confidence(self):
@@ -175,7 +180,7 @@ class TestEventsAccessor:
                 "2024-06-15", sources=["noaa"], mmsi=[111], cache_dir=store
             )
             result = n.events().collect()
-            assert len(result) == 2  # port_call + encounter for mmsi 111
+            assert len(result) == 3  # port_call + encounter + eez_crossing for mmsi 111
             assert (result[Col.MMSI] == 111).all()
 
     def test_events_filter_by_bbox(self):
@@ -189,8 +194,10 @@ class TestEventsAccessor:
                 cache_dir=store,
             )
             result = n.events().collect()
-            assert len(result) == 1
-            assert result[Col.LAT][0] == 40.0
+            # port_call at (40,-74) and eez_crossing at (41,-73) are inside bbox
+            assert len(result) == 2
+            assert (result[Col.LAT] >= 39.0).all()
+            assert (result[Col.LAT] <= 41.0).all()
 
     def test_events_empty_when_no_data(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,7 +229,7 @@ class TestEventsDuckDB:
             n = Neptune("2024-06-15", sources=["noaa"], cache_dir=store)
             con = n.duckdb()
             count = con.sql("SELECT count(*) FROM events").fetchone()[0]
-            assert count == 4
+            assert count == 5
 
     def test_events_sql_query(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +275,7 @@ class TestEventsCLI:
                 "--cache-dir", tmp,
             ])
             assert result.exit_code == 0
-            assert "4 row(s)" in result.output
+            assert "5 row(s)" in result.output
 
     def test_events_command_with_kind_filter(self):
         from click.testing import CliRunner
@@ -286,6 +293,23 @@ class TestEventsCLI:
             ])
             assert result.exit_code == 0
             assert "2 row(s)" in result.output
+
+    def test_events_command_with_min_confidence(self):
+        from click.testing import CliRunner
+        from neptune_ais.cli.main import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_events_partition(Path(tmp))
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "events",
+                "--date", "2024-06-15",
+                "--source", "noaa",
+                "--min-confidence", "0.7",
+                "--cache-dir", tmp,
+            ])
+            assert result.exit_code == 0
+            assert "3 row(s)" in result.output  # 0.9 + 0.8 + 0.7
 
     def test_events_command_no_data(self):
         from click.testing import CliRunner
