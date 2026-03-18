@@ -27,12 +27,14 @@ geo extra since it is used alongside spatial data).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import polars as pl
 
 from neptune_ais.datasets.positions import Col as PosCol
 from neptune_ais.datasets.tracks import Col as TrackCol
+
+# Viz-only derived column name (not part of the tracks schema).
+_TRIP_PROGRESS = "trip_progress"
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +103,12 @@ def _clip_tracks(df: pl.DataFrame, viewport: Viewport) -> pl.DataFrame:
     )
 
 
-def _sample(df: pl.DataFrame, max_rows: int | None) -> pl.DataFrame:
+def _sample(
+    df: pl.DataFrame, max_rows: int | None, *, seed: int | None = None
+) -> pl.DataFrame:
     """Downsample to at most *max_rows* rows if the frame is larger."""
     if max_rows is not None and len(df) > max_rows:
-        return df.sample(n=max_rows, seed=42)
+        return df.sample(n=max_rows, seed=seed)
     return df
 
 
@@ -207,22 +211,24 @@ def prepare_trips(
         ``trip_progress`` (Float64) column: duration_s normalized to [0, 1]
         across all returned tracks for uniform animation speed.
     """
+    # Check schema before collecting — avoids materializing a large
+    # LazyFrame only to discover the required columns are absent.
+    cols = df.columns
+    required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
+    if not required.issubset(cols):
+        schema = df.schema if isinstance(df, pl.DataFrame) else dict(df.schema)
+        empty = pl.DataFrame(schema=schema)
+        return empty.with_columns(
+            pl.lit(None).cast(pl.Float64).alias(_TRIP_PROGRESS),
+        )
+
     result = _collect(df)
 
     # Only keep tracks with geometry and timestamp offsets.
-    if TrackCol.GEOMETRY_WKB not in result.columns:
-        return result.head(0).with_columns(
-            pl.lit(None).cast(pl.Float64).alias("trip_progress"),
-        )
-
     result = result.filter(
         pl.col(TrackCol.GEOMETRY_WKB).is_not_null()
+        & pl.col(TrackCol.TIMESTAMP_OFFSETS_MS).is_not_null()
     )
-
-    if TrackCol.TIMESTAMP_OFFSETS_MS in result.columns:
-        result = result.filter(
-            pl.col(TrackCol.TIMESTAMP_OFFSETS_MS).is_not_null()
-        )
 
     if viewport is not None:
         result = _clip_tracks(result, viewport)
@@ -233,11 +239,11 @@ def prepare_trips(
     max_dur = result[TrackCol.DURATION_S].max()
     if max_dur is not None and max_dur > 0:
         result = result.with_columns(
-            (pl.col(TrackCol.DURATION_S) / max_dur).alias("trip_progress"),
+            (pl.col(TrackCol.DURATION_S) / max_dur).alias(_TRIP_PROGRESS),
         )
     else:
         result = result.with_columns(
-            pl.lit(0.0).alias("trip_progress"),
+            pl.lit(0.0).alias(_TRIP_PROGRESS),
         )
 
     return result
@@ -308,30 +314,29 @@ def prepare_density(
 
 def _density_h3(df: pl.DataFrame, resolution: int) -> pl.DataFrame:
     """Bin positions into H3 cells and count per cell."""
-    try:
-        import h3
-    except ImportError:
-        from neptune_ais.geometry import _missing_geo_extra
+    import h3  # caller guards with try/except ImportError
 
-        raise _missing_geo_extra("h3") from None
+    # Use struct map_elements to avoid materializing two Python lists.
+    h3_series = (
+        df.select(pl.struct([PosCol.LAT, PosCol.LON])
+            .map_elements(
+                lambda r: h3.latlng_to_cell(r[PosCol.LAT], r[PosCol.LON], resolution),
+                return_dtype=pl.String,
+            )
+            .alias("h3_index"))
+        .to_series()
+    )
 
-    lats = df[PosCol.LAT].to_list()
-    lons = df[PosCol.LON].to_list()
-
-    h3_indices = [h3.latlng_to_cell(lat, lon, resolution) for lat, lon in zip(lats, lons)]
-
-    h3_df = pl.DataFrame({"h3_index": h3_indices})
+    h3_df = pl.DataFrame({"h3_index": h3_series})
     counts = h3_df.group_by("h3_index").agg(pl.len().cast(pl.Int64).alias("count"))
 
-    # Compute cell centers.
+    # Compute cell centers — return struct to avoid intermediate List column.
+    _center_dtype = pl.Struct({"center_lat": pl.Float64, "center_lon": pl.Float64})
     centers = counts["h3_index"].map_elements(
-        lambda idx: h3.cell_to_latlng(idx),
-        return_dtype=pl.List(pl.Float64),
+        lambda idx: dict(zip(("center_lat", "center_lon"), h3.cell_to_latlng(idx))),
+        return_dtype=_center_dtype,
     )
-    counts = counts.with_columns(
-        centers.list.get(0).alias("center_lat"),
-        centers.list.get(1).alias("center_lon"),
-    )
+    counts = counts.with_columns(centers.struct.unnest())
 
     return counts.sort("count", descending=True)
 
@@ -358,10 +363,10 @@ def _density_grid_fallback(df: pl.DataFrame, resolution: int) -> pl.DataFrame:
 
     # Create a grid_key for the h3_index column.
     counts = counts.with_columns(
-        (
-            pl.col("center_lat").cast(pl.String)
-            + ","
-            + pl.col("center_lon").cast(pl.String)
+        pl.concat_str(
+            [pl.col("center_lat").cast(pl.String),
+             pl.col("center_lon").cast(pl.String)],
+            separator=",",
         ).alias("h3_index"),
     )
 

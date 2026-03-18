@@ -11,6 +11,7 @@ import pytest
 
 from neptune_ais.viz import (
     Viewport,
+    _TRIP_PROGRESS,
     prepare_density,
     prepare_positions,
     prepare_tracks,
@@ -26,17 +27,14 @@ from neptune_ais.viz import (
 def _sample_positions(n: int = 100) -> pl.DataFrame:
     """Generate *n* synthetic position rows spread across a bbox."""
     import random
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
-    random.seed(42)
+    rng = random.Random(42)
     base = datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
-    timestamps = [
-        datetime(2024, 6, 15, h, m, 0, tzinfo=timezone.utc)
-        for h in range(10) for m in range(10)
-    ][:n]
+    timestamps = [base + timedelta(minutes=i) for i in range(n)]
 
     return pl.DataFrame({
-        "mmsi": pl.Series([random.choice([111, 222, 333]) for _ in range(n)], dtype=pl.Int64),
+        "mmsi": pl.Series([rng.choice([111, 222, 333]) for _ in range(n)], dtype=pl.Int64),
         "timestamp": pl.Series(timestamps, dtype=pl.Datetime("us", "UTC")),
         "lat": [40.0 + i * 0.01 for i in range(n)],
         "lon": [-74.0 + i * 0.01 for i in range(n)],
@@ -202,16 +200,16 @@ class TestPrepareTrips:
         df = _sample_tracks(5, with_geometry=True)
         result = prepare_trips(df)
         assert len(result) == 5
-        assert "trip_progress" in result.columns
+        assert _TRIP_PROGRESS in result.columns
         # Trip progress should be in [0, 1].
-        assert result["trip_progress"].min() >= 0.0
-        assert result["trip_progress"].max() <= 1.0
+        assert result[_TRIP_PROGRESS].min() >= 0.0
+        assert result[_TRIP_PROGRESS].max() <= 1.0
 
     def test_without_geometry_returns_empty(self):
         df = _sample_tracks(5, with_geometry=False)
         result = prepare_trips(df)
         assert len(result) == 0
-        assert "trip_progress" in result.columns
+        assert _TRIP_PROGRESS in result.columns
 
     def test_viewport_clipping(self):
         df = _sample_tracks(10, with_geometry=True)
@@ -227,9 +225,9 @@ class TestPrepareTrips:
         )
         result = prepare_trips(df)
         # The longest track (1800s) should have progress 1.0.
-        assert result["trip_progress"].max() == pytest.approx(1.0)
+        assert result[_TRIP_PROGRESS].max() == pytest.approx(1.0)
         # The shortest (300s) should be 300/1800.
-        assert result["trip_progress"].min() == pytest.approx(300.0 / 1800.0)
+        assert result[_TRIP_PROGRESS].min() == pytest.approx(300.0 / 1800.0)
 
 
 # ---------------------------------------------------------------------------
