@@ -173,10 +173,8 @@ class TestDetectEEZCrossings:
         events = self._detect()
         assert (events[EventCol.START_TIME] <= events[EventCol.END_TIME]).all()
         # Crossing happens between point 4 (minute 40) and point 5 (minute 50).
-        start = events[EventCol.START_TIME][0]
-        end = events[EventCol.END_TIME][0]
-        gap = (end - start).total_seconds()
-        assert 0 < gap <= 600  # ~10 minutes
+        assert events[EventCol.START_TIME][0] == _ts(40)
+        assert events[EventCol.END_TIME][0] == _ts(50)
 
     def test_midpoint_location(self):
         events = self._detect()
@@ -188,8 +186,8 @@ class TestDetectEEZCrossings:
         events = self._detect()
         score = events[EventCol.CONFIDENCE_SCORE][0]
         assert 0.0 <= score <= 1.0
-        # 10-minute gap, short distance → high confidence.
-        assert score >= 0.7
+        # 10-minute gap but ~67km distance → 0.7 (gap<=2h, dist<=100km).
+        assert score == 0.7
 
     def test_provenance_token(self):
         events = self._detect()
@@ -277,6 +275,40 @@ class TestEEZCrossingFiltering:
         })
         events = self._detect(positions)
         assert len(events) == 0
+
+    def test_multi_crossing_a_b_a(self):
+        """Vessel crosses NLD → GBR → NLD → two crossing events.
+
+        Uses a generous max_distance_m to avoid filtering out the
+        return crossing.
+        """
+        rows = [
+            # In NLD_EEZ (lon 4.0 → 3.0)
+            (111, _ts(0), 53.0, 4.0, 8.0, "noaa"),
+            (111, _ts(10), 53.0, 3.5, 8.0, "noaa"),
+            (111, _ts(20), 53.0, 3.0, 8.0, "noaa"),
+            # In GBR_EEZ (lon 2.0 → 1.5)
+            (111, _ts(30), 53.0, 2.0, 8.0, "noaa"),
+            (111, _ts(40), 53.0, 1.5, 8.0, "noaa"),
+            # Back in NLD_EEZ (lon 3.0 → 4.0)
+            (111, _ts(50), 53.0, 3.0, 8.0, "noaa"),
+            (111, _ts(60), 53.0, 4.0, 8.0, "noaa"),
+        ]
+        positions = pl.DataFrame({
+            "mmsi": pl.Series([r[0] for r in rows], dtype=pl.Int64),
+            "timestamp": pl.Series([r[1] for r in rows], dtype=pl.Datetime("us", "UTC")),
+            "lat": [r[2] for r in rows],
+            "lon": [r[3] for r in rows],
+            "sog": [r[4] for r in rows],
+            "source": [r[5] for r in rows],
+        })
+        config = EEZCrossingConfig(max_distance_m=200_000)
+        events = self._detect(positions, config=config)
+        assert len(events) == 2
+        assert (events[EventCol.MMSI] == 111).all()
+        # First crossing: NLD → GBR, second: GBR → NLD.
+        sorted_events = events.sort(EventCol.START_TIME)
+        assert sorted_events[EventCol.START_TIME][1] > sorted_events[EventCol.END_TIME][0]
 
     def test_empty_positions(self):
         empty = pl.DataFrame(schema={

@@ -584,8 +584,13 @@ def detect_eez_crossings(
         ).alias("_dist_m"),
     )
 
-    # Filter by max gap.
-    crossings = crossings.filter(pl.col("_gap_us") <= gap_us)
+    # Filter by max gap, max distance, and exclude zero-duration
+    # crossings (duplicate timestamps produce phantom events).
+    crossings = crossings.filter(
+        (pl.col("_gap_us") > 0)
+        & (pl.col("_gap_us") <= gap_us)
+        & (pl.col("_dist_m") <= config.max_distance_m)
+    )
 
     if len(crossings) == 0:
         return pl.DataFrame(schema=SCHEMA)
