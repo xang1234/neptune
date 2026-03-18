@@ -247,7 +247,6 @@ class TestDensityConfig:
     def test_defaults(self):
         config = DensityConfig()
         assert config.resolution == 4
-        assert config.time_bucket_hours == 24
 
     def test_config_hash_deterministic(self):
         assert DensityConfig().config_hash() == DensityConfig().config_hash()

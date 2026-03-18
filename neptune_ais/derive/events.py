@@ -886,25 +886,23 @@ def detect_encounters(
 # Shared output helper
 # ---------------------------------------------------------------------------
 
-_EVENT_OUTPUT_COLS: list[str] = []  # populated lazily
+from neptune_ais.datasets.events import (
+    Col as _EventCol,
+    SORT_ORDER as _EVENT_SORT_ORDER,
+)
+
+_EVENT_OUTPUT_COLS: list[str] = [
+    _EventCol.EVENT_ID, _EventCol.EVENT_TYPE, _EventCol.MMSI,
+    _EventCol.OTHER_MMSI, _EventCol.START_TIME, _EventCol.END_TIME,
+    _EventCol.LAT, _EventCol.LON, _EventCol.GEOMETRY_WKB,
+    _EventCol.CONFIDENCE_SCORE, _EventCol.SOURCE,
+    _EventCol.RECORD_PROVENANCE,
+]
 
 
 def _select_and_sort_events(df: pl.DataFrame) -> pl.DataFrame:
-    """Select canonical event columns and sort by (mmsi, start_time)."""
-    from neptune_ais.datasets.events import Col as EventCol
-
-    global _EVENT_OUTPUT_COLS
-    if not _EVENT_OUTPUT_COLS:
-        _EVENT_OUTPUT_COLS = [
-            EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
-            EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
-            EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
-            EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
-            EventCol.RECORD_PROVENANCE,
-        ]
-    return df.select(_EVENT_OUTPUT_COLS).sort(
-        [EventCol.MMSI, EventCol.START_TIME]
-    )
+    """Select canonical event columns and sort by the schema's SORT_ORDER."""
+    return df.select(_EVENT_OUTPUT_COLS).sort(_EVENT_SORT_ORDER)
 
 
 # ---------------------------------------------------------------------------

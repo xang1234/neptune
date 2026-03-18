@@ -25,16 +25,12 @@ class DensityConfig:
         resolution: Grid resolution. For the lat/lon fallback, this
             maps to decimal rounding places. For H3 (when available),
             this is the H3 resolution (0–15). Default 4.
-        time_bucket_hours: Aggregate positions into time windows of
-            this width. Each (cell, time_bucket) pair counts as one
-            observation. Default 24 (daily density).
     """
 
     resolution: int = 4
-    time_bucket_hours: int = 24
 
     def config_hash(self) -> str:
-        key = f"res={self.resolution}:bucket={self.time_bucket_hours}"
+        key = f"res={self.resolution}"
         return hashlib.sha1(key.encode()).hexdigest()[:12]
 
 
