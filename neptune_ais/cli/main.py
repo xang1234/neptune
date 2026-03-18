@@ -310,6 +310,54 @@ def fusion(
 
 
 # ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--kind", "-k", help="Filter by event type (e.g. port_call).")
+@click.option("--min-confidence", type=float, help="Minimum confidence score (0.0-1.0).")
+@click.option("--date", "-d", "date_str", help="Single date (YYYY-MM-DD).")
+@click.option("--start", "start_str", help="Start date.")
+@click.option("--end", "end_str", help="End date.")
+@click.option("--source", "-s", multiple=True, help="Source(s).")
+@click.option("--mmsi", type=int, multiple=True, help="Filter by MMSI.")
+@click.option("--limit", "-n", "row_limit", type=int, help="Max rows to display.")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+def events(
+    kind: str | None,
+    min_confidence: float | None,
+    date_str: str | None,
+    start_str: str | None,
+    end_str: str | None,
+    source: tuple[str, ...],
+    mmsi: tuple[int, ...],
+    row_limit: int | None,
+    cache_dir: str | None,
+) -> None:
+    """Query stored events."""
+    from neptune_ais.api import Neptune
+
+    dates = _resolve_dates(date_str, start_str, end_str)
+    sources = list(source) if source else None
+    mmsi_list = list(mmsi) if mmsi else None
+
+    n = Neptune(dates, sources=sources, mmsi=mmsi_list, cache_dir=cache_dir)
+    lf = n.events(kind=kind, min_confidence=min_confidence)
+
+    df = lf.collect()
+    if len(df) == 0:
+        click.echo("No events found.")
+        return
+
+    if row_limit:
+        df = df.head(row_limit)
+
+    click.echo(f"Events: {len(df)} row(s)")
+    click.echo(df)
+
+
+# ---------------------------------------------------------------------------
 # provenance
 # ---------------------------------------------------------------------------
 

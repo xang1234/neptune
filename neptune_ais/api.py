@@ -544,6 +544,54 @@ class Neptune:
 
         return result.lazy()
 
+    def events(
+        self,
+        *,
+        kind: str | None = None,
+        min_confidence: float | None = None,
+    ) -> pl.LazyFrame:
+        """Return events as a Polars LazyFrame.
+
+        Scans all committed event partitions matching the configured
+        dates and sources. Events are produced by detector pipelines
+        and stored in the derived event store.
+
+        Args:
+            kind: Filter by event type (e.g. ``"port_call"``).
+                If None, returns all event types.
+            min_confidence: Minimum confidence score (0.0–1.0).
+                If set, filters out events below this threshold.
+
+        Returns:
+            A Polars LazyFrame over the events dataset. Returns an
+            empty LazyFrame with the correct schema if no events
+            are found.
+        """
+        from neptune_ais.datasets.events import Col as EventCol, SCHEMA
+
+        files = self._dataset_files("events")
+        if not files:
+            return pl.DataFrame(schema=SCHEMA).lazy()
+
+        lf = pl.scan_parquet(
+            files,
+            missing_columns="insert",
+            extra_columns="ignore",
+        )
+
+        if kind is not None:
+            lf = lf.filter(pl.col(EventCol.EVENT_TYPE) == kind)
+
+        if min_confidence is not None:
+            lf = lf.filter(
+                pl.col(EventCol.CONFIDENCE_SCORE) >= min_confidence
+            )
+
+        if self._mmsi:
+            lf = lf.filter(pl.col(EventCol.MMSI).is_in(self._mmsi))
+
+        return lf
+
     def vessels(self) -> pl.LazyFrame:
         """Return vessels as a Polars LazyFrame."""
         files = self._dataset_files("vessels")
@@ -562,14 +610,15 @@ class Neptune:
     def duckdb(self):
         """Return a DuckDB connection with cataloged datasets registered.
 
-        The connection has views for each dataset (positions, vessels)
-        pointing to the same Parquet files that Polars would scan.
+        The connection has views for each dataset (positions, vessels,
+        tracks, events) pointing to the same Parquet files that Polars
+        would scan.
         """
         import duckdb
 
         con = duckdb.connect()
 
-        for dataset_name in ("positions", "vessels"):
+        for dataset_name in ("positions", "vessels", "tracks", "events"):
             files = self._dataset_files(dataset_name)
             if files:
                 file_list = ", ".join(f"'{f}'" for f in files)
