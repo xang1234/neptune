@@ -183,11 +183,12 @@ class EventProvenance:
     ``("boundaries", "tracks")``."""
 
     def __post_init__(self) -> None:
-        # Ensure upstream_datasets is always a sorted tuple for
+        # Ensure upstream_datasets is always a non-empty sorted tuple for
         # deterministic tokens and equality comparisons.
-        object.__setattr__(
-            self, "upstream_datasets", tuple(sorted(self.upstream_datasets))
-        )
+        sorted_ds = tuple(sorted(self.upstream_datasets))
+        if not sorted_ds:
+            raise ValueError("upstream_datasets must not be empty")
+        object.__setattr__(self, "upstream_datasets", sorted_ds)
 
     def to_token(self) -> str:
         """Serialize to a compact provenance token string.

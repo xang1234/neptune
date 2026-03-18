@@ -487,3 +487,13 @@ class TestEventProvenance:
             upstream_datasets=["tracks", "boundaries", "positions"],
         )
         assert "[boundaries+positions+tracks]" in prov.to_token()
+
+    def test_empty_upstream_raises(self):
+        """upstream_datasets must not be empty."""
+        with pytest.raises(ValueError, match="must not be empty"):
+            EventProvenance(
+                source="noaa",
+                detector="det",
+                detector_version="1.0",
+                upstream_datasets=[],
+            )
