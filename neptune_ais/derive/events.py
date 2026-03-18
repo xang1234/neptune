@@ -746,11 +746,17 @@ def detect_encounters(
         return pl.DataFrame(schema=SCHEMA)
 
     # Step 1: bucket positions by time.
+    # Emit each position into current and next bucket to catch pairs
+    # that straddle a bucket boundary.
     bucket_us = config.time_bucket_s * 1_000_000
+    epoch_col = pl.col("timestamp").dt.epoch(time_unit="us")
     df = positions.with_columns(
-        (pl.col("timestamp").dt.epoch(time_unit="us") // bucket_us)
-        .alias("_time_bucket"),
+        (epoch_col // bucket_us).alias("_time_bucket"),
     )
+    df_next = df.with_columns(
+        (pl.col("_time_bucket") + 1).alias("_time_bucket"),
+    )
+    df = pl.concat([df, df_next])
 
     # Step 2: self-join within time buckets.
     df_a = df.select(
@@ -771,6 +777,8 @@ def detect_encounters(
 
     pairs = df_a.join(df_b, on="_time_bucket", how="inner")
     pairs = pairs.filter(pl.col("_mmsi_a") < pl.col("_mmsi_b"))
+    # Deduplicate pairs created by the double-bucketing.
+    pairs = pairs.unique(["_mmsi_a", "_mmsi_b", "_ts_a", "_ts_b"])
 
     if len(pairs) == 0:
         return pl.DataFrame(schema=SCHEMA)
@@ -793,17 +801,20 @@ def detect_encounters(
     if len(proximate) == 0:
         return pl.DataFrame(schema=SCHEMA)
 
+    # Use min timestamp as observation time for ordering, but keep
+    # both timestamps for accurate start/end computation.
     proximate = proximate.with_columns(
         pl.min_horizontal("_ts_a", "_ts_b").alias("_obs_ts"),
     )
 
     # Step 4: group consecutive observations by pair.
+    # Sort ensures contiguous pair groups; bare diff() is correct
+    # since shift(1) pair-boundary check handles cross-pair resets.
     proximate = proximate.sort(["_mmsi_a", "_mmsi_b", "_obs_ts"])
     gap_us = config.gap_seconds * 1_000_000
 
     proximate = proximate.with_columns(
         pl.col("_obs_ts").diff().dt.total_microseconds()
-        .over(["_mmsi_a", "_mmsi_b"])
         .alias("_dt_us"),
     )
     proximate = proximate.with_columns(
@@ -822,8 +833,12 @@ def detect_encounters(
     encounters = proximate.group_by("_encounter_id").agg(
         pl.col("_mmsi_a").first().alias(EventCol.MMSI),
         pl.col("_mmsi_b").first().alias(EventCol.OTHER_MMSI),
-        pl.col("_obs_ts").min().alias(EventCol.START_TIME),
-        pl.col("_obs_ts").max().alias(EventCol.END_TIME),
+        pl.min_horizontal(
+            pl.col("_ts_a").min(), pl.col("_ts_b").min()
+        ).alias(EventCol.START_TIME),
+        pl.max_horizontal(
+            pl.col("_ts_a").max(), pl.col("_ts_b").max()
+        ).alias(EventCol.END_TIME),
         ((pl.col("_lat_a") + pl.col("_lat_b")) / 2).mean().alias(EventCol.LAT),
         ((pl.col("_lon_a") + pl.col("_lon_b")) / 2).mean().alias(EventCol.LON),
         pl.len().cast(pl.Int64).alias("_obs_count"),
