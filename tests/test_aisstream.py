@@ -53,8 +53,8 @@ def _raw_position_report(
     mmsi: int = 123456789,
     lat: float = 40.0,
     lon: float = -74.0,
-    sog: int = 105,
-    cog: int = 1800,
+    sog: float = 10.5,
+    cog: float = 180.0,
     heading: int = 178,
     nav_status: int = 0,
     ship_name: str = "TEST VESSEL",
@@ -90,15 +90,15 @@ class TestNormalizeMessage:
         assert msg["lon"] == -74.0
         assert msg["source"] == "aisstream"
 
-    def test_sog_scaled(self):
-        """SOG is in 1/10 knot units — should be divided by 10."""
-        msg = normalize_message(_raw_position_report(sog=105))
+    def test_sog_passthrough(self):
+        """SOG arrives pre-scaled from AISStream — no division needed."""
+        msg = normalize_message(_raw_position_report(sog=10.5))
         assert msg["sog"] == 10.5
 
-    def test_cog_scaled(self):
-        """COG is in 1/10 degree units — should be divided by 10."""
-        msg = normalize_message(_raw_position_report(cog=1800))
-        assert msg["cog"] == 180.0
+    def test_cog_passthrough(self):
+        """COG arrives pre-scaled from AISStream — no division needed."""
+        msg = normalize_message(_raw_position_report(cog=234.5))
+        assert msg["cog"] == 234.5
 
     def test_heading_preserved(self):
         msg = normalize_message(_raw_position_report(heading=178))
@@ -131,6 +131,14 @@ class TestNormalizeMessage:
         ))
         assert "2024-06-15" in msg["timestamp"]
         assert "12:30" in msg["timestamp"]
+
+    def test_timestamp_with_utc_suffix(self):
+        """AISStream wire format includes trailing ' UTC' suffix."""
+        msg = normalize_message(_raw_position_report(
+            time_utc="2022-12-29 18:22:32.318353 +0000 UTC"
+        ))
+        assert "2022-12-29" in msg["timestamp"]
+        assert "18:22" in msg["timestamp"]
 
     def test_non_position_report_returns_none(self):
         raw = {"MessageType": "StaticDataReport", "MetaData": {}, "Message": {}}

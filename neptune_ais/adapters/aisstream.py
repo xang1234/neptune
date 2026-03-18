@@ -82,8 +82,8 @@ CAPABILITIES = SourceCapabilities(
     datasets_provided=["positions"],
     known_quirks=[
         "Heading=511 means unavailable",
-        "SOG in knots (1/10 knot precision)",
-        "COG in degrees (1/10 degree precision)",
+        "SOG/COG delivered as pre-scaled floats (not raw NMEA 1/10 units)",
+        "time_utc may include trailing ' UTC' suffix",
     ],
 )
 
@@ -150,10 +150,11 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
     if mmsi is None:
         return None
 
-    # Parse timestamp.
+    # Parse timestamp. AISStream uses "2022-12-29 18:22:32.318353 +0000 UTC".
     time_str = meta.get("time_utc", "")
     try:
-        ts = datetime.fromisoformat(time_str.replace(" ", "T"))
+        cleaned = time_str.replace(" UTC", "").strip().replace(" ", "T")
+        ts = datetime.fromisoformat(cleaned)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
     except (ValueError, AttributeError):
@@ -178,8 +179,9 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
         "timestamp": ts.isoformat(),
         "lat": float(lat),
         "lon": float(lon),
-        "sog": float(pos_report.get("Sog", 0)) / 10.0 if pos_report.get("Sog") is not None else None,
-        "cog": float(pos_report.get("Cog", 0)) / 10.0 if pos_report.get("Cog") is not None else None,
+        # AISStream delivers pre-scaled floats (not raw NMEA 1/10 units).
+        "sog": float(pos_report.get("Sog")) if pos_report.get("Sog") is not None else None,
+        "cog": float(pos_report.get("Cog")) if pos_report.get("Cog") is not None else None,
         "heading": float(heading) if heading is not None else None,
         "nav_status": nav_status,
         "vessel_name": (meta.get("ShipName") or "").strip() or None,
