@@ -327,6 +327,8 @@ class TestPrepareEvents:
         assert len(result) < 5
         assert (result["lat"] >= 39.5).all()
         assert (result["lat"] <= 40.5).all()
+        assert (result["lon"] >= -74.5).all()
+        assert (result["lon"] <= -73.0).all()
 
     def test_event_type_filter(self):
         df = _sample_events(5)
