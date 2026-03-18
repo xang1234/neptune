@@ -342,7 +342,7 @@ def _density_h3(df: pl.DataFrame, resolution: int) -> pl.DataFrame:
         lambda idx: dict(zip(("center_lat", "center_lon"), h3.cell_to_latlng(idx))),
         return_dtype=_center_dtype,
     )
-    counts = counts.with_columns(centers.struct.unnest())
+    counts = counts.with_columns(centers.alias("_center")).unnest("_center")
 
     return counts.sort("count", descending=True)
 
