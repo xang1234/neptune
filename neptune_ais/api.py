@@ -671,10 +671,12 @@ class Neptune:
 
         Returns a dict with ``"positions"`` and optionally
         ``"tracks"`` and ``"events"`` LazyFrames filtered to the
-        given MMSI.
+        given MMSI. Tracks and events inherit the instance-level
+        filters (bbox, mmsi, etc.) from their respective accessors.
         """
         from neptune_ais.helpers import vessel_history
 
+        # Scan tracks directly (no derivation — just read cached files).
         tracks = None
         tracks_files = self._dataset_files("tracks")
         if tracks_files:
@@ -684,14 +686,10 @@ class Neptune:
                 extra_columns="ignore",
             )
 
+        # Use self.events() to inherit bbox/mmsi filters.
         events_lf = None
-        events_files = self._dataset_files("events")
-        if events_files:
-            events_lf = pl.scan_parquet(
-                events_files,
-                missing_columns="insert",
-                extra_columns="ignore",
-            )
+        if self._dataset_files("events"):
+            events_lf = self.events()
 
         return vessel_history(
             mmsi,

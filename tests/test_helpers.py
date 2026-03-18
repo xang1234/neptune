@@ -102,6 +102,7 @@ class TestSnapshot:
         result = snapshot(lf, _ts(12)).collect().sort(PosCol.MMSI)
         assert result.filter(pl.col(PosCol.MMSI) == 111)[PosCol.TIMESTAMP][0] == _ts(10)
         assert result.filter(pl.col(PosCol.MMSI) == 222)[PosCol.TIMESTAMP][0] == _ts(15)
+        assert result.filter(pl.col(PosCol.MMSI) == 333)[PosCol.TIMESTAMP][0] == _ts(0)
 
     def test_one_row_per_vessel(self):
         lf = _multi_vessel_positions().lazy()
@@ -110,8 +111,10 @@ class TestSnapshot:
 
     def test_string_timestamp(self):
         lf = _multi_vessel_positions().lazy()
-        result = snapshot(lf, "2024-06-15T00:12:00").collect()
+        result = snapshot(lf, "2024-06-15T00:12:00").collect().sort(PosCol.MMSI)
         assert len(result) == 3
+        # Same result as datetime-based snapshot at minute 12.
+        assert result.filter(pl.col(PosCol.MMSI) == 111)[PosCol.TIMESTAMP][0] == _ts(10)
 
     def test_sorted_by_mmsi(self):
         lf = _multi_vessel_positions().lazy()

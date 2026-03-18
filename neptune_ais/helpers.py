@@ -47,9 +47,8 @@ def latest_positions(positions: pl.LazyFrame) -> pl.LazyFrame:
     """
     return (
         positions
-        .sort(PosCol.TIMESTAMP)
         .group_by(PosCol.MMSI)
-        .last()
+        .agg(pl.all().sort_by(PosCol.TIMESTAMP).last())
         .sort(PosCol.MMSI)
     )
 
@@ -83,9 +82,8 @@ def snapshot(
             .abs()
             .alias("_time_diff")
         )
-        .sort("_time_diff")
         .group_by(PosCol.MMSI)
-        .first()
+        .agg(pl.all().sort_by("_time_diff").first())
         .drop("_time_diff")
         .sort(PosCol.MMSI)
     )
