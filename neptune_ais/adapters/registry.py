@@ -17,6 +17,17 @@ from neptune_ais.adapters.base import SourceAdapter, SourceCapabilities
 # ---------------------------------------------------------------------------
 
 _ADAPTERS: dict[str, type[SourceAdapter]] = {}
+_STREAMING_CAPABILITIES: dict[str, SourceCapabilities] = {}
+
+
+def register_streaming(caps: SourceCapabilities) -> None:
+    """Register capabilities for a streaming-only source.
+
+    Streaming sources don't implement the full SourceAdapter protocol
+    (no fetch_raw/normalize_positions). This registers their capabilities
+    so they appear in ``catalog()``, ``info()``, and ``sources`` CLI.
+    """
+    _STREAMING_CAPABILITIES[caps.source_id] = caps
 
 
 def register(adapter_cls: type[SourceAdapter]) -> type[SourceAdapter]:
@@ -56,8 +67,14 @@ def get_adapter(source_id: str) -> SourceAdapter:
 
 
 def catalog() -> list[SourceCapabilities]:
-    """Return capabilities for all registered sources."""
-    return [get_adapter(sid).capabilities for sid in sorted(_ADAPTERS)]
+    """Return capabilities for all registered sources (archival + streaming)."""
+    caps = [get_adapter(sid).capabilities for sid in sorted(_ADAPTERS)]
+    caps.extend(
+        _STREAMING_CAPABILITIES[sid]
+        for sid in sorted(_STREAMING_CAPABILITIES)
+        if sid not in _ADAPTERS
+    )
+    return caps
 
 
 def available(date_str: str) -> list[str]:
@@ -85,10 +102,12 @@ def available(date_str: str) -> list[str]:
 
 
 def info(source_id: str) -> SourceCapabilities:
-    """Return capabilities for a specific source.
+    """Return capabilities for a specific source (archival or streaming).
 
     Raises ``KeyError`` if the source is not registered.
     """
+    if source_id in _STREAMING_CAPABILITIES:
+        return _STREAMING_CAPABILITIES[source_id]
     return get_adapter(source_id).capabilities
 
 
@@ -108,5 +127,5 @@ def compare(*source_ids: str) -> list[dict[str, str]]:
 
 
 def registered_sources() -> list[str]:
-    """Return sorted list of all registered source IDs."""
-    return sorted(_ADAPTERS.keys())
+    """Return sorted list of all registered source IDs (archival + streaming)."""
+    return sorted(set(_ADAPTERS.keys()) | set(_STREAMING_CAPABILITIES.keys()))
