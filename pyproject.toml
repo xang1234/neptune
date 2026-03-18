@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neptune-ais"
+version = "0.1.0dev0"
+description = "Open AIS data platform for Python"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+
+# ---------------------------------------------------------------------------
+# Core dependencies — required for archival ingest, query, and catalog.
+# These are paid by every install. Keep this list lean.
+# ---------------------------------------------------------------------------
+dependencies = [
+    "polars>=1.0",
+    "pyarrow>=14.0",
+    "duckdb>=1.0",
+    "fsspec>=2024.2",
+    "orjson>=3.9",
+    "pydantic>=2.0",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups ("extras").
+#
+# Install with:  pip install neptune-ais[geo]
+#                pip install neptune-ais[stream]
+#                pip install neptune-ais[all]
+#
+# Each group maps to specific subsystems — see the subsystem boundary docs
+# in each __init__.py for which modules are allowed to import these.
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# Geometry & visualization — used by geometry/ and viz/ subsystems.
+# Required for: GeoDataFrame/MovingPandas bridges, EEZ/port boundary
+# lookups, spatial indexing, and interactive map rendering.
+geo = [
+    "shapely>=2.0",
+    "geopandas>=1.0",
+    "movingpandas>=0.18",
+    "lonboard>=0.9",
+    "h3>=4.0",
+]
+
+# Streaming — used by stream.py and streaming-capable adapters.
+# Required for: real-time AIS feeds via WebSocket.
+stream = [
+    "websockets>=12.0",
+]
+
+# CLI — used by cli/ subsystem.
+# Required for: the `neptune` console script.
+cli = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+# Development and testing.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "coverage>=7.4",
+]
+
+# Everything.
+all = [
+    "neptune-ais[geo,stream,cli,dev]",
+]
+
+[project.scripts]
+neptune = "neptune_ais.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["neptune_ais"]
