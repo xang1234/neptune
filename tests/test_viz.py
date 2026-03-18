@@ -13,6 +13,7 @@ from neptune_ais.viz import (
     Viewport,
     _TRIP_PROGRESS,
     prepare_density,
+    prepare_events,
     prepare_positions,
     prepare_tracks,
     prepare_trips,
@@ -276,3 +277,92 @@ class TestPrepareDensity:
         df = _sample_positions(100)
         result = prepare_density(df, max_points=20)
         assert result["count"].sum() == 20
+
+
+# ---------------------------------------------------------------------------
+# Events layer
+# ---------------------------------------------------------------------------
+
+
+def _sample_events(n: int = 5) -> pl.DataFrame:
+    """Generate *n* synthetic event rows."""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
+    types = ["port_call", "eez_crossing", "encounter", "loitering", "port_call"]
+    return pl.DataFrame({
+        "event_id": [f"evt_{i:03d}" for i in range(n)],
+        "event_type": types[:n],
+        "mmsi": pl.Series([111 + i % 3 for i in range(n)], dtype=pl.Int64),
+        "other_mmsi": pl.Series(
+            [None, None, 222, None, None][:n], dtype=pl.Int64
+        ),
+        "start_time": pl.Series(
+            [base + timedelta(hours=i) for i in range(n)],
+            dtype=pl.Datetime("us", "UTC"),
+        ),
+        "end_time": pl.Series(
+            [base + timedelta(hours=i, minutes=30) for i in range(n)],
+            dtype=pl.Datetime("us", "UTC"),
+        ),
+        "lat": [40.0 + i * 0.5 for i in range(n)],
+        "lon": [-74.0 + i * 0.5 for i in range(n)],
+        "geometry_wkb": pl.Series([None] * n, dtype=pl.Binary),
+        "confidence_score": [0.9, 0.5, 0.8, 0.3, 0.7][:n],
+        "source": ["noaa"] * n,
+        "record_provenance": ["noaa:detector/0.1.0[positions]"] * n,
+    })
+
+
+class TestPrepareEvents:
+    def test_passthrough_no_filters(self):
+        df = _sample_events(5)
+        result = prepare_events(df)
+        assert len(result) == 5
+
+    def test_viewport_clipping(self):
+        df = _sample_events(5)
+        viewport = Viewport(west=-74.5, south=39.5, east=-73.0, north=40.5)
+        result = prepare_events(df, viewport=viewport)
+        assert len(result) < 5
+        assert (result["lat"] >= 39.5).all()
+        assert (result["lat"] <= 40.5).all()
+
+    def test_event_type_filter(self):
+        df = _sample_events(5)
+        result = prepare_events(df, event_type="port_call")
+        assert len(result) == 2
+        assert (result["event_type"] == "port_call").all()
+
+    def test_min_confidence_filter(self):
+        df = _sample_events(5)
+        result = prepare_events(df, min_confidence=0.7)
+        assert len(result) == 3  # 0.9, 0.8, 0.7
+        assert (result["confidence_score"] >= 0.7).all()
+
+    def test_combined_filters(self):
+        df = _sample_events(5)
+        # Narrow viewport to only include the first port_call (lat=40, lon=-74).
+        viewport = Viewport(west=-75.0, south=39.0, east=-73.0, north=41.0)
+        result = prepare_events(
+            df, viewport=viewport, event_type="port_call", min_confidence=0.7
+        )
+        # Only the first port_call (lat=40, conf=0.9) is inside this viewport.
+        assert len(result) == 1
+        assert result["confidence_score"][0] == 0.9
+
+    def test_sampling(self):
+        df = _sample_events(5)
+        result = prepare_events(df, max_events=2)
+        assert len(result) == 2
+
+    def test_lazyframe_input(self):
+        df = _sample_events(5)
+        result = prepare_events(df.lazy())
+        assert isinstance(result, pl.DataFrame)
+        assert len(result) == 5
+
+    def test_empty_after_filters(self):
+        df = _sample_events(5)
+        result = prepare_events(df, event_type="fishing")
+        assert len(result) == 0

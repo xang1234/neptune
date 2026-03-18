@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 import polars as pl
 
+from neptune_ais.datasets.events import Col as EventCol
 from neptune_ais.datasets.positions import Col as PosCol
 from neptune_ais.datasets.tracks import Col as TrackCol
 
@@ -379,3 +380,57 @@ def _density_grid_fallback(df: pl.DataFrame, resolution: int) -> pl.DataFrame:
     return counts.select(
         "h3_index", "count", "center_lat", "center_lon"
     ).sort("count", descending=True)
+
+
+# ---------------------------------------------------------------------------
+# Events layer
+# ---------------------------------------------------------------------------
+
+
+def prepare_events(
+    df: pl.DataFrame | pl.LazyFrame,
+    *,
+    viewport: Viewport | None = None,
+    event_type: str | None = None,
+    min_confidence: float | None = None,
+    max_events: int | None = None,
+) -> pl.DataFrame:
+    """Prepare an events DataFrame for map rendering.
+
+    Applies viewport clipping on the event's representative lat/lon,
+    optional event type and confidence filters, and downsampling.
+
+    This follows the same pattern as ``prepare_positions`` and
+    ``prepare_tracks`` — the output is a materialized DataFrame
+    ready for point-marker or icon rendering on a map.
+
+    Args:
+        df: Events LazyFrame or DataFrame.
+        viewport: Optional bounding box to clip to.
+        event_type: Filter to a single event type (e.g. ``"port_call"``).
+        min_confidence: Minimum confidence score to include.
+        max_events: If set, downsample to at most this many events.
+
+    Returns:
+        A Polars DataFrame with event rows, clipped, filtered, and sampled.
+    """
+    result = _collect(df)
+
+    if event_type is not None:
+        result = result.filter(pl.col(EventCol.EVENT_TYPE) == event_type)
+
+    if min_confidence is not None:
+        result = result.filter(
+            pl.col(EventCol.CONFIDENCE_SCORE) >= min_confidence
+        )
+
+    if viewport is not None:
+        result = result.filter(
+            (pl.col(EventCol.LAT) >= viewport.south)
+            & (pl.col(EventCol.LAT) <= viewport.north)
+            & (pl.col(EventCol.LON) >= viewport.west)
+            & (pl.col(EventCol.LON) <= viewport.east)
+        )
+
+    result = _sample(result, max_events)
+    return result
