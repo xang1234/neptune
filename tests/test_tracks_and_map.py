@@ -65,7 +65,13 @@ def _run_pipeline(
     include_geometry: bool = False,
     config: TrackConfig | None = None,
 ) -> pl.DataFrame:
-    """Run detect → filter → aggregate and return tracks."""
+    """Run detect → filter → aggregate and return tracks.
+
+    Pass *either* ``include_geometry`` (uses permissive defaults) or a
+    full ``config`` object — not both.
+    """
+    if config is not None and include_geometry:
+        raise ValueError("Pass either include_geometry or config, not both")
     if config is None:
         config = TrackConfig(
             min_points=1, min_duration_seconds=0, min_distance_m=0,
