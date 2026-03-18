@@ -189,9 +189,9 @@ class EventProvenance:
 
     Examples::
 
-        "noaa:port_call_detector/0.1.0[tracks]"
-        "dma:encounter_detector/0.2.0[positions]"
-        "noaa:loitering_detector/0.1.0[tracks+boundaries]"
+        "noaa:port_call_detector/0.1.0[boundaries+positions]"
+        "dma:encounter_detector/0.1.0[positions]"
+        "noaa:loitering_detector/0.1.0[positions]"
 
     The token is designed to be:
     - Human-readable in a DataFrame column.
