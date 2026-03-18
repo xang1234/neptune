@@ -301,6 +301,21 @@ class TestEventCacheKey:
         b = EventCacheKey(**{**self._BASE, "events_schema_version": "events/v2"}).cache_key()
         assert a != b
 
+    def test_cache_key_changes_with_source(self):
+        a = EventCacheKey(**{**self._BASE, "source": "noaa"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "source": "dma"}).cache_key()
+        assert a != b
+
+    def test_cache_key_changes_with_date(self):
+        a = EventCacheKey(**{**self._BASE, "date": "2024-06-15"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "date": "2024-06-16"}).cache_key()
+        assert a != b
+
+    def test_cache_key_changes_with_upstream_schema_version(self):
+        a = EventCacheKey(**{**self._BASE, "upstream_schema_version": "tracks/v1"}).cache_key()
+        b = EventCacheKey(**{**self._BASE, "upstream_schema_version": "positions/v1"}).cache_key()
+        assert a != b
+
     def test_from_manifest_factory(self):
         key = EventCacheKey.from_manifest(
             event_type="port_call",

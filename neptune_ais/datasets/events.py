@@ -137,7 +137,7 @@ SORT_ORDER: list[str] = [Col.EVENT_TYPE, Col.MMSI, Col.START_TIME]
 
 PARTITION_KEYS: list[str] = [Col.EVENT_TYPE]
 """Hive-style partition columns. Events are partitioned by event_type
-(e.g. ``kind=port_call/date=2024-06-15/``)."""
+(e.g. ``event_type=port_call/date=2024-06-15/``)."""
 
 # ---------------------------------------------------------------------------
 # event_id construction — deterministic and stable
