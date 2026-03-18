@@ -322,8 +322,214 @@ class NeptuneStream:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint — restart-safe state persistence
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Checkpoint:
+    """Persistent state for restart-safe streaming.
+
+    Stored as a JSON file in ``StreamConfig.checkpoint_dir``. On restart,
+    the stream loads the checkpoint to resume from the last known state.
+
+    Since most AIS WebSocket sources (including AISStream) do not support
+    replay from a cursor, the checkpoint serves primarily for:
+    - **Gap detection** — how long was the stream down?
+    - **Dedup on restart** — skip messages older than ``last_timestamp``.
+    - **Operational monitoring** — total counts across restarts.
+
+    Attributes:
+        source: Source adapter ID.
+        last_timestamp: ISO-8601 timestamp of the last processed message.
+        messages_total: Cumulative message count across all sessions.
+        session_count: Number of stream sessions (restarts).
+        last_saved: When this checkpoint was written.
+    """
+
+    source: str = ""
+    last_timestamp: str = ""
+    messages_total: int = 0
+    session_count: int = 0
+    last_saved: str = ""
+
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        import json
+        return json.dumps({
+            "source": self.source,
+            "last_timestamp": self.last_timestamp,
+            "messages_total": self.messages_total,
+            "session_count": self.session_count,
+            "last_saved": self.last_saved,
+        }, indent=2)
+
+    @classmethod
+    def from_json(cls, data: str) -> Checkpoint:
+        """Deserialize from JSON string."""
+        import json
+        d = json.loads(data)
+        return cls(
+            source=d.get("source", ""),
+            last_timestamp=d.get("last_timestamp", ""),
+            messages_total=d.get("messages_total", 0),
+            session_count=d.get("session_count", 0),
+            last_saved=d.get("last_saved", ""),
+        )
+
+
+def save_checkpoint(checkpoint: Checkpoint, checkpoint_dir: str) -> None:
+    """Write a checkpoint to disk.
+
+    Creates the directory if it doesn't exist. The checkpoint file
+    is named ``<source>.checkpoint.json``.
+    """
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = Checkpoint(
+        source=checkpoint.source,
+        last_timestamp=checkpoint.last_timestamp,
+        messages_total=checkpoint.messages_total,
+        session_count=checkpoint.session_count,
+        last_saved=datetime.now(timezone.utc).isoformat(),
+    )
+
+    filepath = path / f"{checkpoint.source}.checkpoint.json"
+    filepath.write_text(checkpoint.to_json())
+    logger.debug("Checkpoint saved: %s", filepath)
+
+
+def load_checkpoint(source: str, checkpoint_dir: str) -> Checkpoint | None:
+    """Load a checkpoint from disk, or return None if not found."""
+    from pathlib import Path
+
+    filepath = Path(checkpoint_dir) / f"{source}.checkpoint.json"
+    if not filepath.exists():
+        return None
+
+    try:
+        return Checkpoint.from_json(filepath.read_text())
+    except (ValueError, KeyError):
+        logger.warning("Corrupt checkpoint file: %s", filepath)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reconnect loop — exponential backoff with jitter
+# ---------------------------------------------------------------------------
+
+
+async def run_with_reconnect(
+    stream: NeptuneStream,
+    connect_fn,
+    *,
+    max_retries: int | None = None,
+) -> None:
+    """Run a streaming connection with automatic reconnection.
+
+    Wraps a connect function (e.g. ``connect_and_stream``) in a
+    retry loop with exponential backoff. Saves checkpoints between
+    reconnection attempts if checkpointing is enabled.
+
+    Args:
+        stream: A running NeptuneStream instance.
+        connect_fn: An async callable that connects to the source and
+            feeds messages into ``stream.ingest()``. Should return when
+            the connection drops.
+        max_retries: Maximum number of reconnection attempts. None
+            means retry indefinitely.
+
+    The backoff schedule uses ``stream.config.reconnect_delay_s`` as
+    the initial delay and doubles on each attempt up to
+    ``stream.config.max_reconnect_delay_s``, with ±25% jitter.
+    """
+    import random
+
+    config = stream.config
+    delay = config.reconnect_delay_s
+    attempts = 0
+
+    # Load checkpoint if available.
+    checkpoint = None
+    if config.checkpoint_dir:
+        checkpoint = load_checkpoint(config.source, config.checkpoint_dir)
+        if checkpoint:
+            logger.info(
+                "Resuming from checkpoint: %d messages, last at %s",
+                checkpoint.messages_total, checkpoint.last_timestamp,
+            )
+            checkpoint = Checkpoint(
+                source=checkpoint.source,
+                last_timestamp=checkpoint.last_timestamp,
+                messages_total=checkpoint.messages_total,
+                session_count=checkpoint.session_count + 1,
+            )
+        else:
+            checkpoint = Checkpoint(source=config.source, session_count=1)
+
+    while stream.is_running:
+        try:
+            await connect_fn()
+            # Normal exit — save checkpoint and stop.
+            if config.checkpoint_dir and checkpoint:
+                checkpoint = Checkpoint(
+                    source=config.source,
+                    last_timestamp=_now_iso(),
+                    messages_total=(
+                        checkpoint.messages_total + stream.stats.messages_delivered
+                    ),
+                    session_count=checkpoint.session_count,
+                )
+                save_checkpoint(checkpoint, config.checkpoint_dir)
+            break
+
+        except Exception as e:
+            attempts += 1
+            stream._stats.reconnections += 1
+            stream._stats.errors += 1
+
+            if max_retries is not None and attempts > max_retries:
+                logger.error(
+                    "Max retries (%d) exceeded, stopping", max_retries
+                )
+                break
+
+            # Save checkpoint before reconnecting.
+            if config.checkpoint_dir and checkpoint:
+                checkpoint = Checkpoint(
+                    source=config.source,
+                    last_timestamp=_now_iso(),
+                    messages_total=(
+                        checkpoint.messages_total + stream.stats.messages_delivered
+                    ),
+                    session_count=checkpoint.session_count,
+                )
+                save_checkpoint(checkpoint, config.checkpoint_dir)
+
+            # Exponential backoff with jitter.
+            jitter = delay * random.uniform(-0.25, 0.25)
+            wait = min(delay + jitter, config.max_reconnect_delay_s)
+            logger.warning(
+                "Connection failed (%s), reconnecting in %.1fs (attempt %d)",
+                e, wait, attempts,
+            )
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, config.max_reconnect_delay_s)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    """Return current UTC time as ISO-8601 string."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _message_hash(msg: dict[str, Any]) -> str:

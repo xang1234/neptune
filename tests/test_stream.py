@@ -15,11 +15,15 @@ from typing import Any
 import pytest
 
 from neptune_ais.stream import (
+    Checkpoint,
     NeptuneStream,
     StreamConfig,
     StreamSink,
     StreamStats,
     _message_hash,
+    load_checkpoint,
+    run_with_reconnect,
+    save_checkpoint,
 )
 
 
@@ -291,4 +295,158 @@ class TestSinkRunner:
 
             assert sink.total_messages == 3
             assert sink.closed
+        _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpoint:
+    def test_roundtrip(self):
+        cp = Checkpoint(
+            source="aisstream",
+            last_timestamp="2024-06-15T00:00:00+00:00",
+            messages_total=1000,
+            session_count=3,
+            last_saved="2024-06-15T01:00:00+00:00",
+        )
+        restored = Checkpoint.from_json(cp.to_json())
+        assert restored.source == "aisstream"
+        assert restored.messages_total == 1000
+        assert restored.session_count == 3
+
+    def test_save_and_load(self, tmp_path):
+        cp = Checkpoint(
+            source="test",
+            last_timestamp="2024-06-15T00:00:00+00:00",
+            messages_total=500,
+            session_count=1,
+        )
+        save_checkpoint(cp, str(tmp_path))
+        loaded = load_checkpoint("test", str(tmp_path))
+        assert loaded is not None
+        assert loaded.source == "test"
+        assert loaded.messages_total == 500
+        assert loaded.last_saved != ""  # populated by save_checkpoint
+
+    def test_load_missing_returns_none(self, tmp_path):
+        assert load_checkpoint("nonexistent", str(tmp_path)) is None
+
+    def test_save_creates_directory(self, tmp_path):
+        nested = tmp_path / "deep" / "nested"
+        cp = Checkpoint(source="test", messages_total=1)
+        save_checkpoint(cp, str(nested))
+        assert (nested / "test.checkpoint.json").exists()
+
+    def test_corrupt_checkpoint_returns_none(self, tmp_path):
+        filepath = tmp_path / "bad.checkpoint.json"
+        filepath.write_text("not json")
+        assert load_checkpoint("bad", str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# Reconnect loop
+# ---------------------------------------------------------------------------
+
+
+class TestReconnect:
+    def test_successful_connection_no_retry(self):
+        """A successful connection exits immediately."""
+        call_count = 0
+
+        async def _test():
+            nonlocal call_count
+
+            async def connect():
+                nonlocal call_count
+                call_count += 1
+
+            async with NeptuneStream() as stream:
+                await run_with_reconnect(stream, connect, max_retries=3)
+
+            assert call_count == 1
+
+        _run(_test())
+
+    def test_retry_on_failure(self):
+        """Connection retries after failure."""
+        call_count = 0
+
+        async def _test():
+            nonlocal call_count
+
+            async def connect():
+                nonlocal call_count
+                call_count += 1
+                if call_count < 3:
+                    raise ConnectionError("test failure")
+
+            config = StreamConfig(reconnect_delay_s=0.01, max_reconnect_delay_s=0.02)
+            async with NeptuneStream(config=config) as stream:
+                await run_with_reconnect(stream, connect, max_retries=5)
+
+            assert call_count == 3
+
+        _run(_test())
+
+    def test_max_retries_exceeded(self):
+        """Stops after max_retries."""
+        call_count = 0
+
+        async def _test():
+            nonlocal call_count
+
+            async def connect():
+                nonlocal call_count
+                call_count += 1
+                raise ConnectionError("always fails")
+
+            config = StreamConfig(reconnect_delay_s=0.01)
+            async with NeptuneStream(config=config) as stream:
+                await run_with_reconnect(stream, connect, max_retries=2)
+
+            # 1 initial + 2 retries = 3 calls.
+            assert call_count == 3
+            assert stream.stats.reconnections == 3
+            assert stream.stats.errors == 3
+
+        _run(_test())
+
+    def test_checkpoint_saved_on_reconnect(self, tmp_path):
+        """Checkpoint is saved between reconnection attempts."""
+        async def _test():
+            async def connect():
+                raise ConnectionError("fail")
+
+            config = StreamConfig(
+                source="test",
+                reconnect_delay_s=0.01,
+                checkpoint_dir=str(tmp_path),
+            )
+            async with NeptuneStream(config=config) as stream:
+                await run_with_reconnect(stream, connect, max_retries=1)
+
+        _run(_test())
+        loaded = load_checkpoint("test", str(tmp_path))
+        assert loaded is not None
+        assert loaded.session_count >= 1
+
+    def test_stats_track_reconnections(self):
+        """StreamStats.reconnections increments on each failure."""
+        async def _test():
+            call_count = 0
+
+            async def connect():
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 2:
+                    raise ConnectionError("fail")
+
+            config = StreamConfig(reconnect_delay_s=0.01)
+            async with NeptuneStream(config=config) as stream:
+                await run_with_reconnect(stream, connect, max_retries=5)
+                assert stream.stats.reconnections == 2
+
         _run(_test())
