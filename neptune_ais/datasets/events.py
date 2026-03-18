@@ -195,14 +195,21 @@ CONFIDENCE_BANDS: dict[str, tuple[float, float]] = {
 }
 """Named confidence bands for filtering and reporting.
 
+Each band is a ``[lower, upper)`` half-open interval — the lower bound
+is inclusive and the upper bound is exclusive (except ``"high"`` which
+includes 1.0). This matches ``classify_confidence()`` semantics.
+
 Usage::
 
     # Filter to high-confidence events only
     events.filter(pl.col("confidence_score") >= CONFIDENCE_HIGH)
 
-    # Or use the band thresholds
+    # Or use the band thresholds (half-open: [lo, hi))
     lo, hi = CONFIDENCE_BANDS["medium"]
-    events.filter(pl.col("confidence_score").is_between(lo, hi))
+    events.filter(
+        (pl.col("confidence_score") >= lo)
+        & (pl.col("confidence_score") < hi)
+    )
 """
 
 

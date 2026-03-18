@@ -437,11 +437,17 @@ class TestEventProvenance:
             detector_version="0.1.0",
             upstream_datasets=["tracks"],
         )
-        parsed = parse_provenance(original.to_token())
-        assert parsed.source == original.source
-        assert parsed.detector == original.detector
-        assert parsed.detector_version == original.detector_version
-        assert parsed.upstream_datasets == original.upstream_datasets
+        assert parse_provenance(original.to_token()) == original
+
+    def test_parse_roundtrip_multi_upstream(self):
+        """Roundtrip works even when upstream_datasets are unsorted."""
+        original = EventProvenance(
+            source="noaa",
+            detector="eez_detector",
+            detector_version="0.2.0",
+            upstream_datasets=["tracks", "boundaries"],
+        )
+        assert parse_provenance(original.to_token()) == original
 
     def test_parse_multiple_upstream(self):
         token = "noaa:eez_detector/0.2.0[boundaries+tracks]"
@@ -449,7 +455,7 @@ class TestEventProvenance:
         assert prov.source == "noaa"
         assert prov.detector == "eez_detector"
         assert prov.detector_version == "0.2.0"
-        assert prov.upstream_datasets == ["boundaries", "tracks"]
+        assert prov.upstream_datasets == ("boundaries", "tracks")
 
     def test_parse_invalid_raises(self):
         with pytest.raises(ValueError, match="Cannot parse"):
@@ -458,6 +464,10 @@ class TestEventProvenance:
     def test_parse_missing_brackets_raises(self):
         with pytest.raises(ValueError, match="Cannot parse"):
             parse_provenance("noaa:detector/0.1.0")
+
+    def test_parse_unclosed_bracket_raises(self):
+        with pytest.raises(ValueError, match="Cannot parse"):
+            parse_provenance("noaa:detector/0.1.0[tracks")
 
     def test_to_token_deterministic(self):
         prov = EventProvenance(

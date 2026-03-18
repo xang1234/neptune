@@ -177,10 +177,17 @@ class EventProvenance:
     detector_version: str
     """Detector version string (e.g. ``"0.1.0"``)."""
 
-    upstream_datasets: list[str] = field(default_factory=lambda: ["tracks"])
-    """Upstream datasets this event was derived from.
-    Common values: ``["tracks"]``, ``["positions"]``,
-    ``["tracks", "boundaries"]``."""
+    upstream_datasets: tuple[str, ...] = field(default_factory=lambda: ("tracks",))
+    """Upstream datasets this event was derived from (always sorted).
+    Common values: ``("tracks",)``, ``("positions",)``,
+    ``("boundaries", "tracks")``."""
+
+    def __post_init__(self) -> None:
+        # Ensure upstream_datasets is always a sorted tuple for
+        # deterministic tokens and equality comparisons.
+        object.__setattr__(
+            self, "upstream_datasets", tuple(sorted(self.upstream_datasets))
+        )
 
     def to_token(self) -> str:
         """Serialize to a compact provenance token string.
@@ -188,7 +195,7 @@ class EventProvenance:
         Returns:
             A string like ``"noaa:port_call_detector/0.1.0[tracks]"``.
         """
-        upstream = "+".join(sorted(self.upstream_datasets))
+        upstream = "+".join(self.upstream_datasets)
         return f"{self.source}:{self.detector}/{self.detector_version}[{upstream}]"
 
 
@@ -210,15 +217,17 @@ def parse_provenance(token: str) -> EventProvenance:
         assert prov.source == "noaa"
         assert prov.detector == "port_call_detector"
         assert prov.detector_version == "0.1.0"
-        assert prov.upstream_datasets == ["tracks"]
+        assert prov.upstream_datasets == ("tracks",)
     """
     try:
         source, rest = token.split(":", 1)
         # rest = "port_call_detector/0.1.0[tracks]"
         detector_and_version, bracket_part = rest.split("[", 1)
-        upstream_str = bracket_part.rstrip("]")
+        if not bracket_part.endswith("]"):
+            raise ValueError("missing closing bracket")
+        upstream_str = bracket_part[:-1]
         detector, version = detector_and_version.split("/", 1)
-        upstream = sorted(upstream_str.split("+"))
+        upstream = tuple(sorted(upstream_str.split("+")))
         return EventProvenance(
             source=source,
             detector=detector,
