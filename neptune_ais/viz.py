@@ -425,12 +425,8 @@ def prepare_events(
         )
 
     if viewport is not None:
-        result = result.filter(
-            (pl.col(EventCol.LAT) >= viewport.south)
-            & (pl.col(EventCol.LAT) <= viewport.north)
-            & (pl.col(EventCol.LON) >= viewport.west)
-            & (pl.col(EventCol.LON) <= viewport.east)
-        )
+        # Events have lat/lon like positions — reuse the same clipper.
+        result = _clip_positions(result, viewport)
 
     result = _sample(result, max_events)
     return result
