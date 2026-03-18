@@ -646,6 +646,60 @@ class Neptune:
         con = self.duckdb()
         return con.sql(query)
 
+    # --- Helper APIs ---
+
+    def latest_positions(self) -> pl.LazyFrame:
+        """Return the most recent position per vessel.
+
+        For each MMSI in the configured scope, returns the single
+        row with the latest timestamp.
+        """
+        from neptune_ais.helpers import latest_positions
+        return latest_positions(self.positions())
+
+    def snapshot(self, when: str | datetime) -> pl.LazyFrame:
+        """Return the closest position per vessel to a timestamp.
+
+        Args:
+            when: Target timestamp (datetime or ISO-8601 string).
+        """
+        from neptune_ais.helpers import snapshot
+        return snapshot(self.positions(), when)
+
+    def vessel_history(self, mmsi: int) -> dict[str, pl.LazyFrame]:
+        """Return all data for a single vessel.
+
+        Returns a dict with ``"positions"`` and optionally
+        ``"tracks"`` and ``"events"`` LazyFrames filtered to the
+        given MMSI.
+        """
+        from neptune_ais.helpers import vessel_history
+
+        tracks = None
+        tracks_files = self._dataset_files("tracks")
+        if tracks_files:
+            tracks = pl.scan_parquet(
+                tracks_files,
+                missing_columns="insert",
+                extra_columns="ignore",
+            )
+
+        events_lf = None
+        events_files = self._dataset_files("events")
+        if events_files:
+            events_lf = pl.scan_parquet(
+                events_files,
+                missing_columns="insert",
+                extra_columns="ignore",
+            )
+
+        return vessel_history(
+            mmsi,
+            positions=self.positions(),
+            tracks=tracks,
+            events=events_lf,
+        )
+
     # --- Inspection surfaces ---
 
     def inventory(self):
