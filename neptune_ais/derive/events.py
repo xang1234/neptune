@@ -452,3 +452,208 @@ def detect_port_calls(
     return result.select(output_cols).sort(
         [EventCol.MMSI, EventCol.START_TIME]
     )
+
+
+# ---------------------------------------------------------------------------
+# EEZ-crossing detector
+# ---------------------------------------------------------------------------
+
+_EEZ_DETECTOR_NAME = "eez_crossing_detector"
+_EEZ_DETECTOR_VERSION = "0.1.0"
+
+
+@dataclass(frozen=True)
+class EEZCrossingConfig:
+    """Configuration for EEZ-crossing detection.
+
+    Controls how transitions between EEZ regions are detected and
+    filtered.
+
+    Args:
+        max_gap_s: Maximum time gap (seconds) between the two
+            positions forming a crossing. Gaps larger than this are
+            ignored (the vessel may have transited through unknown
+            waters). Default 7200 (2 hours).
+        max_distance_m: Maximum distance (meters) between the two
+            positions. Crossings with larger distance gaps are
+            lower-confidence. Default 100000 (100 km).
+    """
+
+    max_gap_s: int = 7200
+    max_distance_m: float = 100_000.0
+
+    def config_hash(self) -> str:
+        """Deterministic hash of detection parameters."""
+        key = f"gap={self.max_gap_s}:dist={self.max_distance_m}"
+        return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+# Approximate meters per degree of latitude.
+_METERS_PER_DEG = 111_320.0
+
+
+def detect_eez_crossings(
+    positions: pl.DataFrame,
+    eez_regions: pl.Series,
+    *,
+    config: EEZCrossingConfig | None = None,
+    source: str = "",
+) -> pl.DataFrame:
+    """Detect EEZ-crossing events from positions and EEZ region labels.
+
+    Algorithm:
+    1. Attach EEZ region labels to positions.
+    2. Sort by ``(mmsi, timestamp)`` and compute per-vessel diffs.
+    3. Detect transitions where the EEZ label changes between
+       consecutive positions of the same vessel.
+    4. Filter by maximum time gap.
+    5. Compute crossing location (midpoint), confidence, and emit events.
+
+    Confidence is based on the time gap and distance between the two
+    positions forming the crossing:
+    - Gap <= 30 min and distance <= 20 km → 0.9 (high)
+    - Gap <= 2 hours and distance <= 100 km → 0.7 (medium)
+    - Otherwise → 0.5 (low, but still within max_gap_s)
+
+    Args:
+        positions: Positions DataFrame sorted by ``(mmsi, timestamp)``.
+            Must include ``mmsi``, ``timestamp``, ``lat``, ``lon``,
+            and ``source`` columns.
+        eez_regions: A String Series (same length as ``positions``)
+            with the EEZ region name for each position, or None if
+            the position is not in any EEZ. Produced by
+            ``BoundaryRegistry.lookup_column()``.
+        config: Detection configuration. Uses defaults if None.
+        source: Source identifier for provenance.
+
+    Returns:
+        A DataFrame conforming to ``events/v1`` schema with
+        ``event_type = "eez_crossing"``.
+    """
+    from neptune_ais.datasets.events import (
+        Col as EventCol,
+        EVENT_TYPE_EEZ_CROSSING,
+        SCHEMA,
+        make_event_id,
+    )
+
+    if config is None:
+        config = EEZCrossingConfig()
+
+    cfg_hash = config.config_hash()
+
+    # Attach EEZ labels and sort.
+    df = positions.with_columns(eez_regions.alias("_eez_region"))
+    df = df.sort(["mmsi", "timestamp"])
+
+    # Compute per-vessel previous values.
+    df = df.with_columns(
+        pl.col("_eez_region").shift(1).over("mmsi").alias("_prev_eez"),
+        pl.col("timestamp").shift(1).over("mmsi").alias("_prev_ts"),
+        pl.col("lat").shift(1).over("mmsi").alias("_prev_lat"),
+        pl.col("lon").shift(1).over("mmsi").alias("_prev_lon"),
+    )
+
+    # Detect transitions: EEZ changed between consecutive positions.
+    # Exclude transitions from/to null (entering/leaving coverage).
+    crossings = df.filter(
+        pl.col("_eez_region").is_not_null()
+        & pl.col("_prev_eez").is_not_null()
+        & (pl.col("_eez_region") != pl.col("_prev_eez"))
+    )
+
+    if len(crossings) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Compute gap and approximate distance.
+    gap_us = config.max_gap_s * 1_000_000
+    crossings = crossings.with_columns(
+        (
+            (pl.col("timestamp") - pl.col("_prev_ts"))
+            .dt.total_microseconds()
+        ).alias("_gap_us"),
+        (
+            (
+                ((pl.col("lat") - pl.col("_prev_lat")) * _METERS_PER_DEG).pow(2)
+                + (
+                    (pl.col("lon") - pl.col("_prev_lon"))
+                    * _METERS_PER_DEG
+                    * pl.col("lat").radians().cos()
+                ).pow(2)
+            ).sqrt()
+        ).alias("_dist_m"),
+    )
+
+    # Filter by max gap.
+    crossings = crossings.filter(pl.col("_gap_us") <= gap_us)
+
+    if len(crossings) == 0:
+        return pl.DataFrame(schema=SCHEMA)
+
+    # Compute crossing midpoint and confidence.
+    crossings = crossings.with_columns(
+        ((pl.col("lat") + pl.col("_prev_lat")) / 2).alias(EventCol.LAT),
+        ((pl.col("lon") + pl.col("_prev_lon")) / 2).alias(EventCol.LON),
+        pl.col("_prev_ts").alias(EventCol.START_TIME),
+        pl.col("timestamp").alias(EventCol.END_TIME),
+        pl.col("mmsi").alias(EventCol.MMSI),
+        pl.col("source").alias(EventCol.SOURCE),
+        # Confidence: tighter gap + shorter distance = higher confidence.
+        (
+            pl.when(
+                (pl.col("_gap_us") <= 1_800_000_000)  # <= 30 min
+                & (pl.col("_dist_m") <= 20_000)
+            )
+            .then(0.9)
+            .when(
+                (pl.col("_gap_us") <= 7_200_000_000)  # <= 2 hours
+                & (pl.col("_dist_m") <= 100_000)
+            )
+            .then(0.7)
+            .otherwise(0.5)
+        ).alias(EventCol.CONFIDENCE_SCORE),
+    )
+
+    # Generate deterministic event IDs.
+    crossings = crossings.with_columns(
+        pl.struct([EventCol.MMSI, EventCol.START_TIME, EventCol.SOURCE])
+        .map_elements(
+            lambda row: make_event_id(
+                EVENT_TYPE_EEZ_CROSSING,
+                row[EventCol.MMSI],
+                int(row[EventCol.START_TIME].timestamp() * 1e6),
+                row[EventCol.SOURCE],
+                cfg_hash,
+            ),
+            return_dtype=pl.String,
+        )
+        .alias(EventCol.EVENT_ID),
+    )
+
+    # Build provenance.
+    prov = EventProvenance(
+        source=source or "derived",
+        detector=_EEZ_DETECTOR_NAME,
+        detector_version=_EEZ_DETECTOR_VERSION,
+        upstream_datasets=["boundaries", "positions"],
+    )
+
+    # Assemble output.
+    result = crossings.with_columns(
+        pl.lit(EVENT_TYPE_EEZ_CROSSING).alias(EventCol.EVENT_TYPE),
+        pl.lit(None).cast(pl.Int64).alias(EventCol.OTHER_MMSI),
+        pl.lit(None).cast(pl.Binary).alias(EventCol.GEOMETRY_WKB),
+        pl.lit(prov.to_token()).alias(EventCol.RECORD_PROVENANCE),
+    )
+
+    output_cols = [
+        EventCol.EVENT_ID, EventCol.EVENT_TYPE, EventCol.MMSI,
+        EventCol.OTHER_MMSI, EventCol.START_TIME, EventCol.END_TIME,
+        EventCol.LAT, EventCol.LON, EventCol.GEOMETRY_WKB,
+        EventCol.CONFIDENCE_SCORE, EventCol.SOURCE,
+        EventCol.RECORD_PROVENANCE,
+    ]
+
+    return result.select(output_cols).sort(
+        [EventCol.MMSI, EventCol.START_TIME]
+    )
