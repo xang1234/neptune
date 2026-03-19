@@ -15,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -212,7 +211,7 @@ def bench_duckdb(df: pl.DataFrame, tmp_dir: Path) -> BenchmarkResult:
 
 def bench_derivation(df: pl.DataFrame) -> BenchmarkResult:
     """Benchmark derivation operations: compaction, dedup, time gaps."""
-    from neptune_ais.stream import compact_batch, DEDUP_KEY_FIELDS
+    from neptune_ais.stream import compact_batch
 
     result = BenchmarkResult("derivation")
 
