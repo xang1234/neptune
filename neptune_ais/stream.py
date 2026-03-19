@@ -83,6 +83,13 @@ class StreamConfig:
         max_reconnect_delay_s: Maximum backoff delay. Default 60.
         dedup_window_size: Number of recent message hashes to keep
             for rolling deduplication. Default 10000.
+        max_queue_size: Maximum number of messages that can be buffered
+            in the internal queue before backpressure is applied.
+            Default 10000.
+        backpressure: Policy when the queue is full. ``"block"``
+            (default) awaits until space is available, naturally
+            throttling the producer. ``"drop_oldest"`` discards the
+            oldest queued message to make room, prioritizing freshness.
         checkpoint_dir: Directory for checkpoint files. None disables
             checkpointing.
         flush_interval_s: How often sinks should flush. Default 60.
@@ -95,6 +102,8 @@ class StreamConfig:
     reconnect_delay_s: float = 5.0
     max_reconnect_delay_s: float = 60.0
     dedup_window_size: int = 10_000
+    max_queue_size: int = 10_000
+    backpressure: str = "block"  # "block" or "drop_oldest"
     checkpoint_dir: str | None = None
     flush_interval_s: int = 60
 
@@ -137,6 +146,8 @@ class StreamStats:
     messages_received: int = 0
     messages_deduplicated: int = 0
     messages_delivered: int = 0
+    messages_dropped: int = 0
+    backpressure_events: int = 0
     reconnections: int = 0
     errors: int = 0
     last_message_time: float | None = None
@@ -190,13 +201,21 @@ class NeptuneStream:
         else:
             self._config = StreamConfig(source=source, api_key=api_key)
 
+        if self._config.backpressure not in ("block", "drop_oldest"):
+            raise ValueError(
+                f"backpressure must be 'block' or 'drop_oldest', "
+                f"got {self._config.backpressure!r}"
+            )
+
         self._stats = StreamStats()
         self._dedup_queue: deque[str] = deque(
             maxlen=self._config.dedup_window_size
         )
         self._dedup_set: set[str] = set()
         self._running = False
-        self._message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=self._config.max_queue_size
+        )
 
     @property
     def config(self) -> StreamConfig:
@@ -277,6 +296,19 @@ class NeptuneStream:
         self._dedup_queue.append(msg_hash)
         self._dedup_set.add(msg_hash)
         self._stats.messages_delivered += 1
+
+        # Bounded queue with backpressure policy.
+        if self._message_queue.full():
+            self._stats.backpressure_events += 1
+            if self._config.backpressure == "drop_oldest":
+                try:
+                    self._message_queue.get_nowait()
+                    self._stats.messages_dropped += 1
+                except asyncio.QueueEmpty:
+                    pass  # pragma: no cover — race condition guard
+                self._message_queue.put_nowait(message)
+                return True
+            # "block" policy: fall through to await put().
 
         await self._message_queue.put(message)
         return True

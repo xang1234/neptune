@@ -452,3 +452,140 @@ class TestReconnect:
                 assert stream.stats.reconnections == 2
 
         _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Bounded buffers and backpressure
+# ---------------------------------------------------------------------------
+
+
+class TestBackpressure:
+    def test_default_queue_is_bounded(self):
+        """Queue has a finite maxsize by default."""
+        stream = NeptuneStream()
+        assert stream._message_queue.maxsize == 10_000
+
+    def test_custom_queue_size(self):
+        config = StreamConfig(max_queue_size=50)
+        stream = NeptuneStream(config=config)
+        assert stream._message_queue.maxsize == 50
+
+    def test_invalid_backpressure_policy(self):
+        config = StreamConfig(backpressure="ignore")
+        with pytest.raises(ValueError, match="backpressure"):
+            NeptuneStream(config=config)
+
+    def test_block_policy_awaits_consumer(self):
+        """With 'block' policy, ingest awaits until queue has space."""
+        async def _test():
+            config = StreamConfig(max_queue_size=2, backpressure="block")
+            async with NeptuneStream(config=config) as stream:
+                # Fill the queue.
+                await stream.ingest(_sample_message(mmsi=1, ts="2024-01-01T00:00:00"))
+                await stream.ingest(_sample_message(mmsi=2, ts="2024-01-01T00:01:00"))
+
+                # Third ingest should block. Use a task + short timeout to verify.
+                blocked = True
+
+                async def _try_ingest():
+                    nonlocal blocked
+                    await stream.ingest(_sample_message(mmsi=3, ts="2024-01-01T00:02:00"))
+                    blocked = False
+
+                task = asyncio.create_task(_try_ingest())
+                await asyncio.sleep(0.05)
+                assert blocked  # still waiting
+
+                # Consume one message to unblock.
+                msg = await stream._message_queue.get()
+                assert msg is not None
+                await asyncio.sleep(0.05)
+                assert not blocked  # ingest completed
+
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        _run(_test())
+
+    def test_drop_oldest_policy(self):
+        """With 'drop_oldest' policy, oldest message is discarded."""
+        async def _test():
+            config = StreamConfig(max_queue_size=2, backpressure="drop_oldest")
+            async with NeptuneStream(config=config) as stream:
+                await stream.ingest(_sample_message(mmsi=1, ts="2024-01-01T00:00:00"))
+                await stream.ingest(_sample_message(mmsi=2, ts="2024-01-01T00:01:00"))
+                # Queue is full. This should drop the oldest (mmsi=1).
+                await stream.ingest(_sample_message(mmsi=3, ts="2024-01-01T00:02:00"))
+
+                assert stream.stats.messages_dropped == 1
+                assert stream.stats.backpressure_events == 1
+                assert stream._message_queue.qsize() == 2
+
+                # Verify the oldest was dropped — remaining are mmsi=2 and mmsi=3.
+                msg1 = stream._message_queue.get_nowait()
+                msg2 = stream._message_queue.get_nowait()
+                assert msg1["mmsi"] == 2
+                assert msg2["mmsi"] == 3
+
+        _run(_test())
+
+    def test_backpressure_stats_accumulate(self):
+        """Backpressure events are counted across multiple occurrences."""
+        async def _test():
+            config = StreamConfig(max_queue_size=1, backpressure="drop_oldest")
+            async with NeptuneStream(config=config) as stream:
+                for i in range(5):
+                    await stream.ingest(
+                        _sample_message(mmsi=i, ts=f"2024-01-01T00:0{i}:00")
+                    )
+                # Queue size 1 means 4 drops (first fills, next 4 each drop oldest).
+                assert stream.stats.backpressure_events == 4
+                assert stream.stats.messages_dropped == 4
+                assert stream.stats.messages_delivered == 5
+
+        _run(_test())
+
+    def test_block_policy_records_backpressure_event(self):
+        """Block policy also records backpressure_events for observability."""
+        async def _test():
+            config = StreamConfig(max_queue_size=1, backpressure="block")
+            async with NeptuneStream(config=config) as stream:
+                await stream.ingest(_sample_message(mmsi=1, ts="2024-01-01T00:00:00"))
+
+                # Second ingest will trigger backpressure. Consume to unblock.
+                async def _delayed_consume():
+                    await asyncio.sleep(0.02)
+                    await stream._message_queue.get()
+
+                consumer = asyncio.create_task(_delayed_consume())
+                await stream.ingest(_sample_message(mmsi=2, ts="2024-01-01T00:01:00"))
+                await consumer
+
+                assert stream.stats.backpressure_events == 1
+                assert stream.stats.messages_dropped == 0  # block never drops
+
+        _run(_test())
+
+    def test_drop_oldest_with_sink(self):
+        """Drop-oldest integrates correctly with sink runner."""
+        async def _test():
+            config = StreamConfig(max_queue_size=3, backpressure="drop_oldest")
+            sink = MockSink()
+            async with NeptuneStream(config=config) as stream:
+                # Overfill the queue.
+                for i in range(5):
+                    await stream.ingest(
+                        _sample_message(mmsi=i, ts=f"2024-01-01T00:0{i}:00")
+                    )
+                # Queue keeps the 3 newest: mmsi 2, 3, 4.
+                await stream.run_sink(sink, max_messages=3)
+
+            assert sink.total_messages == 3
+            msgs = [m for batch in sink.batches for m in batch]
+            mmsis = [m["mmsi"] for m in msgs]
+            assert mmsis == [2, 3, 4]
+
+        _run(_test())
