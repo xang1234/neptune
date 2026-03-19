@@ -50,6 +50,12 @@ def _msg(mmsi: int, ts: str, lat: float = 40.0, lon: float = -74.0) -> dict[str,
     }
 
 
+def _ts(i: int, date: str = "2024-01-01") -> str:
+    """Generate a valid ISO timestamp from an integer index."""
+    h, m, s = i // 3600, (i % 3600) // 60, i % 60
+    return f"{date}T{h:02d}:{m:02d}:{s:02d}"
+
+
 soak = pytest.mark.soak
 
 
@@ -74,9 +80,7 @@ class TestSustainedThroughput:
 
                 async def _produce():
                     for i in range(n_messages):
-                        await stream.ingest(
-                            _msg(mmsi=i, ts=f"2024-01-01T{i // 3600:02d}:{(i % 3600) // 60:02d}:{i % 60:02d}")
-                        )
+                        await stream.ingest(_msg(mmsi=i, ts=_ts(i)))
 
                 async def _consume():
                     count = 0
@@ -131,10 +135,7 @@ class TestSustainedThroughput:
             async with NeptuneStream(config=config) as stream:
                 # Send 100 unique messages with valid timestamps.
                 for i in range(100):
-                    h, m, s = i // 3600, (i % 3600) // 60, i % 60
-                    await stream.ingest(
-                        _msg(mmsi=i, ts=f"2024-01-01T{h:02d}:{m:02d}:{s:02d}")
-                    )
+                    await stream.ingest(_msg(mmsi=i, ts=_ts(i)))
                 assert stream.stats.messages_delivered == 100
                 assert stream.stats.messages_deduplicated == 0
 
@@ -243,7 +244,11 @@ class TestHealthTransitions:
         async def _test():
             config = StreamConfig(
                 lag_threshold_s=0.02,
-                stale_threshold_s=0.05,
+                # Wide gap so asyncio.sleep overshoot can't push us past
+                # stale_threshold before we assert LAGGING.  With a 80ms
+                # safe window (0.02–0.15s) the test can tolerate ~70ms of
+                # scheduler jitter without a false STALE transition.
+                stale_threshold_s=0.15,
             )
             stream = NeptuneStream(config=config)
 
@@ -258,12 +263,12 @@ class TestHealthTransitions:
                 await stream.ingest(_msg(mmsi=1, ts="2024-01-01T00:00:00"))
                 assert stream.health is StreamHealth.HEALTHY
 
-                # Wait past lag threshold.
-                await asyncio.sleep(0.04)
+                # Wait past lag threshold (0.02s) but well inside stale (0.15s).
+                await asyncio.sleep(0.07)
                 assert stream.health is StreamHealth.LAGGING
 
-                # Wait past stale threshold.
-                await asyncio.sleep(0.04)
+                # Wait past stale threshold (need ≥0.15s total elapsed).
+                await asyncio.sleep(0.10)
                 assert stream.health is StreamHealth.STALE
 
                 # Recovery: new message restores HEALTHY.
@@ -279,7 +284,12 @@ class TestHealthTransitions:
     def test_health_snapshot_consistency(self):
         """Snapshot health and lag_seconds are always consistent."""
         async def _test():
-            config = StreamConfig(lag_threshold_s=0.01, stale_threshold_s=0.05)
+            config = StreamConfig(
+                lag_threshold_s=0.01,
+                # Wide stale window so a slow asyncio.sleep(0.05) can't
+                # overshoot into STALE before we assert LAGGING.
+                stale_threshold_s=0.20,
+            )
             async with NeptuneStream(config=config) as stream:
                 # Stale snapshot.
                 snap = stream.health_snapshot()
@@ -293,8 +303,8 @@ class TestHealthTransitions:
                 assert snap["lag_seconds"] is not None
                 assert snap["lag_seconds"] < 1.0
 
-                # Lagging snapshot.
-                await asyncio.sleep(0.03)
+                # Lagging snapshot: sleep past lag (0.01s), well inside stale (0.20s).
+                await asyncio.sleep(0.05)
                 snap = stream.health_snapshot()
                 assert snap["health"] == "lagging"
                 assert snap["lag_seconds"] >= 0.01
@@ -338,9 +348,8 @@ class TestEndToEndParquet:
             sink = ParquetSink(landing, source="soak")
             async with NeptuneStream() as stream:
                 for i in range(100):
-                    h, m, s = i // 3600, (i % 3600) // 60, i % 60
                     await stream.ingest(
-                        _msg(mmsi=i % 20, ts=f"2024-06-15T{h:02d}:{m:02d}:{s:02d}")
+                        _msg(mmsi=i % 20, ts=_ts(i, date="2024-06-15"))
                     )
                 await stream.run_sink(sink, max_messages=100)
 
@@ -373,15 +382,13 @@ class TestEndToEndParquet:
             async with NeptuneStream() as stream:
                 # Send 50 unique + 50 duplicates.
                 for i in range(50):
-                    m, s = i // 60, i % 60
                     await stream.ingest(
-                        _msg(mmsi=i, ts=f"2024-06-15T00:{m:02d}:{s:02d}")
+                        _msg(mmsi=i, ts=_ts(i, date="2024-06-15"))
                     )
                 # Duplicates are caught by in-flight dedup.
                 for i in range(50):
-                    m, s = i // 60, i % 60
                     await stream.ingest(
-                        _msg(mmsi=i, ts=f"2024-06-15T00:{m:02d}:{s:02d}")
+                        _msg(mmsi=i, ts=_ts(i, date="2024-06-15"))
                     )
                 await stream.run_sink(sink, max_messages=50)
 
@@ -439,9 +446,8 @@ class TestEndToEndDuckDB:
             sink = DuckDBSink(db_path=":memory:", table_name="positions")
             async with NeptuneStream() as stream:
                 for i in range(50):
-                    m, s = i // 60, i % 60
                     await stream.ingest(
-                        _msg(mmsi=i % 10, ts=f"2024-06-15T00:{m:02d}:{s:02d}")
+                        _msg(mmsi=i % 10, ts=_ts(i, date="2024-06-15"))
                     )
                 # Flush manually (not run_sink, which closes the connection).
                 await stream.run_sink(sink, max_messages=50)
@@ -580,7 +586,8 @@ class TestStatsInvariants:
                 assert s.messages_received == (
                     s.messages_delivered + s.messages_deduplicated + s.messages_dropped
                 )
-                assert s.messages_dropped > 0
+                # 30 messages into queue of 5 → at least 25 drops.
+                assert s.messages_dropped >= 25
                 assert s.backpressure_events > 0
 
         _run(_test())
