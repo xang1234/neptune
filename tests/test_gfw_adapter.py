@@ -202,6 +202,14 @@ class TestGFWNormalization:
         assert "source" in df.columns
         assert df["source"][0] == "gfw"
 
+    def test_timestamp_parsed(self, tmp_path):
+        """Timestamps are parsed as non-null UTC datetimes."""
+        path = _write_gfw_json(tmp_path)
+        df = GFWAdapter().normalize_positions([_make_artifact(path)])
+        assert df["timestamp"].null_count() == 0
+        assert df["timestamp"].dtype == pl.Datetime("us", "UTC")
+        assert df["timestamp"][0] == datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
+
     def test_mmsi_type(self, tmp_path):
         path = _write_gfw_json(tmp_path)
         df = GFWAdapter().normalize_positions([_make_artifact(path)])

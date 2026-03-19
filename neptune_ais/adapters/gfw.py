@@ -265,10 +265,11 @@ class GFWAdapter:
             if col_name == "mmsi":
                 exprs.append(col.cast(pl.Int64, strict=False))
             elif col_name == "timestamp":
-                # GFW timestamps include timezone suffix (e.g. "Z" or "+00:00").
+                # GFW timestamps use "Z" or "+00:00" suffix.
+                # %#z handles both Zulu literal and offset notation.
                 exprs.append(
                     col.str.to_datetime(
-                        "%Y-%m-%dT%H:%M:%S%Z", strict=False
+                        "%Y-%m-%dT%H:%M:%S%#z", strict=False
                     ).cast(pl.Datetime("us", "UTC"))
                 )
             elif col_name in ("lat", "lon", "sog", "cog", "length"):
@@ -276,10 +277,11 @@ class GFWAdapter:
             elif col_name == "heading":
                 exprs.append(col.cast(pl.Float64, strict=False))
             elif col_name == "imo":
-                # IMO=0 means unavailable → null.
+                # IMO=0 or null means unavailable → null.
+                casted = col.cast(pl.Int64, strict=False)
                 exprs.append(
-                    pl.when(col.cast(pl.Int64, strict=False) == IMO_UNAVAILABLE)
-                    .then(None)
+                    pl.when(casted.is_null() | (casted == IMO_UNAVAILABLE))
+                    .then(pl.lit(None, dtype=pl.String))
                     .otherwise(col.cast(pl.String))
                     .alias("imo")
                 )
