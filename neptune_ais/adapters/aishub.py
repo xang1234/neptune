@@ -212,8 +212,16 @@ class AISHubAdapter:
             fpath = Path(art.local_path)
             raw_data = json.loads(fpath.read_text())
 
-            # AISHub returns [{...}, ...] or [metadata, [{...}, ...]].
-            if isinstance(raw_data, list) and len(raw_data) == 2 and isinstance(raw_data[1], list):
+            # AISHub returns [{...}, ...] or [metadata_dict, [records]].
+            # Disambiguate by checking that the first element lacks vessel
+            # fields (metadata dicts never have "MMSI").
+            if (
+                isinstance(raw_data, list)
+                and len(raw_data) == 2
+                and isinstance(raw_data[1], list)
+                and isinstance(raw_data[0], dict)
+                and "MMSI" not in raw_data[0]
+            ):
                 records = raw_data[1]
             elif isinstance(raw_data, list):
                 records = raw_data
@@ -281,27 +289,29 @@ class AISHubAdapter:
     @staticmethod
     def _derive_dimensions(df: pl.DataFrame) -> pl.DataFrame:
         """Derive length (A+B) and beam (C+D) from AIS dimension fields."""
+        dim_exprs: list[pl.Expr] = []
+
         if "_dim_a" in df.columns and "_dim_b" in df.columns:
-            df = df.with_columns(
+            dim_exprs.append(
                 (pl.col("_dim_a").cast(pl.Float64, strict=False)
                  + pl.col("_dim_b").cast(pl.Float64, strict=False))
                 .alias("length")
-            ).drop(["_dim_a", "_dim_b"])
-        else:
-            for col in ("_dim_a", "_dim_b"):
-                if col in df.columns:
-                    df = df.drop(col)
+            )
 
         if "_dim_c" in df.columns and "_dim_d" in df.columns:
-            df = df.with_columns(
+            dim_exprs.append(
                 (pl.col("_dim_c").cast(pl.Float64, strict=False)
                  + pl.col("_dim_d").cast(pl.Float64, strict=False))
                 .alias("beam")
-            ).drop(["_dim_c", "_dim_d"])
-        else:
-            for col in ("_dim_c", "_dim_d"):
-                if col in df.columns:
-                    df = df.drop(col)
+            )
+
+        if dim_exprs:
+            df = df.with_columns(dim_exprs)
+
+        # Drop all intermediate dimension columns.
+        drop_cols = [c for c in ("_dim_a", "_dim_b", "_dim_c", "_dim_d") if c in df.columns]
+        if drop_cols:
+            df = df.drop(drop_cols)
 
         return df
 
