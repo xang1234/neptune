@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-03-19T08:47:36.096556+00:00",
+  "rows": 50000,
+  "benchmarks": [
+    {
+      "name": "ingestion",
+      "timings_ms": {
+        "sort_mmsi_timestamp": 81.93,
+        "write_parquet": 235.88,
+        "read_parquet": 519.68
+      }
+    },
+    {
+      "name": "query",
+      "timings_ms": {
+        "filter_single_vessel": 42.39,
+        "filter_bbox": 47.5,
+        "group_by_vessel_count": 35.57,
+        "latest_positions": 30.2,
+        "top_speed_vessels": 29.92
+      }
+    },
+    {
+      "name": "duckdb_sql",
+      "timings_ms": {
+        "count_all": 8.24,
+        "group_by_vessel": 366.15,
+        "filter_bbox": 88.06,
+        "avg_speed_by_type": 16.4
+      }
+    },
+    {
+      "name": "derivation",
+      "timings_ms": {
+        "compact_10k_messages": 30.93,
+        "polars_unique_dedup": 32.06,
+        "time_gap_computation": 29.54,
+        "per_vessel_stats": 30.65
+      }
+    },
+    {
+      "name": "streaming",
+      "timings_ms": {
+        "ingest_10k_messages": 72.58
+      }
+    }
+  ]
+}
