@@ -35,8 +35,9 @@ n = Neptune("2024-06-15", sources=["noaa"], cache_dir="/tmp/neptune_demo")
 
 # --- Vessel history ---
 # from neptune_ais.helpers import vessel_history
-# history = vessel_history(mmsi=367000001, positions=positions)
-# print(f"Positions for vessel: {history.collect().shape[0]}")
+# history = vessel_history(367000001, positions=positions)
+# # Returns dict[str, LazyFrame] with keys like "positions", "tracks", "events".
+# print(f"Positions for vessel: {history['positions'].collect().shape[0]}")
 
 print("Example 2: See comments for archival workflow steps.")
 print("Uncomment lines after setting up a cache directory with real data.")

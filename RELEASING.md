@@ -83,4 +83,4 @@ twine upload dist/*
 | `[stream]` | websockets | `NeptuneStream`, AISStream adapter |
 | `[cli]` | click, rich | `neptune` console script |
 | `[all]` | all of the above | Full-featured install |
-| `[dev]` | pytest, ruff, mypy, coverage | Development only |
+| `[dev]` | pytest, pytest-asyncio, ruff, mypy, coverage | Development only |
