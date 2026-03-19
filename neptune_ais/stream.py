@@ -54,6 +54,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,6 +75,18 @@ class BackpressurePolicy(str, Enum):
 
     BLOCK = "block"
     DROP_OLDEST = "drop_oldest"
+
+
+class StreamHealth(str, Enum):
+    """Observable health state for a running stream.
+
+    Derived from message recency and stream lifecycle state.
+    """
+
+    HEALTHY = "healthy"      # Receiving messages within lag threshold.
+    LAGGING = "lagging"      # Receiving messages, but lag exceeds threshold.
+    STALE = "stale"          # No messages received within stale threshold.
+    DISCONNECTED = "disconnected"  # Stream is not running.
 
 
 # Default dedup key fields — two messages with the same vessel, time, and
@@ -107,6 +120,10 @@ class StreamConfig:
         checkpoint_dir: Directory for checkpoint files. None disables
             checkpointing.
         flush_interval_s: How often sinks should flush. Default 60.
+        lag_threshold_s: Seconds since last message before health
+            transitions from HEALTHY to LAGGING. Default 30.
+        stale_threshold_s: Seconds since last message before health
+            transitions from LAGGING to STALE. Default 120.
     """
 
     source: str = "aisstream"
@@ -121,6 +138,8 @@ class StreamConfig:
     backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK
     checkpoint_dir: str | None = None
     flush_interval_s: int = 60
+    lag_threshold_s: float = 30.0
+    stale_threshold_s: float = 120.0
 
     def __post_init__(self) -> None:
         if isinstance(self.backpressure, str):
@@ -252,6 +271,56 @@ class NeptuneStream:
         """Whether the stream is currently connected and running."""
         return self._running
 
+    @property
+    def lag_seconds(self) -> float | None:
+        """Seconds since the last message was received, or None if no messages yet."""
+        if self._stats.last_message_time is None:
+            return None
+        return time.monotonic() - self._stats.last_message_time
+
+    @property
+    def health(self) -> StreamHealth:
+        """Current health state derived from recency and lifecycle.
+
+        - ``DISCONNECTED`` — stream is not running.
+        - ``STALE`` — no messages received, or last message exceeds stale threshold.
+        - ``LAGGING`` — last message exceeds lag threshold but within stale threshold.
+        - ``HEALTHY`` — receiving messages within lag threshold.
+        """
+        if not self._running:
+            return StreamHealth.DISCONNECTED
+
+        lag = self.lag_seconds
+        if lag is None:
+            # Running but no messages received yet.
+            return StreamHealth.STALE
+
+        if lag >= self._config.stale_threshold_s:
+            return StreamHealth.STALE
+        if lag >= self._config.lag_threshold_s:
+            return StreamHealth.LAGGING
+        return StreamHealth.HEALTHY
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return a dict summarizing current stream health.
+
+        Suitable for logging, monitoring endpoints, or operator dashboards.
+        """
+        return {
+            "health": self.health.value,
+            "running": self._running,
+            "lag_seconds": self.lag_seconds,
+            "messages_received": self._stats.messages_received,
+            "messages_delivered": self._stats.messages_delivered,
+            "messages_dropped": self._stats.messages_dropped,
+            "messages_deduplicated": self._stats.messages_deduplicated,
+            "backpressure_events": self._stats.backpressure_events,
+            "reconnections": self._stats.reconnections,
+            "errors": self._stats.errors,
+            "dedup_rate": self._stats.dedup_rate,
+            "source": self._config.source,
+        }
+
     # --- Async context manager ---
 
     async def __aenter__(self) -> NeptuneStream:
@@ -303,6 +372,7 @@ class NeptuneStream:
         call this method for each normalized position they produce.
         """
         self._stats.messages_received += 1
+        self._stats.last_message_time = time.monotonic()
 
         # Rolling dedup by identity key (O(1) lookup via parallel set).
         msg_key = _dedup_key(message, self._dedup_key_fields)

@@ -23,6 +23,7 @@ from neptune_ais.stream import (
     NeptuneStream,
     StreamCompactor,
     StreamConfig,
+    StreamHealth,
     StreamSink,
     StreamStats,
     _dedup_key,
@@ -824,3 +825,130 @@ class TestCustomDedupKeys:
                 assert accepted is True  # different position = different message
 
         _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Stream health and heartbeat
+# ---------------------------------------------------------------------------
+
+
+class TestStreamHealth:
+    def test_disconnected_before_start(self):
+        stream = NeptuneStream()
+        assert stream.health is StreamHealth.DISCONNECTED
+
+    def test_disconnected_after_exit(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                pass
+            assert stream.health is StreamHealth.DISCONNECTED
+        _run(_test())
+
+    def test_stale_when_no_messages(self):
+        """Running stream with no messages yet is STALE."""
+        async def _test():
+            async with NeptuneStream() as stream:
+                assert stream.health is StreamHealth.STALE
+                assert stream.lag_seconds is None
+        _run(_test())
+
+    def test_healthy_after_message(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                await stream.ingest(_sample_message())
+                assert stream.health is StreamHealth.HEALTHY
+                assert stream.lag_seconds is not None
+                assert stream.lag_seconds < 1.0
+        _run(_test())
+
+    def test_lagging_after_threshold(self):
+        async def _test():
+            config = StreamConfig(lag_threshold_s=0.01, stale_threshold_s=10.0)
+            async with NeptuneStream(config=config) as stream:
+                await stream.ingest(_sample_message())
+                await asyncio.sleep(0.03)
+                assert stream.health is StreamHealth.LAGGING
+        _run(_test())
+
+    def test_stale_after_threshold(self):
+        async def _test():
+            config = StreamConfig(lag_threshold_s=0.01, stale_threshold_s=0.02)
+            async with NeptuneStream(config=config) as stream:
+                await stream.ingest(_sample_message())
+                await asyncio.sleep(0.05)
+                assert stream.health is StreamHealth.STALE
+        _run(_test())
+
+    def test_health_recovers_on_new_message(self):
+        """Health returns to HEALTHY when messages resume."""
+        async def _test():
+            config = StreamConfig(lag_threshold_s=0.01, stale_threshold_s=0.02)
+            async with NeptuneStream(config=config) as stream:
+                await stream.ingest(_sample_message(mmsi=1, ts="2024-01-01T00:00:00"))
+                await asyncio.sleep(0.05)
+                assert stream.health is StreamHealth.STALE
+                await stream.ingest(_sample_message(mmsi=2, ts="2024-01-01T00:01:00"))
+                assert stream.health is StreamHealth.HEALTHY
+        _run(_test())
+
+    def test_lag_seconds_increases(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                await stream.ingest(_sample_message())
+                lag1 = stream.lag_seconds
+                await asyncio.sleep(0.05)
+                lag2 = stream.lag_seconds
+                assert lag2 > lag1
+        _run(_test())
+
+    def test_last_message_time_set_on_ingest(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                assert stream.stats.last_message_time is None
+                await stream.ingest(_sample_message())
+                assert stream.stats.last_message_time is not None
+        _run(_test())
+
+    def test_last_message_time_updated_on_duplicate(self):
+        """Even duplicates update last_message_time (source is alive)."""
+        async def _test():
+            async with NeptuneStream() as stream:
+                msg = _sample_message()
+                await stream.ingest(msg)
+                t1 = stream.stats.last_message_time
+                await asyncio.sleep(0.01)
+                await stream.ingest(msg)  # duplicate
+                t2 = stream.stats.last_message_time
+                assert t2 > t1  # time advanced even for dupes
+        _run(_test())
+
+
+class TestHealthSnapshot:
+    def test_snapshot_keys(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                snap = stream.health_snapshot()
+                assert snap["health"] == "stale"
+                assert snap["running"] is True
+                assert snap["lag_seconds"] is None
+                assert snap["source"] == "aisstream"
+                assert "messages_received" in snap
+                assert "dedup_rate" in snap
+        _run(_test())
+
+    def test_snapshot_after_messages(self):
+        async def _test():
+            async with NeptuneStream() as stream:
+                await stream.ingest(_sample_message())
+                snap = stream.health_snapshot()
+                assert snap["health"] == "healthy"
+                assert snap["messages_received"] == 1
+                assert snap["lag_seconds"] is not None
+                assert snap["lag_seconds"] < 1.0
+        _run(_test())
+
+    def test_snapshot_disconnected(self):
+        stream = NeptuneStream()
+        snap = stream.health_snapshot()
+        assert snap["health"] == "disconnected"
+        assert snap["running"] is False
