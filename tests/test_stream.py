@@ -916,9 +916,9 @@ class TestStreamHealth:
     def test_last_message_time_set_on_ingest(self):
         async def _test():
             async with NeptuneStream() as stream:
-                assert stream.stats.last_message_time is None
+                assert stream._last_message_time is None
                 await stream.ingest(_sample_message())
-                assert stream.stats.last_message_time is not None
+                assert stream._last_message_time is not None
         _run(_test())
 
     def test_last_message_time_updated_on_duplicate(self):
@@ -927,10 +927,10 @@ class TestStreamHealth:
             async with NeptuneStream() as stream:
                 msg = _sample_message()
                 await stream.ingest(msg)
-                t1 = stream.stats.last_message_time
+                t1 = stream._last_message_time
                 await asyncio.sleep(0.01)
                 await stream.ingest(msg)  # duplicate
-                t2 = stream.stats.last_message_time
+                t2 = stream._last_message_time
                 assert t2 > t1  # time advanced even for dupes
         _run(_test())
 

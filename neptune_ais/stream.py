@@ -51,6 +51,7 @@ Non-goals for the current implementation:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import random
@@ -203,7 +204,6 @@ class StreamStats:
     backpressure_events: int = 0
     reconnections: int = 0
     errors: int = 0
-    last_message_time: float | None = None
 
     @property
     def dedup_rate(self) -> float:
@@ -261,6 +261,7 @@ class NeptuneStream:
         )
         self._dedup_set: set[tuple] = set()
         self._running = False
+        self._last_message_time: float | None = None
         self._message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
             maxsize=self._config.max_queue_size
         )
@@ -283,9 +284,9 @@ class NeptuneStream:
     @property
     def lag_seconds(self) -> float | None:
         """Seconds since the last message was received, or None if no messages yet."""
-        if self._stats.last_message_time is None:
+        if self._last_message_time is None:
             return None
-        return time.monotonic() - self._stats.last_message_time
+        return time.monotonic() - self._last_message_time
 
     def _health_from_lag(self, lag: float | None) -> StreamHealth:
         """Derive health state from a lag value."""
@@ -317,20 +318,15 @@ class NeptuneStream:
         Suitable for logging, monitoring endpoints, or operator dashboards.
         """
         lag = self.lag_seconds
-        return {
+        snapshot = dataclasses.asdict(self._stats)
+        snapshot.update({
             "health": self._health_from_lag(lag).value,
             "running": self._running,
             "lag_seconds": lag,
-            "messages_received": self._stats.messages_received,
-            "messages_delivered": self._stats.messages_delivered,
-            "messages_dropped": self._stats.messages_dropped,
-            "messages_deduplicated": self._stats.messages_deduplicated,
-            "backpressure_events": self._stats.backpressure_events,
-            "reconnections": self._stats.reconnections,
-            "errors": self._stats.errors,
             "dedup_rate": self._stats.dedup_rate,
             "source": self._config.source,
-        }
+        })
+        return snapshot
 
     # --- Async context manager ---
 
@@ -383,7 +379,7 @@ class NeptuneStream:
         call this method for each normalized position they produce.
         """
         self._stats.messages_received += 1
-        self._stats.last_message_time = time.monotonic()
+        self._last_message_time = time.monotonic()
 
         # Rolling dedup by identity key (O(1) lookup via parallel set).
         msg_key = _dedup_key(message, self._dedup_key_fields)
