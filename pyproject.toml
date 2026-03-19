@@ -11,8 +11,9 @@ license = "MIT"
 requires-python = ">=3.10"
 
 # ---------------------------------------------------------------------------
-# Core dependencies — required for archival ingest, query, and catalog.
+# Core dependencies — required for archival ingest and catalog.
 # These are paid by every install. Keep this list lean.
+# SQL queries require [sql], Parquet write features require [parquet].
 # ---------------------------------------------------------------------------
 dependencies = [
     "polars>=1.0",
