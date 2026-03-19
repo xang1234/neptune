@@ -313,6 +313,13 @@ class DuckDBSink:
 PROMOTION_VERSION = "promotion/landing-to-canonical/1.0.0"
 
 
+def _to_utc_datetime(val: Any) -> datetime:
+    """Coerce a timestamp value to a timezone-aware UTC datetime."""
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(val)).replace(tzinfo=timezone.utc)
+
+
 @dataclass
 class PromotionResult:
     """Result of promoting landing files for one date partition."""
@@ -463,8 +470,8 @@ def promote_landing(
             distinct_mmsi_count=(
                 partition_df["mmsi"].n_unique() if "mmsi" in partition_df.columns else 0
             ),
-            min_timestamp=partition_df["timestamp"].min(),
-            max_timestamp=partition_df["timestamp"].max(),
+            min_timestamp=_to_utc_datetime(partition_df["timestamp"].min()),
+            max_timestamp=_to_utc_datetime(partition_df["timestamp"].max()),
             bbox=BBox(
                 west=float(partition_df["lon"].min()),
                 south=float(partition_df["lat"].min()),
