@@ -88,11 +88,15 @@ def download_and_hash(
     *,
     overwrite: bool = False,
     content_type: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> RawArtifact:
     """Download a file and return a RawArtifact with its SHA-256 hash.
 
     Shared by all HTTP-based adapters. Handles caching (skip if exists
     and not overwrite), streaming download, and hash computation.
+
+    Args:
+        headers: Optional HTTP headers (e.g. for API key authentication).
     """
     import hashlib
     import logging
@@ -106,7 +110,7 @@ def download_and_hash(
     else:
         logger.info("Downloading %s → %s", url, dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.stream("GET", url, follow_redirects=True) as resp:
+        with httpx.stream("GET", url, follow_redirects=True, headers=headers or {}) as resp:
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=8192):

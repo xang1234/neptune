@@ -56,7 +56,7 @@ SOURCE_ID = "gfw"
 ADAPTER_VERSION = "gfw/0.1.0"
 
 # GFW API base URL.
-BASE_URL = "https://gateway-int.api.globalfishingwatch.org/v3"
+BASE_URL = "https://gateway.api.globalfishingwatch.org/v3"
 
 # GFW raw field names → canonical column names.
 COLUMN_MAP: dict[str, str] = {
@@ -172,8 +172,17 @@ class GFWAdapter:
         filename = _build_filename(spec.date)
         dest = self._download_dir / filename
 
+        auth_headers = (
+            {"Authorization": f"Bearer {self._api_key}"}
+            if self._api_key
+            else None
+        )
+
         return [download_and_hash(
-            url, dest, overwrite=spec.overwrite, content_type="application/json",
+            url, dest,
+            overwrite=spec.overwrite,
+            content_type="application/json",
+            headers=auth_headers,
         )]
 
     def normalize_positions(
@@ -183,13 +192,18 @@ class GFWAdapter:
         frames: list[pl.DataFrame] = []
 
         for art in artifacts:
-            path = Path(art.local_path)
-            raw_data = json.loads(path.read_text())
+            fpath = Path(art.local_path)
+            raw_data = json.loads(fpath.read_text())
 
             # GFW API returns a list of position records or a
             # wrapper object with an "entries" key.
             if isinstance(raw_data, dict):
                 records = raw_data.get("entries", raw_data.get("data", []))
+                if not records and "entries" not in raw_data and "data" not in raw_data:
+                    logger.warning(
+                        "GFW response has no 'entries' or 'data' key: %s",
+                        sorted(raw_data.keys()),
+                    )
             elif isinstance(raw_data, list):
                 records = raw_data
             else:
