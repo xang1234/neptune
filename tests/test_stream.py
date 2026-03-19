@@ -20,13 +20,12 @@ from neptune_ais.stream import (
     CompactionConfig,
     CompactionStats,
     DEDUP_KEY_FIELDS,
-    DedupConfig,
     NeptuneStream,
     StreamCompactor,
     StreamConfig,
     StreamSink,
     StreamStats,
-    _message_hash,
+    _dedup_key,
     compact_batch,
     load_checkpoint,
     run_with_reconnect,
@@ -121,29 +120,29 @@ class TestStreamStats:
 
 
 # ---------------------------------------------------------------------------
-# Message hash
+# Dedup key
 # ---------------------------------------------------------------------------
 
 
-class TestMessageHash:
+class TestDedupKey:
     def test_deterministic(self):
         msg = _sample_message()
-        assert _message_hash(msg) == _message_hash(msg)
+        assert _dedup_key(msg) == _dedup_key(msg)
 
     def test_differs_by_mmsi(self):
-        a = _message_hash(_sample_message(mmsi=111))
-        b = _message_hash(_sample_message(mmsi=222))
+        a = _dedup_key(_sample_message(mmsi=111))
+        b = _dedup_key(_sample_message(mmsi=222))
         assert a != b
 
     def test_differs_by_timestamp(self):
-        a = _message_hash(_sample_message(ts="2024-06-15T00:00:00"))
-        b = _message_hash(_sample_message(ts="2024-06-15T00:01:00"))
+        a = _dedup_key(_sample_message(ts="2024-06-15T00:00:00"))
+        b = _dedup_key(_sample_message(ts="2024-06-15T00:01:00"))
         assert a != b
 
-    def test_format(self):
-        h = _message_hash(_sample_message())
-        assert isinstance(h, str)
-        assert len(h) == 16  # SHA-1 hex prefix
+    def test_returns_tuple(self):
+        k = _dedup_key(_sample_message())
+        assert isinstance(k, tuple)
+        assert len(k) == 4  # mmsi, timestamp, lat, lon
 
 
 # ---------------------------------------------------------------------------
@@ -605,30 +604,6 @@ class TestBackpressure:
             assert mmsis == [2, 3, 4]
 
         _run(_test())
-
-
-# ---------------------------------------------------------------------------
-# DedupConfig
-# ---------------------------------------------------------------------------
-
-
-class TestDedupConfig:
-    def test_defaults(self):
-        cfg = DedupConfig()
-        assert cfg.key_fields == DEDUP_KEY_FIELDS
-        assert cfg.window_size == 10_000
-
-    def test_custom_key_fields(self):
-        cfg = DedupConfig(key_fields=("mmsi", "timestamp"))
-        assert cfg.key_fields == ("mmsi", "timestamp")
-
-    def test_empty_key_fields_raises(self):
-        with pytest.raises(ValueError, match="key_fields"):
-            DedupConfig(key_fields=())
-
-    def test_zero_window_raises(self):
-        with pytest.raises(ValueError, match="window_size"):
-            DedupConfig(window_size=0)
 
 
 # ---------------------------------------------------------------------------

@@ -51,7 +51,6 @@ Non-goals for the current implementation:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import random
@@ -226,10 +225,11 @@ class NeptuneStream:
             self._config = StreamConfig(source=source, api_key=api_key)
 
         self._stats = StreamStats()
-        self._dedup_queue: deque[str] = deque(
+        self._dedup_key_fields = self._config.dedup_key_fields
+        self._dedup_queue: deque[tuple] = deque(
             maxlen=self._config.dedup_window_size
         )
-        self._dedup_set: set[str] = set()
+        self._dedup_set: set[tuple] = set()
         self._running = False
         self._message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
             maxsize=self._config.max_queue_size
@@ -302,17 +302,17 @@ class NeptuneStream:
         """
         self._stats.messages_received += 1
 
-        # Rolling dedup by message hash (O(1) lookup via parallel set).
-        msg_hash = _message_hash(message, self._config.dedup_key_fields)
-        if msg_hash in self._dedup_set:
+        # Rolling dedup by identity key (O(1) lookup via parallel set).
+        msg_key = _dedup_key(message, self._dedup_key_fields)
+        if msg_key in self._dedup_set:
             self._stats.messages_deduplicated += 1
             return False
 
         # Evict oldest hash if window is full.
         if len(self._dedup_queue) == self._dedup_queue.maxlen:
             self._dedup_set.discard(self._dedup_queue[0])
-        self._dedup_queue.append(msg_hash)
-        self._dedup_set.add(msg_hash)
+        self._dedup_queue.append(msg_key)
+        self._dedup_set.add(msg_key)
 
         # Bounded queue with backpressure policy.
         if self._message_queue.full():
@@ -567,40 +567,10 @@ async def run_with_reconnect(
 
 
 # ---------------------------------------------------------------------------
-# Rolling dedup configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DedupConfig:
-    """Explicit rolling dedup semantics for streaming ingestion.
-
-    The dedup window is a sliding window of recent message hashes.
-    Messages whose hash matches one already in the window are dropped.
-
-    Attributes:
-        key_fields: Message fields that define identity. Two messages
-            with identical values for all key fields are duplicates.
-        window_size: How many recent hashes to retain. Larger windows
-            catch more duplicates but use more memory. Each hash is a
-            16-char hex string (~50 bytes with Python overhead).
-    """
-
-    key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS
-    window_size: int = 10_000
-
-    def __post_init__(self) -> None:
-        if not self.key_fields:
-            raise ValueError("key_fields must not be empty")
-        if self.window_size < 1:
-            raise ValueError(
-                f"window_size must be >= 1, got {self.window_size}"
-            )
-
-
-# ---------------------------------------------------------------------------
 # Compaction — landed-data dedup and ordering
 # ---------------------------------------------------------------------------
+
+COMPACTION_SORT_FIELDS: tuple[str, ...] = ("timestamp", "mmsi")
 
 
 @dataclass
@@ -621,7 +591,7 @@ class CompactionConfig:
     """
 
     key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS
-    sort_fields: tuple[str, ...] = ("timestamp", "mmsi")
+    sort_fields: tuple[str, ...] = COMPACTION_SORT_FIELDS
     trigger_count: int | None = 10_000
 
     def __post_init__(self) -> None:
@@ -647,7 +617,7 @@ def compact_batch(
     messages: list[dict[str, Any]],
     *,
     key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS,
-    sort_fields: tuple[str, ...] = ("timestamp", "mmsi"),
+    sort_fields: tuple[str, ...] = COMPACTION_SORT_FIELDS,
 ) -> list[dict[str, Any]]:
     """Deduplicate and sort a batch of messages.
 
@@ -667,18 +637,15 @@ def compact_batch(
         return []
 
     # Dedup: keep last occurrence (latest wins for same identity).
-    seen: dict[tuple, int] = {}
-    for i, msg in enumerate(messages):
+    # Overwriting the value gives last-wins; dict insertion order is
+    # irrelevant because we sort afterwards.
+    seen: dict[tuple, dict[str, Any]] = {}
+    for msg in messages:
         key = tuple(msg.get(f) for f in key_fields)
-        seen[key] = i  # overwrite with later index
+        seen[key] = msg
 
-    unique = [messages[i] for i in sorted(seen.values())]
-
-    # Sort by requested fields.
-    def _sort_key(msg: dict[str, Any]) -> tuple:
-        return tuple(msg.get(f, "") for f in sort_fields)
-
-    unique.sort(key=_sort_key)
+    unique = list(seen.values())
+    unique.sort(key=lambda msg: tuple(msg.get(f, "") for f in sort_fields))
     return unique
 
 
@@ -737,9 +704,10 @@ class StreamCompactor:
 
         Resets the internal buffer. Updates compaction stats.
         """
-        before = len(self._buffer)
+        buf, self._buffer = self._buffer, []
+        before = len(buf)
         result = compact_batch(
-            self._buffer,
+            buf,
             key_fields=self._config.key_fields,
             sort_fields=self._config.sort_fields,
         )
@@ -748,7 +716,6 @@ class StreamCompactor:
         self._stats.compactions_run += 1
         self._stats.messages_before += before
         self._stats.messages_after += after
-        self._buffer = []
 
         logger.debug(
             "Compaction: %d → %d messages (%d removed)",
@@ -767,11 +734,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _message_hash(msg: dict[str, Any], key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS) -> str:
-    """Compute a dedup hash for a position message.
+def _dedup_key(msg: dict[str, Any], key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS) -> tuple:
+    """Build a dedup identity tuple for a position message.
 
-    Uses the configured key fields as the dedup key. Two messages
-    with the same values for all key fields are considered duplicates.
+    Uses the configured key fields. Two messages with the same values
+    for all key fields are considered duplicates. Returns a hashable
+    tuple suitable for set/dict membership tests.
     """
-    key = ":".join(str(msg.get(f)) for f in key_fields)
-    return hashlib.sha1(key.encode()).hexdigest()[:16]
+    return tuple(msg.get(f) for f in key_fields)
