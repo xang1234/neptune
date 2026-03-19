@@ -241,7 +241,14 @@ def discover_plugins() -> list[str]:
             adapter_cls = ep.load()
             if adapter_cls not in _ADAPTERS.values():
                 register(adapter_cls)
-            source_id = getattr(adapter_cls, "SOURCE_ID", ep.name)
+            # Read back the actual registered key (not ep.name, which
+            # may differ from what register() resolved).
+            source_id = getattr(adapter_cls, "SOURCE_ID", None)
+            if source_id is None:
+                source_id = next(
+                    (k for k, v in _ADAPTERS.items() if v is adapter_cls),
+                    ep.name,
+                )
             loaded.append(source_id)
             logger.debug("Loaded plugin adapter: %s (%s)", source_id, ep.value)
         except Exception as e:

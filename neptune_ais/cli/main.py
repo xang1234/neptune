@@ -279,7 +279,7 @@ def sources(
                 continue  # already in header
             click.echo(f"{key:<20}", nl=False)
             for s in summaries:
-                val = s[key]
+                val = s.get(key, "")
                 if len(val) > 13:
                     val = val[:12] + "\u2026"
                 click.echo(f" {val:<14}", nl=False)
