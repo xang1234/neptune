@@ -268,38 +268,27 @@ class FinlandAdapter:
             if col_name == "mmsi":
                 exprs.append(col.cast(pl.Int64, strict=False))
             elif col_name == "timestamp":
-                # Digitraffic uses Unix epoch milliseconds.
+                # Digitraffic uses epoch ms; × 1000 converts to μs for Datetime("us").
                 exprs.append(
                     (col.cast(pl.Int64, strict=False) * 1000)
                     .cast(pl.Datetime("us", "UTC"))
                 )
             elif col_name in ("lat", "lon"):
                 exprs.append(col.cast(pl.Float64, strict=False))
-            elif col_name == "sog":
-                # Digitraffic SOG is knots × 10.
+            elif col_name in ("sog", "cog", "draught"):
+                # Digitraffic sends SOG/COG/draught × 10; divide to normalize.
                 exprs.append(
                     (col.cast(pl.Float64, strict=False) / DIGITRAFFIC_SCALE_FACTOR)
-                    .alias("sog")
-                )
-            elif col_name == "cog":
-                # Digitraffic COG is degrees × 10.
-                exprs.append(
-                    (col.cast(pl.Float64, strict=False) / DIGITRAFFIC_SCALE_FACTOR)
-                    .alias("cog")
+                    .alias(col_name)
                 )
             elif col_name == "heading":
                 # 511 = not available → null.
+                float_col = col.cast(pl.Float64, strict=False)
                 exprs.append(
-                    pl.when(col.cast(pl.Float64, strict=False) == HEADING_UNAVAILABLE)
+                    pl.when(float_col == HEADING_UNAVAILABLE)
                     .then(None)
-                    .otherwise(col.cast(pl.Float64, strict=False))
+                    .otherwise(float_col)
                     .alias("heading")
-                )
-            elif col_name == "draught":
-                # Digitraffic draught is meters × 10.
-                exprs.append(
-                    (col.cast(pl.Float64, strict=False) / DIGITRAFFIC_SCALE_FACTOR)
-                    .alias("draught")
                 )
             elif col_name == "imo":
                 # IMO=0 or null means unavailable → null.
@@ -316,14 +305,8 @@ class FinlandAdapter:
             else:
                 exprs.append(col.cast(pl.String, strict=False))
 
-        df = df.with_columns(exprs)
-
-        # Add source provenance.
-        df = df.with_columns(
-            pl.lit(SOURCE_ID).alias("source"),
-        )
-
-        return df
+        exprs.append(pl.lit(SOURCE_ID).alias("source"))
+        return df.with_columns(exprs)
 
 
 # ---------------------------------------------------------------------------
