@@ -475,6 +475,15 @@ class TestBackpressure:
         with pytest.raises(ValueError):
             StreamConfig(backpressure="ignore")
 
+    def test_zero_queue_size_raises(self):
+        """max_queue_size=0 would create unbounded queue; reject it."""
+        with pytest.raises(ValueError, match="max_queue_size"):
+            StreamConfig(max_queue_size=0)
+
+    def test_negative_queue_size_raises(self):
+        with pytest.raises(ValueError, match="max_queue_size"):
+            StreamConfig(max_queue_size=-1)
+
     def test_block_policy_awaits_consumer(self):
         """With 'block' policy, ingest awaits until queue has space."""
         async def _test():
@@ -544,7 +553,8 @@ class TestBackpressure:
                 # Queue size 1 means 4 drops (first fills, next 4 each drop oldest).
                 assert stream.stats.backpressure_events == 4
                 assert stream.stats.messages_dropped == 4
-                assert stream.stats.messages_delivered == 5
+                # Only 1 message survives in the queue for consumers.
+                assert stream.stats.messages_delivered == 1
 
         _run(_test())
 

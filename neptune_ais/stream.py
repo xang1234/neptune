@@ -118,6 +118,10 @@ class StreamConfig:
     def __post_init__(self) -> None:
         if isinstance(self.backpressure, str):
             self.backpressure = BackpressurePolicy(self.backpressure)
+        if self.max_queue_size < 1:
+            raise ValueError(
+                f"max_queue_size must be >= 1, got {self.max_queue_size}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +314,9 @@ class NeptuneStream:
                 # so no other coroutine can drain the queue in between.
                 self._message_queue.get_nowait()
                 self._stats.messages_dropped += 1
+                # Revoke the evicted message's delivery credit so
+                # messages_delivered reflects what consumers actually see.
+                self._stats.messages_delivered -= 1
                 self._message_queue.put_nowait(message)
                 self._stats.messages_delivered += 1
                 return True
