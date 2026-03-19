@@ -39,6 +39,7 @@ from neptune_ais.storage import (
 )
 from neptune_ais.stream import (
     CompactionConfig,
+    DEDUP_KEY_FIELDS,
     StreamCompactor,
     StreamSink,
 )
@@ -378,27 +379,42 @@ def promote_landing(
         logger.info("No landing files found in %s", landing_path)
         return []
 
-    # Read all landing files into a single DataFrame.
-    dfs = [pl.read_parquet(f) for f in parquet_files]
-    all_data = pl.concat(dfs)
+    # Lazy scan avoids loading all files into memory at once.
+    # Each date partition is collected separately.
+    all_data = pl.scan_parquet(parquet_files).with_columns(
+        pl.col("timestamp").cast(pl.String).str.slice(0, 10).alias("_date")
+    )
 
-    if len(all_data) == 0:
+    dates = sorted(
+        all_data.select("_date").unique().collect()["_date"].to_list()
+    )
+    if not dates:
         return []
 
-    # Extract date from timestamp for partitioning.
-    all_data = all_data.with_columns(
-        pl.col("timestamp").cast(pl.String).str.slice(0, 10).alias("_date")
+    # Shared Parquet write kwargs — single definition for all shards.
+    _write_kwargs = dict(
+        compression=PARQUET_COMPRESSION,
+        compression_level=PARQUET_COMPRESSION_LEVEL,
+        row_group_size=DEFAULT_ROW_GROUP_SIZE,
+        statistics=PARQUET_WRITE_STATISTICS,
     )
 
     results: list[PromotionResult] = []
 
-    for date_str in sorted(all_data["_date"].unique().to_list()):
-        partition_df = all_data.filter(pl.col("_date") == date_str).drop("_date")
+    for date_str in dates:
+        # Collect only this date's data (predicate pushdown via lazy scan).
+        partition_df = (
+            all_data.filter(pl.col("_date") == date_str)
+            .drop("_date")
+            .collect()
+        )
 
         # Dedup by position identity keys (same as streaming dedup).
-        dedup_cols = [c for c in ["mmsi", "timestamp", "lat", "lon"] if c in partition_df.columns]
+        dedup_cols = [c for c in DEDUP_KEY_FIELDS if c in partition_df.columns]
         if dedup_cols:
-            partition_df = partition_df.unique(subset=dedup_cols, keep="last")
+            # All copies with identical (mmsi, timestamp, lat, lon) are
+            # equivalent observations — keep any.
+            partition_df = partition_df.unique(subset=dedup_cols, keep="any")
 
         # Sort for optimal Parquet layout.
         sort_cols = [c for c in SORT_ORDER_POSITIONS if c in partition_df.columns]
@@ -418,27 +434,17 @@ def promote_landing(
         shard_files: list[str] = []
         if n_rows <= DEFAULT_MAX_ROWS_PER_SHARD:
             sf = shard_filename(0)
-            partition_df.write_parquet(
-                staging / sf,
-                compression=PARQUET_COMPRESSION,
-                compression_level=PARQUET_COMPRESSION_LEVEL,
-                row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                statistics=PARQUET_WRITE_STATISTICS,
-            )
+            partition_df.write_parquet(staging / sf, **_write_kwargs)
             shard_files.append(sf)
         else:
-            shard_idx = 0
-            for offset in range(0, n_rows, DEFAULT_MAX_ROWS_PER_SHARD):
+            for shard_idx, offset in enumerate(
+                range(0, n_rows, DEFAULT_MAX_ROWS_PER_SHARD)
+            ):
                 sf = shard_filename(shard_idx)
-                partition_df.slice(offset, DEFAULT_MAX_ROWS_PER_SHARD).write_parquet(
-                    staging / sf,
-                    compression=PARQUET_COMPRESSION,
-                    compression_level=PARQUET_COMPRESSION_LEVEL,
-                    row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                    statistics=PARQUET_WRITE_STATISTICS,
-                )
+                partition_df.slice(
+                    offset, DEFAULT_MAX_ROWS_PER_SHARD
+                ).write_parquet(staging / sf, **_write_kwargs)
                 shard_files.append(sf)
-                shard_idx += 1
 
         writer.validate(expected_files=shard_files)
 
@@ -477,14 +483,13 @@ def promote_landing(
 
         writer.commit(manifest_json=manifest.model_dump_json(indent=2))
 
-        landing_file_names = [f.name for f in parquet_files]
         results.append(PromotionResult(
             date=date_str,
             source=source,
             record_count=n_rows,
             files_promoted=len(parquet_files),
             shard_files=shard_files,
-            landing_files=landing_file_names,
+            landing_files=[f.name for f in parquet_files],
         ))
 
         logger.info(
