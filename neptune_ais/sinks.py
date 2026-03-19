@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import re
+
 import polars as pl
 
 from neptune_ais.storage import (
@@ -33,6 +35,7 @@ from neptune_ais.storage import (
     PARQUET_COMPRESSION_LEVEL,
     PARQUET_WRITE_STATISTICS,
     DEFAULT_ROW_GROUP_SIZE,
+    SORT_ORDER_POSITIONS,
 )
 from neptune_ais.stream import (
     CompactionConfig,
@@ -42,10 +45,7 @@ from neptune_ais.stream import (
 
 logger = logging.getLogger(__name__)
 
-# Columns present in raw streaming messages that map to the positions schema.
-# Streaming messages are dicts with these keys; Parquet files will have them
-# as columns.  Additional keys in the message are preserved as-is.
-_LANDING_SORT_COLUMNS = ["mmsi", "timestamp"]
+_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,8 @@ class ParquetSink:
         self._rows_written = 0
         self._compact = compact
         self._compactor = StreamCompactor(compaction_config) if compact else None
+        self._sort_cols: list[str] | None = None  # cached after first flush
+        self._dir_created = False
 
     @property
     def rows_written(self) -> int:
@@ -124,11 +126,15 @@ class ParquetSink:
         df = pl.DataFrame(messages)
 
         # Sort by mmsi, timestamp for efficient downstream reads.
-        sort_cols = [c for c in _LANDING_SORT_COLUMNS if c in df.columns]
-        if sort_cols:
-            df = df.sort(sort_cols)
+        # Cache sort_cols on first flush: column presence is fixed per stream.
+        if self._sort_cols is None:
+            self._sort_cols = [c for c in SORT_ORDER_POSITIONS if c in df.columns]
+        if self._sort_cols:
+            df = df.sort(self._sort_cols)
 
-        self._landing_dir.mkdir(parents=True, exist_ok=True)
+        if not self._dir_created:
+            self._landing_dir.mkdir(parents=True, exist_ok=True)
+            self._dir_created = True
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename = f"landing-{ts}-{self._batch_count:04d}.parquet"
         filepath = self._landing_dir / filename
@@ -190,11 +196,18 @@ class DuckDBSink:
     ) -> None:
         import duckdb
 
+        if not _VALID_IDENTIFIER.match(table_name):
+            raise ValueError(
+                f"table_name must be a valid SQL identifier, got {table_name!r}"
+            )
+
         self._db_path = str(db_path)
         self._table_name = table_name
         self._source = source
         self._con = duckdb.connect(self._db_path)
         self._table_created = False
+        self._insert_sql: str | None = None   # cached after table creation
+        self._columns: list[str] | None = None  # cached after table creation
         self._buffer: list[dict[str, Any]] = []
         self._rows_written = 0
         self._compact = compact
@@ -229,11 +242,13 @@ class DuckDBSink:
         if not messages:
             return
 
-        columns = list(messages[0].keys())
-
         if not self._table_created:
-            # Infer schema from first message and create table.
-            type_map = {str: "VARCHAR", int: "BIGINT", float: "DOUBLE"}
+            # Infer schema from first message, create table, and cache the
+            # INSERT SQL and column order — both are fixed for the lifetime
+            # of the sink.
+            columns = list(messages[0].keys())
+            # bool must precede int (bool subclasses int in Python).
+            type_map = {bool: "BOOLEAN", str: "VARCHAR", int: "BIGINT", float: "DOUBLE"}
             col_defs = []
             for col in columns:
                 val = messages[0].get(col)
@@ -243,17 +258,19 @@ class DuckDBSink:
                 f"CREATE TABLE IF NOT EXISTS {self._table_name} "
                 f"({', '.join(col_defs)})"
             )
+            self._columns = columns
+            placeholders = ", ".join("?" for _ in columns)
+            quoted_cols = ", ".join(f'"{c}"' for c in columns)
+            self._insert_sql = (
+                f"INSERT INTO {self._table_name} ({quoted_cols}) "
+                f"VALUES ({placeholders})"
+            )
             self._table_created = True
 
-        # Parameterized batch insert.
-        placeholders = ", ".join("?" for _ in columns)
-        quoted_cols = ", ".join(f'"{c}"' for c in columns)
-        sql = (
-            f"INSERT INTO {self._table_name} ({quoted_cols}) "
-            f"VALUES ({placeholders})"
-        )
+        # Parameterized batch insert using cached SQL and column order.
+        columns = self._columns  # type: ignore[assignment]
         rows = [tuple(msg.get(c) for c in columns) for msg in messages]
-        self._con.executemany(sql, rows)
+        self._con.executemany(self._insert_sql, rows)
 
         self._rows_written += len(messages)
         logger.debug(

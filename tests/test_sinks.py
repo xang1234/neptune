@@ -15,6 +15,7 @@ import polars as pl
 import pytest
 
 from neptune_ais.sinks import DuckDBSink, ParquetSink
+from neptune_ais.stream import StreamSink
 
 
 def _has_module(name: str) -> bool:
@@ -23,7 +24,6 @@ def _has_module(name: str) -> bool:
         return True
     except ImportError:
         return False
-from neptune_ais.stream import StreamSink
 
 
 def _sample_message(
@@ -250,7 +250,8 @@ class TestDuckDBSink:
             assert sink.rows_written == 0
             # Table should not exist yet.
             tables = sink.connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'"
             ).fetchall()
             assert len(tables) == 0
 
