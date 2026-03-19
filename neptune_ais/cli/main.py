@@ -251,8 +251,8 @@ def sources(
     has_filters = filter_backfill or filter_streaming or filter_open
     if has_filters:
         all_caps = registry.find_sources(
-            backfill=True if filter_backfill else None,
-            streaming=True if filter_streaming else None,
+            backfill=filter_backfill or None,
+            streaming=filter_streaming or None,
             auth=False if filter_open else None,
         )
     else:
@@ -263,29 +263,26 @@ def sources(
         return
 
     if do_compare:
-        # Side-by-side comparison matrix.
-        click.echo(f"\n{'Capability':<20}", nl=False)
-        for caps in all_caps:
-            click.echo(f" {caps.source_id:<14}", nl=False)
-        click.echo()
-        click.echo("-" * (20 + 15 * len(all_caps)))
+        # Side-by-side comparison using registry.compare().
+        source_ids = [c.source_id for c in all_caps]
+        summaries = registry.compare(*source_ids)
+        keys = list(summaries[0].keys())
 
-        rows = [
-            ("Provider", lambda c: c.provider[:13]),
-            ("Coverage", lambda c: c.coverage[:13]),
-            ("Backfill", lambda c: "yes" if c.supports_backfill else "no"),
-            ("Streaming", lambda c: "yes" if c.supports_streaming else "no"),
-            ("Server bbox", lambda c: "yes" if c.supports_server_side_bbox else "no"),
-            ("Auth", lambda c: c.auth_scheme or "none"),
-            ("Latency", lambda c: (c.expected_latency or "?")[:13]),
-            ("History", lambda c: (c.history_start or "?")[:13]),
-            ("Format", lambda c: c.delivery_format[:13]),
-            ("License", lambda c: (c.license_requirements or "?")[:13]),
-        ]
-        for label, fn in rows:
-            click.echo(f"{label:<20}", nl=False)
-            for caps in all_caps:
-                click.echo(f" {fn(caps):<14}", nl=False)
+        click.echo(f"\n{'Capability':<20}", nl=False)
+        for sid in source_ids:
+            click.echo(f" {sid:<14}", nl=False)
+        click.echo()
+        click.echo("-" * (20 + 15 * len(source_ids)))
+
+        for key in keys:
+            if key == "source":
+                continue  # already in header
+            click.echo(f"{key:<20}", nl=False)
+            for s in summaries:
+                val = s[key]
+                if len(val) > 13:
+                    val = val[:12] + "\u2026"
+                click.echo(f" {val:<14}", nl=False)
             click.echo()
     else:
         # Summary table.
