@@ -51,7 +51,8 @@ def _msg(mmsi: int, ts: str, lat: float = 40.0, lon: float = -74.0) -> dict[str,
 
 
 def _ts(i: int, date: str = "2024-01-01") -> str:
-    """Generate a valid ISO timestamp from an integer index."""
+    """Generate a valid ISO timestamp from an integer index (0–86399)."""
+    assert 0 <= i < 86400, f"_ts() index {i} out of valid range [0, 86400)"
     h, m, s = i // 3600, (i % 3600) // 60, i % 60
     return f"{date}T{h:02d}:{m:02d}:{s:02d}"
 
@@ -193,7 +194,7 @@ class TestRestartReliability:
             cp = load_checkpoint("soak-test", str(tmp_path))
             assert cp is not None
             assert cp.messages_total == 4
-            assert cp.session_count >= 1
+            assert cp.session_count == 1
 
         _run(_test())
 
@@ -245,10 +246,9 @@ class TestHealthTransitions:
             config = StreamConfig(
                 lag_threshold_s=0.02,
                 # Wide gap so asyncio.sleep overshoot can't push us past
-                # stale_threshold before we assert LAGGING.  With a 80ms
-                # safe window (0.02–0.15s) the test can tolerate ~70ms of
-                # scheduler jitter without a false STALE transition.
-                stale_threshold_s=0.15,
+                # stale_threshold before we assert LAGGING.  With a 480ms
+                # safe window (0.02–0.5s) the test tolerates heavy CI load.
+                stale_threshold_s=0.5,
             )
             stream = NeptuneStream(config=config)
 
@@ -263,12 +263,12 @@ class TestHealthTransitions:
                 await stream.ingest(_msg(mmsi=1, ts="2024-01-01T00:00:00"))
                 assert stream.health is StreamHealth.HEALTHY
 
-                # Wait past lag threshold (0.02s) but well inside stale (0.15s).
+                # Wait past lag threshold (0.02s) but well inside stale (0.5s).
                 await asyncio.sleep(0.07)
                 assert stream.health is StreamHealth.LAGGING
 
-                # Wait past stale threshold (need ≥0.15s total elapsed).
-                await asyncio.sleep(0.10)
+                # Wait past stale threshold (need ≥0.5s total elapsed).
+                await asyncio.sleep(0.50)
                 assert stream.health is StreamHealth.STALE
 
                 # Recovery: new message restores HEALTHY.
@@ -301,7 +301,7 @@ class TestHealthTransitions:
                 snap = stream.health_snapshot()
                 assert snap["health"] == "healthy"
                 assert snap["lag_seconds"] is not None
-                assert snap["lag_seconds"] < 1.0
+                assert snap["lag_seconds"] < 0.1
 
                 # Lagging snapshot: sleep past lag (0.01s), well inside stale (0.20s).
                 await asyncio.sleep(0.05)
@@ -527,7 +527,7 @@ class TestCompactionReliability:
 
         # Each batch has 1 intra-batch dupe → 20 removed total.
         assert compactor.stats.messages_before == total_added
-        assert compactor.stats.messages_removed >= 10  # at least some dupes per compact
+        assert compactor.stats.messages_removed == 20  # 1 dup per batch × 20 batches
         assert total_compacted < total_added
 
 
