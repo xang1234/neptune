@@ -77,6 +77,7 @@ CAPABILITIES = SourceCapabilities(
     supports_server_side_bbox=True,
     auth_scheme="api_key",
     expected_latency="real-time",
+    license_requirements="Free API key required. See https://aisstream.io",
     coverage="Global (terrestrial AIS receivers)",
     delivery_format="WebSocket JSON",
     typical_daily_rows="10M+",
