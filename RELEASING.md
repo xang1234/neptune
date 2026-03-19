@@ -63,13 +63,17 @@ python -m venv /tmp/neptune-test
 ## Publish
 
 ```bash
-pip install twine
-twine upload dist/*
+# Push the release commit and tag. The GitHub Actions workflow
+# .github/workflows/publish-pypi.yml will build and publish to PyPI
+# via trusted publishing.
+git push
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Post-release
 
-1. Tag the release: `git tag v0.1.0 && git push --tags`
+1. Confirm the `Publish to PyPI` GitHub Actions workflow succeeded
 2. Bump version to next dev: `0.2.0dev0`
 3. Update benchmark baseline if needed
 
@@ -81,6 +85,7 @@ twine upload dist/*
 | `[parquet]` | pyarrow | Full Parquet write options |
 | `[geo]` | shapely, geopandas, movingpandas, lonboard, h3 | `geometry/`, `viz.py` |
 | `[stream]` | websockets | `NeptuneStream`, AISStream adapter |
-| `[cli]` | click, rich | `neptune` console script |
+| base install | click | `neptune` console script |
+| `[cli]` | rich | Richer terminal output |
 | `[all]` | all of the above | Full-featured install |
 | `[dev]` | pytest, pytest-asyncio, ruff, mypy, coverage | Development only |
