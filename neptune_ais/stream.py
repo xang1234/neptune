@@ -59,6 +59,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from enum import Enum
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Stream configuration
 # ---------------------------------------------------------------------------
+
+
+class BackpressurePolicy(str, Enum):
+    """Policy for handling a full message queue."""
+
+    BLOCK = "block"
+    DROP_OLDEST = "drop_oldest"
 
 
 @dataclass
@@ -103,9 +111,13 @@ class StreamConfig:
     max_reconnect_delay_s: float = 60.0
     dedup_window_size: int = 10_000
     max_queue_size: int = 10_000
-    backpressure: str = "block"  # "block" or "drop_oldest"
+    backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK
     checkpoint_dir: str | None = None
     flush_interval_s: int = 60
+
+    def __post_init__(self) -> None:
+        if isinstance(self.backpressure, str):
+            self.backpressure = BackpressurePolicy(self.backpressure)
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +213,6 @@ class NeptuneStream:
         else:
             self._config = StreamConfig(source=source, api_key=api_key)
 
-        if self._config.backpressure not in ("block", "drop_oldest"):
-            raise ValueError(
-                f"backpressure must be 'block' or 'drop_oldest', "
-                f"got {self._config.backpressure!r}"
-            )
-
         self._stats = StreamStats()
         self._dedup_queue: deque[str] = deque(
             maxlen=self._config.dedup_window_size
@@ -295,22 +301,26 @@ class NeptuneStream:
             self._dedup_set.discard(self._dedup_queue[0])
         self._dedup_queue.append(msg_hash)
         self._dedup_set.add(msg_hash)
-        self._stats.messages_delivered += 1
 
         # Bounded queue with backpressure policy.
         if self._message_queue.full():
             self._stats.backpressure_events += 1
-            if self._config.backpressure == "drop_oldest":
-                try:
-                    self._message_queue.get_nowait()
-                    self._stats.messages_dropped += 1
-                except asyncio.QueueEmpty:
-                    pass  # pragma: no cover — race condition guard
+            if self._config.backpressure is BackpressurePolicy.DROP_OLDEST:
+                # Safe to use get_nowait: no await between full() and here,
+                # so no other coroutine can drain the queue in between.
+                self._message_queue.get_nowait()
+                self._stats.messages_dropped += 1
                 self._message_queue.put_nowait(message)
+                self._stats.messages_delivered += 1
                 return True
-            # "block" policy: fall through to await put().
+            # "block" policy: await until consumer makes space.
+            await self._message_queue.put(message)
+            self._stats.messages_delivered += 1
+            return True
 
-        await self._message_queue.put(message)
+        # Common non-full path: put_nowait avoids coroutine overhead.
+        self._message_queue.put_nowait(message)
+        self._stats.messages_delivered += 1
         return True
 
     # --- Sink runner ---

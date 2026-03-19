@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from neptune_ais.stream import (
+    BackpressurePolicy,
     Checkpoint,
     NeptuneStream,
     StreamConfig,
@@ -471,9 +472,8 @@ class TestBackpressure:
         assert stream._message_queue.maxsize == 50
 
     def test_invalid_backpressure_policy(self):
-        config = StreamConfig(backpressure="ignore")
-        with pytest.raises(ValueError, match="backpressure"):
-            NeptuneStream(config=config)
+        with pytest.raises(ValueError):
+            StreamConfig(backpressure="ignore")
 
     def test_block_policy_awaits_consumer(self):
         """With 'block' policy, ingest awaits until queue has space."""
