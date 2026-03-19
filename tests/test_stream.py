@@ -17,11 +17,17 @@ import pytest
 from neptune_ais.stream import (
     BackpressurePolicy,
     Checkpoint,
+    CompactionConfig,
+    CompactionStats,
+    DEDUP_KEY_FIELDS,
+    DedupConfig,
     NeptuneStream,
+    StreamCompactor,
     StreamConfig,
     StreamSink,
     StreamStats,
     _message_hash,
+    compact_batch,
     load_checkpoint,
     run_with_reconnect,
     save_checkpoint,
@@ -597,5 +603,249 @@ class TestBackpressure:
             msgs = [m for batch in sink.batches for m in batch]
             mmsis = [m["mmsi"] for m in msgs]
             assert mmsis == [2, 3, 4]
+
+        _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# DedupConfig
+# ---------------------------------------------------------------------------
+
+
+class TestDedupConfig:
+    def test_defaults(self):
+        cfg = DedupConfig()
+        assert cfg.key_fields == DEDUP_KEY_FIELDS
+        assert cfg.window_size == 10_000
+
+    def test_custom_key_fields(self):
+        cfg = DedupConfig(key_fields=("mmsi", "timestamp"))
+        assert cfg.key_fields == ("mmsi", "timestamp")
+
+    def test_empty_key_fields_raises(self):
+        with pytest.raises(ValueError, match="key_fields"):
+            DedupConfig(key_fields=())
+
+    def test_zero_window_raises(self):
+        with pytest.raises(ValueError, match="window_size"):
+            DedupConfig(window_size=0)
+
+
+# ---------------------------------------------------------------------------
+# compact_batch
+# ---------------------------------------------------------------------------
+
+
+class TestCompactBatch:
+    def test_empty_input(self):
+        assert compact_batch([]) == []
+
+    def test_no_duplicates(self):
+        msgs = [
+            _sample_message(mmsi=1, ts="2024-01-01T00:00:00"),
+            _sample_message(mmsi=2, ts="2024-01-01T00:01:00"),
+        ]
+        result = compact_batch(msgs)
+        assert len(result) == 2
+
+    def test_dedup_keeps_last(self):
+        """When duplicates exist, the last occurrence wins."""
+        msg1 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        msg1["sog"] = 5.0
+        msg2 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        msg2["sog"] = 10.0  # updated value
+        result = compact_batch([msg1, msg2])
+        assert len(result) == 1
+        assert result[0]["sog"] == 10.0  # last wins
+
+    def test_sorts_by_timestamp_then_mmsi(self):
+        msgs = [
+            _sample_message(mmsi=2, ts="2024-01-01T00:01:00"),
+            _sample_message(mmsi=1, ts="2024-01-01T00:01:00"),
+            _sample_message(mmsi=1, ts="2024-01-01T00:00:00"),
+        ]
+        result = compact_batch(msgs)
+        assert [(m["mmsi"], m["timestamp"]) for m in result] == [
+            (1, "2024-01-01T00:00:00"),
+            (1, "2024-01-01T00:01:00"),
+            (2, "2024-01-01T00:01:00"),
+        ]
+
+    def test_custom_key_fields(self):
+        """Dedup using only mmsi+timestamp (ignoring lat/lon)."""
+        msg1 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        msg1["lat"] = 40.0
+        msg2 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        msg2["lat"] = 41.0  # different lat
+        # Default key includes lat → both kept.
+        assert len(compact_batch([msg1, msg2])) == 2
+        # Custom key without lat → deduped.
+        assert len(compact_batch(
+            [msg1, msg2], key_fields=("mmsi", "timestamp")
+        )) == 1
+
+    def test_custom_sort_fields(self):
+        msgs = [
+            _sample_message(mmsi=2, ts="2024-01-01T00:00:00"),
+            _sample_message(mmsi=1, ts="2024-01-01T00:01:00"),
+        ]
+        result = compact_batch(msgs, sort_fields=("mmsi",))
+        assert result[0]["mmsi"] == 1
+        assert result[1]["mmsi"] == 2
+
+    def test_large_batch(self):
+        """Compaction handles realistic batch sizes."""
+        msgs = []
+        for i in range(100):
+            msgs.append(_sample_message(mmsi=i % 10, ts=f"2024-01-01T00:{i:02d}:00"))
+        # mmsi 0-9 repeat 10 times each, but timestamps differ → all unique.
+        result = compact_batch(msgs)
+        assert len(result) == 100
+
+    def test_large_batch_with_dupes(self):
+        msgs = []
+        for _ in range(3):
+            for i in range(10):
+                msgs.append(_sample_message(mmsi=i, ts=f"2024-01-01T00:0{i}:00"))
+        # 30 messages, 10 unique (each repeated 3x).
+        result = compact_batch(msgs)
+        assert len(result) == 10
+
+
+# ---------------------------------------------------------------------------
+# CompactionConfig
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionConfig:
+    def test_defaults(self):
+        cfg = CompactionConfig()
+        assert cfg.key_fields == DEDUP_KEY_FIELDS
+        assert cfg.sort_fields == ("timestamp", "mmsi")
+        assert cfg.trigger_count == 10_000
+
+    def test_empty_key_fields_raises(self):
+        with pytest.raises(ValueError, match="key_fields"):
+            CompactionConfig(key_fields=())
+
+    def test_manual_trigger(self):
+        cfg = CompactionConfig(trigger_count=None)
+        assert cfg.trigger_count is None
+
+
+# ---------------------------------------------------------------------------
+# StreamCompactor
+# ---------------------------------------------------------------------------
+
+
+class TestStreamCompactor:
+    def test_add_and_compact(self):
+        compactor = StreamCompactor()
+        msgs = [
+            _sample_message(mmsi=1, ts="2024-01-01T00:00:00"),
+            _sample_message(mmsi=2, ts="2024-01-01T00:01:00"),
+        ]
+        compactor.add(msgs)
+        assert compactor.pending_count == 2
+        result = compactor.compact()
+        assert len(result) == 2
+        assert compactor.pending_count == 0
+
+    def test_compact_deduplicates(self):
+        compactor = StreamCompactor()
+        msg = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        compactor.add([msg, msg, msg])
+        result = compactor.compact()
+        assert len(result) == 1
+
+    def test_should_compact_trigger(self):
+        compactor = StreamCompactor(CompactionConfig(trigger_count=5))
+        assert not compactor.should_compact()
+        compactor.add([_sample_message(mmsi=i, ts=f"2024-01-01T00:0{i}:00") for i in range(4)])
+        assert not compactor.should_compact()
+        compactor.add([_sample_message(mmsi=9, ts="2024-01-01T00:09:00")])
+        assert compactor.should_compact()
+
+    def test_should_compact_manual_mode(self):
+        compactor = StreamCompactor(CompactionConfig(trigger_count=None))
+        compactor.add([_sample_message()] * 100)
+        assert not compactor.should_compact()  # never auto-triggers
+
+    def test_stats_accumulate(self):
+        compactor = StreamCompactor(CompactionConfig(trigger_count=None))
+        msg = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        compactor.add([msg, msg, msg])
+        compactor.compact()
+        assert compactor.stats.compactions_run == 1
+        assert compactor.stats.messages_before == 3
+        assert compactor.stats.messages_after == 1
+        assert compactor.stats.messages_removed == 2
+
+        # Second compaction accumulates.
+        compactor.add([
+            _sample_message(mmsi=1, ts="2024-01-01T00:01:00"),
+            _sample_message(mmsi=2, ts="2024-01-01T00:02:00"),
+        ])
+        compactor.compact()
+        assert compactor.stats.compactions_run == 2
+        assert compactor.stats.messages_before == 5
+        assert compactor.stats.messages_after == 3
+
+    def test_compact_across_batches(self):
+        """Duplicates spanning batch boundaries are caught."""
+        compactor = StreamCompactor()
+        msg = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+        compactor.add([msg])
+        compactor.add([msg])  # same message in a later batch
+        result = compactor.compact()
+        assert len(result) == 1
+
+    def test_compact_sorts_output(self):
+        compactor = StreamCompactor()
+        compactor.add([
+            _sample_message(mmsi=2, ts="2024-01-01T00:01:00"),
+            _sample_message(mmsi=1, ts="2024-01-01T00:00:00"),
+        ])
+        result = compactor.compact()
+        assert result[0]["mmsi"] == 1
+        assert result[1]["mmsi"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Custom dedup key fields in NeptuneStream
+# ---------------------------------------------------------------------------
+
+
+class TestCustomDedupKeys:
+    def test_custom_key_fields_in_stream(self):
+        """Stream dedup uses configured key fields."""
+        async def _test():
+            config = StreamConfig(
+                dedup_key_fields=("mmsi", "timestamp"),
+            )
+            async with NeptuneStream(config=config) as stream:
+                msg1 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+                msg1["lat"] = 40.0
+                msg2 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+                msg2["lat"] = 41.0  # different lat, same mmsi+ts
+                await stream.ingest(msg1)
+                accepted = await stream.ingest(msg2)
+                # With custom keys (mmsi+ts only), lat difference is ignored.
+                assert accepted is False
+                assert stream.stats.messages_deduplicated == 1
+
+        _run(_test())
+
+    def test_default_key_fields_include_position(self):
+        """Default key fields distinguish by lat/lon."""
+        async def _test():
+            async with NeptuneStream() as stream:
+                msg1 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+                msg1["lat"] = 40.0
+                msg2 = _sample_message(mmsi=1, ts="2024-01-01T00:00:00")
+                msg2["lat"] = 41.0  # different lat
+                await stream.ingest(msg1)
+                accepted = await stream.ingest(msg2)
+                assert accepted is True  # different position = different message
 
         _run(_test())

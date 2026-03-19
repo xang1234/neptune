@@ -77,6 +77,11 @@ class BackpressurePolicy(str, Enum):
     DROP_OLDEST = "drop_oldest"
 
 
+# Default dedup key fields — two messages with the same vessel, time, and
+# position are considered duplicates.
+DEDUP_KEY_FIELDS: tuple[str, ...] = ("mmsi", "timestamp", "lat", "lon")
+
+
 @dataclass
 class StreamConfig:
     """Configuration for a NeptuneStream instance.
@@ -91,6 +96,8 @@ class StreamConfig:
         max_reconnect_delay_s: Maximum backoff delay. Default 60.
         dedup_window_size: Number of recent message hashes to keep
             for rolling deduplication. Default 10000.
+        dedup_key_fields: Message fields that define identity for
+            in-flight dedup. Default ``DEDUP_KEY_FIELDS``.
         max_queue_size: Maximum number of messages that can be buffered
             in the internal queue before backpressure is applied.
             Default 10000.
@@ -110,6 +117,7 @@ class StreamConfig:
     reconnect_delay_s: float = 5.0
     max_reconnect_delay_s: float = 60.0
     dedup_window_size: int = 10_000
+    dedup_key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS
     max_queue_size: int = 10_000
     backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK
     checkpoint_dir: str | None = None
@@ -295,7 +303,7 @@ class NeptuneStream:
         self._stats.messages_received += 1
 
         # Rolling dedup by message hash (O(1) lookup via parallel set).
-        msg_hash = _message_hash(message)
+        msg_hash = _message_hash(message, self._config.dedup_key_fields)
         if msg_hash in self._dedup_set:
             self._stats.messages_deduplicated += 1
             return False
@@ -559,6 +567,197 @@ async def run_with_reconnect(
 
 
 # ---------------------------------------------------------------------------
+# Rolling dedup configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DedupConfig:
+    """Explicit rolling dedup semantics for streaming ingestion.
+
+    The dedup window is a sliding window of recent message hashes.
+    Messages whose hash matches one already in the window are dropped.
+
+    Attributes:
+        key_fields: Message fields that define identity. Two messages
+            with identical values for all key fields are duplicates.
+        window_size: How many recent hashes to retain. Larger windows
+            catch more duplicates but use more memory. Each hash is a
+            16-char hex string (~50 bytes with Python overhead).
+    """
+
+    key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS
+    window_size: int = 10_000
+
+    def __post_init__(self) -> None:
+        if not self.key_fields:
+            raise ValueError("key_fields must not be empty")
+        if self.window_size < 1:
+            raise ValueError(
+                f"window_size must be >= 1, got {self.window_size}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Compaction — landed-data dedup and ordering
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CompactionConfig:
+    """Configuration for landing-zone compaction.
+
+    Compaction deduplicates and sorts batches of messages that a sink
+    has accumulated, producing a clean shape that downstream promotion
+    can rely on.
+
+    Attributes:
+        key_fields: Fields that define message identity for dedup.
+            Defaults to the same fields used for in-flight dedup.
+        sort_fields: Fields to sort by after dedup. Default sorts by
+            timestamp then MMSI for deterministic output.
+        trigger_count: Compact after accumulating this many messages.
+            None means compact only on explicit ``compact()`` calls.
+    """
+
+    key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS
+    sort_fields: tuple[str, ...] = ("timestamp", "mmsi")
+    trigger_count: int | None = 10_000
+
+    def __post_init__(self) -> None:
+        if not self.key_fields:
+            raise ValueError("key_fields must not be empty")
+
+
+@dataclass
+class CompactionStats:
+    """Observability for compaction operations."""
+
+    compactions_run: int = 0
+    messages_before: int = 0
+    messages_after: int = 0
+
+    @property
+    def messages_removed(self) -> int:
+        """Total duplicates removed across all compactions."""
+        return self.messages_before - self.messages_after
+
+
+def compact_batch(
+    messages: list[dict[str, Any]],
+    *,
+    key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS,
+    sort_fields: tuple[str, ...] = ("timestamp", "mmsi"),
+) -> list[dict[str, Any]]:
+    """Deduplicate and sort a batch of messages.
+
+    This is the compaction primitive. Sinks call this to clean landed
+    data before writing or before promoting to canonical storage.
+
+    Args:
+        messages: Raw message dicts (may contain duplicates).
+        key_fields: Fields that define message identity.
+        sort_fields: Fields to sort by after dedup. Uses the last
+            occurrence when duplicates are found (latest wins).
+
+    Returns:
+        Deduplicated, sorted list of messages.
+    """
+    if not messages:
+        return []
+
+    # Dedup: keep last occurrence (latest wins for same identity).
+    seen: dict[tuple, int] = {}
+    for i, msg in enumerate(messages):
+        key = tuple(msg.get(f) for f in key_fields)
+        seen[key] = i  # overwrite with later index
+
+    unique = [messages[i] for i in sorted(seen.values())]
+
+    # Sort by requested fields.
+    def _sort_key(msg: dict[str, Any]) -> tuple:
+        return tuple(msg.get(f, "") for f in sort_fields)
+
+    unique.sort(key=_sort_key)
+    return unique
+
+
+class StreamCompactor:
+    """Stateful compactor for landed stream data.
+
+    Accumulates messages and compacts (dedup + sort) when the trigger
+    threshold is reached or when ``compact()`` is called explicitly.
+
+    Usage::
+
+        compactor = StreamCompactor(CompactionConfig(trigger_count=1000))
+        for batch in incoming_batches:
+            compactor.add(batch)
+            if compactor.should_compact():
+                clean = compactor.compact()
+                sink.write(clean)
+
+    Or with explicit compaction::
+
+        compactor.add(batch1)
+        compactor.add(batch2)
+        clean = compactor.compact()
+    """
+
+    def __init__(self, config: CompactionConfig | None = None) -> None:
+        self._config = config or CompactionConfig()
+        self._buffer: list[dict[str, Any]] = []
+        self._stats = CompactionStats()
+
+    @property
+    def config(self) -> CompactionConfig:
+        return self._config
+
+    @property
+    def stats(self) -> CompactionStats:
+        return self._stats
+
+    @property
+    def pending_count(self) -> int:
+        """Number of messages waiting for compaction."""
+        return len(self._buffer)
+
+    def add(self, messages: list[dict[str, Any]]) -> None:
+        """Add a batch of messages to the compaction buffer."""
+        self._buffer.extend(messages)
+
+    def should_compact(self) -> bool:
+        """Whether the trigger threshold has been reached."""
+        if self._config.trigger_count is None:
+            return False
+        return len(self._buffer) >= self._config.trigger_count
+
+    def compact(self) -> list[dict[str, Any]]:
+        """Compact the buffer and return the cleaned messages.
+
+        Resets the internal buffer. Updates compaction stats.
+        """
+        before = len(self._buffer)
+        result = compact_batch(
+            self._buffer,
+            key_fields=self._config.key_fields,
+            sort_fields=self._config.sort_fields,
+        )
+        after = len(result)
+
+        self._stats.compactions_run += 1
+        self._stats.messages_before += before
+        self._stats.messages_after += after
+        self._buffer = []
+
+        logger.debug(
+            "Compaction: %d → %d messages (%d removed)",
+            before, after, before - after,
+        )
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -568,11 +767,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _message_hash(msg: dict[str, Any]) -> str:
+def _message_hash(msg: dict[str, Any], key_fields: tuple[str, ...] = DEDUP_KEY_FIELDS) -> str:
     """Compute a dedup hash for a position message.
 
-    Uses mmsi + timestamp + lat + lon as the dedup key. Two messages
-    with the same vessel, time, and location are considered duplicates.
+    Uses the configured key fields as the dedup key. Two messages
+    with the same values for all key fields are considered duplicates.
     """
-    key = f"{msg.get('mmsi')}:{msg.get('timestamp')}:{msg.get('lat')}:{msg.get('lon')}"
+    key = ":".join(str(msg.get(f)) for f in key_fields)
     return hashlib.sha1(key.encode()).hexdigest()[:16]
