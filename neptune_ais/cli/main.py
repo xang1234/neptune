@@ -209,9 +209,13 @@ def health(cache_dir: str | None) -> None:
 @click.argument("source_id", required=False)
 def sources(source_id: str | None) -> None:
     """List available sources or show details for a specific source."""
-    # Trigger adapter registration.
+    # Trigger adapter registration for all sources.
     from neptune_ais.adapters import dma as _dma  # noqa: F401
     from neptune_ais.adapters import noaa as _noaa  # noqa: F401
+    from neptune_ais.adapters import gfw as _gfw  # noqa: F401
+    from neptune_ais.adapters import finland as _finland  # noqa: F401
+    from neptune_ais.adapters import aishub as _aishub  # noqa: F401
+    from neptune_ais.adapters import aisstream as _aisstream  # noqa: F401
     from neptune_ais.adapters import registry
 
     if source_id:
@@ -402,6 +406,48 @@ def provenance(
     click.echo(f"  Can rebuild:      {'yes' if prov.can_rebuild_locally else 'no'}")
     if prov.has_mixed_versions:
         click.echo(f"  ⚠ Mixed versions detected")
+
+
+# ---------------------------------------------------------------------------
+# promote
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("source")
+@click.option("--landing-dir", type=click.Path(exists=True), required=True, help="Landing directory with Parquet files.")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+@click.option("--dataset", default="positions", help="Dataset name.")
+@click.option("--cleanup", is_flag=True, help="Delete landing files after promotion.")
+def promote(
+    source: str,
+    landing_dir: str,
+    cache_dir: str | None,
+    dataset: str,
+    cleanup: bool,
+) -> None:
+    """Promote landed stream data into canonical partitions."""
+    from neptune_ais.sinks import promote_landing
+    from neptune_ais.storage import DEFAULT_STORE_ROOT
+    from pathlib import Path
+
+    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+
+    results = promote_landing(
+        landing_dir, store, source=source, dataset=dataset, cleanup=cleanup,
+    )
+
+    if not results:
+        click.echo("No data to promote.")
+        return
+
+    total = sum(r.record_count for r in results)
+    click.echo(f"Promoted {total:,} rows across {len(results)} date partition(s):")
+    for r in results:
+        click.echo(f"  {r.date}: {r.record_count:,} rows → {len(r.shard_files)} shard(s)")
+
+    if cleanup:
+        click.echo("Landing files cleaned up.")
 
 
 # ---------------------------------------------------------------------------
