@@ -70,10 +70,8 @@ def download(
 def inventory(dataset: str | None, cache_dir: str | None) -> None:
     """Show inventory of stored datasets."""
     from neptune_ais.catalog import CatalogRegistry
-    from neptune_ais.storage import DEFAULT_STORE_ROOT
-    from pathlib import Path
 
-    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    store = _resolve_store(cache_dir)
     registry = CatalogRegistry(store)
     registry.scan()
 
@@ -115,10 +113,8 @@ def qc(
 ) -> None:
     """Show quality report for stored data."""
     from neptune_ais.catalog import CatalogRegistry
-    from neptune_ais.storage import DEFAULT_STORE_ROOT
-    from pathlib import Path
 
-    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    store = _resolve_store(cache_dir)
     registry = CatalogRegistry(store)
     registry.scan()
 
@@ -182,10 +178,8 @@ def sql_cmd(
 def health(cache_dir: str | None) -> None:
     """Check catalog health and report issues."""
     from neptune_ais.catalog import CatalogRegistry
-    from neptune_ais.storage import DEFAULT_STORE_ROOT
-    from pathlib import Path
 
-    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    store = _resolve_store(cache_dir)
     registry = CatalogRegistry(store)
     count = registry.scan()
 
@@ -382,10 +376,8 @@ def provenance(
 ) -> None:
     """Show provenance summary for stored data."""
     from neptune_ais.catalog import CatalogRegistry
-    from neptune_ais.storage import DEFAULT_STORE_ROOT
-    from pathlib import Path
 
-    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    store = _resolve_store(cache_dir)
     registry = CatalogRegistry(store)
     registry.scan()
 
@@ -415,7 +407,7 @@ def provenance(
 
 @cli.command()
 @click.argument("source")
-@click.option("--landing-dir", type=click.Path(exists=True), required=True, help="Landing directory with Parquet files.")
+@click.option("--landing-dir", type=click.Path(), required=True, help="Landing directory with Parquet files.")
 @click.option("--cache-dir", type=click.Path(), help="Override store root.")
 @click.option("--dataset", default="positions", help="Dataset name.")
 @click.option("--cleanup", is_flag=True, help="Delete landing files after promotion.")
@@ -428,10 +420,8 @@ def promote(
 ) -> None:
     """Promote landed stream data into canonical partitions."""
     from neptune_ais.sinks import promote_landing
-    from neptune_ais.storage import DEFAULT_STORE_ROOT
-    from pathlib import Path
 
-    store = Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
+    store = _resolve_store(cache_dir)
 
     results = promote_landing(
         landing_dir, store, source=source, dataset=dataset, cleanup=cleanup,
@@ -453,6 +443,13 @@ def promote(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_store(cache_dir: str | None):
+    """Resolve --cache-dir into a store root Path."""
+    from pathlib import Path
+    from neptune_ais.storage import DEFAULT_STORE_ROOT
+    return Path(cache_dir) if cache_dir else DEFAULT_STORE_ROOT
 
 
 def _resolve_dates(
