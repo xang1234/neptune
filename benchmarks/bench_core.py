@@ -148,8 +148,7 @@ def bench_query(df: pl.DataFrame) -> BenchmarkResult:
 
     with result.time("latest_positions"):
         _ = (
-            lf.sort("timestamp")
-            .group_by("mmsi")
+            lf.group_by("mmsi")
             .agg(pl.all().sort_by("timestamp").last())
             .collect()
         )
@@ -171,7 +170,7 @@ def bench_query(df: pl.DataFrame) -> BenchmarkResult:
 # ---------------------------------------------------------------------------
 
 
-def bench_duckdb(df: pl.DataFrame) -> BenchmarkResult:
+def bench_duckdb(df: pl.DataFrame, tmp_dir: Path) -> BenchmarkResult:
     """Benchmark DuckDB SQL queries over positions data."""
     import duckdb
 
@@ -180,8 +179,7 @@ def bench_duckdb(df: pl.DataFrame) -> BenchmarkResult:
     con = duckdb.connect()
 
     # Write to temp Parquet for DuckDB to read (avoids pyarrow dependency).
-    import tempfile
-    tmp = Path(tempfile.mkdtemp()) / "bench.parquet"
+    tmp = tmp_dir / "bench_duckdb.parquet"
     df.write_parquet(tmp)
     con.execute(f"CREATE TABLE positions AS SELECT * FROM read_parquet('{tmp}')")
 
@@ -319,32 +317,32 @@ def run_all(n_rows: int = 100_000) -> list[BenchmarkResult]:
         for k, v in r.timings.items():
             print(f"  {k}: {v * 1000:.1f} ms")
 
-    print("\n--- Query benchmarks ---")
-    r = bench_query(df)
-    results.append(r)
-    for k, v in r.timings.items():
-        print(f"  {k}: {v * 1000:.1f} ms")
-
-    print("\n--- DuckDB SQL benchmarks ---")
-    try:
-        r = bench_duckdb(df)
+        print("\n--- Query benchmarks ---")
+        r = bench_query(df)
         results.append(r)
         for k, v in r.timings.items():
             print(f"  {k}: {v * 1000:.1f} ms")
-    except ImportError:
-        print("  (skipped — duckdb not installed)")
 
-    print("\n--- Derivation benchmarks ---")
-    r = bench_derivation(df)
-    results.append(r)
-    for k, v in r.timings.items():
-        print(f"  {k}: {v * 1000:.1f} ms")
+        print("\n--- DuckDB SQL benchmarks ---")
+        try:
+            r = bench_duckdb(df, tmp_dir)
+            results.append(r)
+            for k, v in r.timings.items():
+                print(f"  {k}: {v * 1000:.1f} ms")
+        except ImportError:
+            print("  (skipped — duckdb not installed)")
 
-    print("\n--- Streaming benchmarks ---")
-    r = bench_streaming()
-    results.append(r)
-    for k, v in r.timings.items():
-        print(f"  {k}: {v * 1000:.1f} ms")
+        print("\n--- Derivation benchmarks ---")
+        r = bench_derivation(df)
+        results.append(r)
+        for k, v in r.timings.items():
+            print(f"  {k}: {v * 1000:.1f} ms")
+
+        print("\n--- Streaming benchmarks ---")
+        r = bench_streaming()
+        results.append(r)
+        for k, v in r.timings.items():
+            print(f"  {k}: {v * 1000:.1f} ms")
 
     return results
 
