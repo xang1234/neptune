@@ -125,6 +125,8 @@ class StreamConfig:
     def __post_init__(self) -> None:
         if isinstance(self.backpressure, str):
             self.backpressure = BackpressurePolicy(self.backpressure)
+        if not self.dedup_key_fields:
+            raise ValueError("dedup_key_fields must not be empty")
         if self.max_queue_size < 1:
             raise ValueError(
                 f"max_queue_size must be >= 1, got {self.max_queue_size}"
@@ -460,8 +462,8 @@ def load_checkpoint(source: str, checkpoint_dir: str) -> Checkpoint | None:
 
     try:
         return Checkpoint.from_json(filepath.read_text())
-    except (ValueError, KeyError):
-        logger.warning("Corrupt checkpoint file: %s", filepath)
+    except (ValueError, OSError, UnicodeDecodeError):
+        logger.warning("Corrupt or unreadable checkpoint file: %s", filepath)
         return None
 
 
@@ -645,7 +647,9 @@ def compact_batch(
         seen[key] = msg
 
     unique = list(seen.values())
-    unique.sort(key=lambda msg: tuple(msg.get(f, "") for f in sort_fields))
+    # Coerce to str for safe comparison across heterogeneous types
+    # (e.g. int mmsi vs missing-field str fallback).
+    unique.sort(key=lambda msg: tuple(str(msg.get(f, "")) for f in sort_fields))
     return unique
 
 
