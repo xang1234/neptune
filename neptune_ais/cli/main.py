@@ -407,7 +407,7 @@ def provenance(
 
 @cli.command()
 @click.argument("source")
-@click.option("--landing-dir", type=click.Path(), required=True, help="Landing directory with Parquet files.")
+@click.option("--landing-dir", type=click.Path(file_okay=False), required=True, help="Landing directory with Parquet files.")
 @click.option("--cache-dir", type=click.Path(), help="Override store root.")
 @click.option("--dataset", default="positions", help="Dataset name.")
 @click.option("--cleanup", is_flag=True, help="Delete landing files after promotion.")
@@ -464,6 +464,8 @@ def _resolve_dates(
         return (start_str, end_str)
     if start_str:
         return start_str
+    if end_str:
+        raise click.UsageError("--end requires --start")
     raise click.UsageError("Provide --date or --start/--end")
 
 
