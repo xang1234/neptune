@@ -25,7 +25,7 @@ from neptune_ais.adapters.aishub import (
     _build_filename,
     _build_url,
 )
-from neptune_ais.adapters.base import RawArtifact, SourceAdapter, SourceCapabilities
+from neptune_ais.adapters.base import FetchSpec, RawArtifact, SourceAdapter, SourceCapabilities
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +188,6 @@ class TestAISHubCapabilities:
 # URL helpers
 # ---------------------------------------------------------------------------
 
-from neptune_ais.adapters.base import FetchSpec
-
 
 class TestAISHubURLHelpers:
     def test_build_url(self):
@@ -285,6 +283,39 @@ class TestAISHubNormalization:
         df = AISHubAdapter().normalize_positions([_make_artifact(path)])
         assert "beam" in df.columns
         assert df["beam"][0] == pytest.approx(25.0)
+
+    def test_imo_sentinel_empty_string(self, tmp_path):
+        """IMO='' → null."""
+        records = [{
+            "MMSI": 211000001,
+            "TIME": "2024-06-15T00:00:00Z",
+            "LATITUDE": 53.5,
+            "LONGITUDE": 9.9,
+            "IMO": "",
+        }]
+        filepath = tmp_path / "aishub_imo_empty.json"
+        filepath.write_text(json.dumps(records))
+        df = AISHubAdapter().normalize_positions([_make_artifact(str(filepath))])
+        assert df["imo"][0] is None
+
+    def test_partial_dimensions_length_only(self, tmp_path):
+        """A+B present but no C+D → length computed, no beam."""
+        records = [{
+            "MMSI": 211000001,
+            "TIME": "2024-06-15T00:00:00Z",
+            "LATITUDE": 53.5,
+            "LONGITUDE": 9.9,
+            "A": 100,
+            "B": 50,
+        }]
+        filepath = tmp_path / "aishub_partial_dim.json"
+        filepath.write_text(json.dumps(records))
+        df = AISHubAdapter().normalize_positions([_make_artifact(str(filepath))])
+        assert "length" in df.columns
+        assert df["length"][0] == pytest.approx(150.0)
+        assert "beam" not in df.columns
+        assert "_dim_a" not in df.columns
+        assert "_dim_b" not in df.columns
 
     def test_no_dimension_fields_graceful(self, tmp_path):
         """Records without A/B/C/D fields don't break normalization."""

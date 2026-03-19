@@ -213,14 +213,13 @@ class AISHubAdapter:
             raw_data = json.loads(fpath.read_text())
 
             # AISHub returns [{...}, ...] or [metadata_dict, [records]].
-            # Disambiguate by checking that the first element lacks vessel
-            # fields (metadata dicts never have "MMSI").
+            # Disambiguate: in the wrapper format raw_data[1] is a list of
+            # records; in a flat list every element is a dict (not a list).
             if (
                 isinstance(raw_data, list)
                 and len(raw_data) == 2
-                and isinstance(raw_data[1], list)
                 and isinstance(raw_data[0], dict)
-                and "MMSI" not in raw_data[0]
+                and isinstance(raw_data[1], list)
             ):
                 records = raw_data[1]
             elif isinstance(raw_data, list):
