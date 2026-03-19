@@ -185,11 +185,10 @@ class Neptune:
 
         Returns a list of partition keys that were written (dataset/source/date).
         """
-        # Import adapters lazily to trigger auto-registration.
-        from neptune_ais.adapters import dma as _dma  # noqa: F401
-        from neptune_ais.adapters import noaa as _noaa  # noqa: F401
         from neptune_ais.adapters.base import FetchSpec
-        from neptune_ais.adapters.registry import get_adapter
+        from neptune_ais.adapters.registry import get_adapter, load_all_adapters
+
+        load_all_adapters()
 
         written: list[str] = []
 

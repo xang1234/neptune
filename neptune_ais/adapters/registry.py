@@ -196,11 +196,7 @@ def discover_plugins() -> list[str]:
 
     loaded: list[str] = []
 
-    try:
-        eps = entry_points(group=ENTRY_POINT_GROUP)
-    except TypeError:
-        # Python 3.9–3.11 compatibility: entry_points() may not accept group=.
-        eps = entry_points().get(ENTRY_POINT_GROUP, [])  # type: ignore[union-attr]
+    eps = entry_points(group=ENTRY_POINT_GROUP)
 
     for ep in eps:
         try:
@@ -235,8 +231,8 @@ def load_all_adapters() -> list[str]:
     for mod_name in _BUILTIN_ADAPTERS:
         try:
             importlib.import_module(f"neptune_ais.adapters.{mod_name}")
-        except ImportError as e:
-            logger.debug("Built-in adapter %s not loadable: %s", mod_name, e)
+        except ModuleNotFoundError as e:
+            logger.debug("Built-in adapter %s not loadable (missing dep): %s", mod_name, e)
 
     # Discover external plugins.
     discover_plugins()
