@@ -22,11 +22,11 @@ Module role — separate from stream lifecycle
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import re
 
 import polars as pl
 
@@ -303,3 +303,199 @@ class DuckDBSink:
             self._rows_written, self._table_name, self._db_path,
         )
         self._con.close()
+
+
+# ---------------------------------------------------------------------------
+# Promotion — landing data → canonical partitions
+# ---------------------------------------------------------------------------
+
+PROMOTION_VERSION = "promotion/landing-to-canonical/1.0.0"
+
+
+@dataclass
+class PromotionResult:
+    """Result of promoting landing files for one date partition."""
+
+    date: str
+    source: str
+    record_count: int
+    files_promoted: int
+    shard_files: list[str]
+    landing_files: list[str]
+
+
+def promote_landing(
+    landing_dir: str | Path,
+    store_root: str | Path,
+    source: str,
+    dataset: str = "positions",
+    *,
+    cleanup: bool = False,
+) -> list[PromotionResult]:
+    """Promote landed stream data into canonical partitions.
+
+    Reads Parquet files from the landing directory, groups them by date
+    (extracted from the ``timestamp`` column), deduplicates, sorts, and
+    writes them as canonical partitions using the same atomic
+    ``PartitionWriter`` protocol used by archival ingestion.
+
+    Each promoted partition gets a manifest with provenance tracing
+    back to the landing files and live source.
+
+    Args:
+        landing_dir: Root landing directory (contains ``{source}/`` subdirs).
+        store_root: Neptune store root for canonical output.
+        source: Source identifier (e.g. ``"aisstream"``).
+        dataset: Dataset name. Default ``"positions"``.
+        cleanup: If True, delete landing files after successful promotion.
+
+    Returns:
+        List of ``PromotionResult`` for each date partition promoted.
+    """
+    from neptune_ais.catalog import (
+        BBox,
+        Manifest,
+        QCSummary,
+        WriteStatus,
+        current_schema_version,
+    )
+    from neptune_ais.storage import (
+        DEFAULT_MAX_ROWS_PER_SHARD,
+        PartitionWriter,
+        PartitionWriteError,
+        shard_filename,
+    )
+
+    landing_path = Path(landing_dir) / source
+    store_path = Path(store_root)
+
+    if not landing_path.exists():
+        logger.info("No landing directory for source=%s", source)
+        return []
+
+    parquet_files = sorted(landing_path.glob("*.parquet"))
+    if not parquet_files:
+        logger.info("No landing files found in %s", landing_path)
+        return []
+
+    # Read all landing files into a single DataFrame.
+    dfs = [pl.read_parquet(f) for f in parquet_files]
+    all_data = pl.concat(dfs)
+
+    if len(all_data) == 0:
+        return []
+
+    # Extract date from timestamp for partitioning.
+    all_data = all_data.with_columns(
+        pl.col("timestamp").cast(pl.String).str.slice(0, 10).alias("_date")
+    )
+
+    results: list[PromotionResult] = []
+
+    for date_str in sorted(all_data["_date"].unique().to_list()):
+        partition_df = all_data.filter(pl.col("_date") == date_str).drop("_date")
+
+        # Dedup by position identity keys (same as streaming dedup).
+        dedup_cols = [c for c in ["mmsi", "timestamp", "lat", "lon"] if c in partition_df.columns]
+        if dedup_cols:
+            partition_df = partition_df.unique(subset=dedup_cols, keep="last")
+
+        # Sort for optimal Parquet layout.
+        sort_cols = [c for c in SORT_ORDER_POSITIONS if c in partition_df.columns]
+        if sort_cols:
+            partition_df = partition_df.sort(sort_cols)
+
+        n_rows = len(partition_df)
+
+        # Stage → write shards → validate → commit.
+        writer = PartitionWriter(store_path, dataset, source, date_str)
+        try:
+            staging = writer.prepare()
+        except PartitionWriteError:
+            writer.abort()
+            staging = writer.prepare()
+
+        shard_files: list[str] = []
+        if n_rows <= DEFAULT_MAX_ROWS_PER_SHARD:
+            sf = shard_filename(0)
+            partition_df.write_parquet(
+                staging / sf,
+                compression=PARQUET_COMPRESSION,
+                compression_level=PARQUET_COMPRESSION_LEVEL,
+                row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                statistics=PARQUET_WRITE_STATISTICS,
+            )
+            shard_files.append(sf)
+        else:
+            shard_idx = 0
+            for offset in range(0, n_rows, DEFAULT_MAX_ROWS_PER_SHARD):
+                sf = shard_filename(shard_idx)
+                partition_df.slice(offset, DEFAULT_MAX_ROWS_PER_SHARD).write_parquet(
+                    staging / sf,
+                    compression=PARQUET_COMPRESSION,
+                    compression_level=PARQUET_COMPRESSION_LEVEL,
+                    row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                    statistics=PARQUET_WRITE_STATISTICS,
+                )
+                shard_files.append(sf)
+                shard_idx += 1
+
+        writer.validate(expected_files=shard_files)
+
+        # Build manifest with promotion provenance.
+        manifest = Manifest(
+            dataset=dataset,
+            source=source,
+            date=date_str,
+            schema_version=current_schema_version(dataset),
+            adapter_version=f"{source}/streaming",
+            transform_version=PROMOTION_VERSION,
+            files=shard_files,
+            raw_artifacts=[],
+            raw_policy="none",
+            record_count=n_rows,
+            distinct_mmsi_count=(
+                partition_df["mmsi"].n_unique() if "mmsi" in partition_df.columns else 0
+            ),
+            min_timestamp=partition_df["timestamp"].min(),
+            max_timestamp=partition_df["timestamp"].max(),
+            bbox=BBox(
+                west=float(partition_df["lon"].min()),
+                south=float(partition_df["lat"].min()),
+                east=float(partition_df["lon"].max()),
+                north=float(partition_df["lat"].max()),
+            ) if {"lat", "lon"}.issubset(partition_df.columns) else None,
+            qc_summary=QCSummary(
+                total_rows=n_rows,
+                rows_ok=n_rows,
+                rows_warning=0,
+                rows_error=0,
+                rows_dropped=0,
+            ),
+            write_status=WriteStatus.COMMITTED,
+        )
+
+        writer.commit(manifest_json=manifest.model_dump_json(indent=2))
+
+        landing_file_names = [f.name for f in parquet_files]
+        results.append(PromotionResult(
+            date=date_str,
+            source=source,
+            record_count=n_rows,
+            files_promoted=len(parquet_files),
+            shard_files=shard_files,
+            landing_files=landing_file_names,
+        ))
+
+        logger.info(
+            "Promoted %d rows for %s/%s/%s → %d shards",
+            n_rows, dataset, source, date_str, len(shard_files),
+        )
+
+    # Clean up landing files after successful promotion.
+    if cleanup and results:
+        for f in parquet_files:
+            f.unlink()
+        logger.info("Cleaned up %d landing files", len(parquet_files))
+
+    return results

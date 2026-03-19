@@ -14,7 +14,7 @@ from typing import Any
 import polars as pl
 import pytest
 
-from neptune_ais.sinks import DuckDBSink, ParquetSink
+from neptune_ais.sinks import DuckDBSink, ParquetSink, promote_landing
 from neptune_ais.stream import StreamSink
 
 
@@ -346,3 +346,141 @@ class TestDuckDBSink:
             assert "source" in col_names
 
         _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Promotion — landing → canonical
+# ---------------------------------------------------------------------------
+
+
+try:
+    from pydantic import BaseModel as _PydanticModel
+    HAS_PYDANTIC = True
+except ImportError:
+    HAS_PYDANTIC = False
+
+skip_no_pydantic = pytest.mark.skipif(not HAS_PYDANTIC, reason="pydantic not installed")
+
+
+@skip_no_pydantic
+class TestPromoteLanding:
+    def _create_landing_files(self, landing_dir: Path, source: str, messages_by_date: dict):
+        """Helper: write landing Parquet files grouped by date."""
+        source_dir = landing_dir / source
+        source_dir.mkdir(parents=True, exist_ok=True)
+        for i, (date, msgs) in enumerate(messages_by_date.items()):
+            df = pl.DataFrame(msgs)
+            df.write_parquet(source_dir / f"landing-{date.replace('-', '')}-{i:04d}.parquet")
+
+    def test_promote_single_date(self, tmp_path):
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        msgs = [
+            _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
+            _sample_message(mmsi=2, ts="2024-06-15T00:01:00"),
+        ]
+        self._create_landing_files(landing, "test", {"2024-06-15": msgs})
+
+        results = promote_landing(landing, store, source="test")
+        assert len(results) == 1
+        assert results[0].date == "2024-06-15"
+        assert results[0].record_count == 2
+        assert results[0].source == "test"
+
+        # Verify canonical partition exists.
+        canonical = store / "canonical" / "positions" / "source=test" / "date=2024-06-15"
+        assert canonical.exists()
+        files = list(canonical.glob("*.parquet"))
+        assert len(files) >= 1
+
+        # Verify manifest exists.
+        manifest_file = store / "manifests" / "positions" / "source=test" / "date=2024-06-15.json"
+        assert manifest_file.exists()
+
+    def test_promote_multiple_dates(self, tmp_path):
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        msgs = [
+            _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
+            _sample_message(mmsi=2, ts="2024-06-16T00:00:00"),
+        ]
+        self._create_landing_files(landing, "test", {"mixed": msgs})
+
+        results = promote_landing(landing, store, source="test")
+        assert len(results) == 2
+        dates = [r.date for r in results]
+        assert "2024-06-15" in dates
+        assert "2024-06-16" in dates
+
+    def test_promote_deduplicates(self, tmp_path):
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        msg = _sample_message(mmsi=1, ts="2024-06-15T00:00:00")
+        self._create_landing_files(landing, "test", {"2024-06-15": [msg, msg, msg]})
+
+        results = promote_landing(landing, store, source="test")
+        assert results[0].record_count == 1  # deduped from 3
+
+    def test_promote_empty_dir(self, tmp_path):
+        results = promote_landing(tmp_path / "landing", tmp_path / "store", source="test")
+        assert results == []
+
+    def test_promote_no_files(self, tmp_path):
+        (tmp_path / "landing" / "test").mkdir(parents=True)
+        results = promote_landing(tmp_path / "landing", tmp_path / "store", source="test")
+        assert results == []
+
+    def test_promote_cleanup(self, tmp_path):
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        self._create_landing_files(landing, "test", {
+            "2024-06-15": [_sample_message(mmsi=1, ts="2024-06-15T00:00:00")],
+        })
+        assert len(list((landing / "test").glob("*.parquet"))) == 1
+
+        promote_landing(landing, store, source="test", cleanup=True)
+        assert len(list((landing / "test").glob("*.parquet"))) == 0
+
+    def test_promote_manifest_metadata(self, tmp_path):
+        """Manifest contains correct promotion provenance."""
+        import json
+
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        self._create_landing_files(landing, "test", {
+            "2024-06-15": [
+                _sample_message(mmsi=1, ts="2024-06-15T00:00:00", lat=40.0, lon=-74.0),
+                _sample_message(mmsi=2, ts="2024-06-15T00:01:00", lat=41.0, lon=-73.0),
+            ],
+        })
+
+        promote_landing(landing, store, source="test")
+
+        manifest_file = store / "manifests" / "positions" / "source=test" / "date=2024-06-15.json"
+        manifest = json.loads(manifest_file.read_text())
+        assert manifest["dataset"] == "positions"
+        assert manifest["source"] == "test"
+        assert manifest["date"] == "2024-06-15"
+        assert "promotion" in manifest["transform_version"]
+        assert manifest["record_count"] == 2
+        assert manifest["distinct_mmsi_count"] == 2
+        assert manifest["write_status"] == "committed"
+        assert manifest["bbox"] is not None
+
+    def test_promoted_data_readable(self, tmp_path):
+        """Promoted Parquet files are readable with correct data."""
+        landing = tmp_path / "landing"
+        store = tmp_path / "store"
+        self._create_landing_files(landing, "test", {
+            "2024-06-15": [
+                _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
+                _sample_message(mmsi=2, ts="2024-06-15T00:01:00"),
+            ],
+        })
+
+        promote_landing(landing, store, source="test")
+
+        canonical = store / "canonical" / "positions" / "source=test" / "date=2024-06-15"
+        df = pl.read_parquet(list(canonical.glob("*.parquet"))[0])
+        assert len(df) == 2
+        assert df["mmsi"].to_list() == [1, 2]  # sorted
