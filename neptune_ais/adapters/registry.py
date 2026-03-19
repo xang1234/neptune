@@ -156,6 +156,44 @@ def registered_sources() -> list[str]:
     return sorted(set(_ADAPTERS.keys()) | set(_STREAMING_CAPABILITIES.keys()))
 
 
+def find_sources(
+    *,
+    backfill: bool | None = None,
+    streaming: bool | None = None,
+    auth: bool | None = None,
+    dataset: str | None = None,
+) -> list[SourceCapabilities]:
+    """Find sources matching capability filters.
+
+    All filters are optional. When multiple are given, they are ANDed.
+
+    Args:
+        backfill: If True, only sources that support backfill. If False,
+            only those that don't.
+        streaming: If True, only sources that support streaming.
+        auth: If True, only sources requiring authentication. If False,
+            only open-data sources (no auth).
+        dataset: Only sources that provide this dataset (e.g. "positions").
+
+    Returns:
+        List of matching ``SourceCapabilities``.
+    """
+    results: list[SourceCapabilities] = []
+    for caps in catalog():
+        if backfill is not None and caps.supports_backfill != backfill:
+            continue
+        if streaming is not None and caps.supports_streaming != streaming:
+            continue
+        if auth is not None:
+            has_auth = caps.auth_scheme is not None
+            if auth != has_auth:
+                continue
+        if dataset is not None and dataset not in caps.datasets_provided:
+            continue
+        results.append(caps)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Plugin discovery and bulk loading
 # ---------------------------------------------------------------------------

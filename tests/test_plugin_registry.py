@@ -12,6 +12,7 @@ from neptune_ais.adapters.registry import (
     ENTRY_POINT_GROUP,
     _BUILTIN_ADAPTERS,
     discover_plugins,
+    find_sources,
     load_all_adapters,
     registered_sources,
     _ADAPTERS,
@@ -130,3 +131,73 @@ class TestRegistryConsistency:
         # and should not also be in _ADAPTERS
         for sid in streaming_only:
             assert sid not in _ADAPTERS
+
+
+# ---------------------------------------------------------------------------
+# find_sources — capability filtering
+# ---------------------------------------------------------------------------
+
+
+class TestFindSources:
+    def test_find_backfill_sources(self):
+        """Filter for sources supporting backfill."""
+        load_all_adapters()
+        results = find_sources(backfill=True)
+        source_ids = [c.source_id for c in results]
+        assert "noaa" in source_ids
+        assert "gfw" in source_ids
+        assert "finland" in source_ids
+        # aishub doesn't support backfill
+        assert "aishub" not in source_ids
+
+    def test_find_streaming_sources(self):
+        """Filter for sources supporting streaming."""
+        load_all_adapters()
+        results = find_sources(streaming=True)
+        source_ids = [c.source_id for c in results]
+        assert "aisstream" in source_ids
+        assert "finland" in source_ids  # mixed delivery
+        # noaa doesn't support streaming
+        assert "noaa" not in source_ids
+
+    def test_find_open_sources(self):
+        """Filter for sources requiring no authentication."""
+        load_all_adapters()
+        results = find_sources(auth=False)
+        source_ids = [c.source_id for c in results]
+        assert "noaa" in source_ids
+        assert "finland" in source_ids
+        assert "dma" in source_ids
+        # gfw requires api_key
+        assert "gfw" not in source_ids
+
+    def test_find_with_multiple_filters(self):
+        """Multiple filters are ANDed."""
+        load_all_adapters()
+        results = find_sources(backfill=True, auth=False)
+        source_ids = [c.source_id for c in results]
+        # noaa, dma, finland all have backfill + no auth
+        assert "noaa" in source_ids
+        # gfw has backfill but requires auth
+        assert "gfw" not in source_ids
+
+    def test_find_by_dataset(self):
+        """Filter by provided dataset."""
+        load_all_adapters()
+        results = find_sources(dataset="positions")
+        assert len(results) >= 5  # all sources provide positions
+
+    def test_find_no_match(self):
+        """Returns empty list when no sources match."""
+        load_all_adapters()
+        results = find_sources(backfill=True, streaming=True, auth=True)
+        # No source has all three
+        # (finland has backfill+streaming but no auth)
+        source_ids = [c.source_id for c in results]
+        assert "finland" not in source_ids  # finland has no auth
+
+    def test_find_no_filters_returns_all(self):
+        """No filters returns all sources (same as catalog)."""
+        load_all_adapters()
+        from neptune_ais.adapters.registry import catalog
+        assert len(find_sources()) == len(catalog())

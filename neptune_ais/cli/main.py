@@ -201,8 +201,22 @@ def health(cache_dir: str | None) -> None:
 
 @cli.command()
 @click.argument("source_id", required=False)
-def sources(source_id: str | None) -> None:
-    """List available sources or show details for a specific source."""
+@click.option("--backfill", "filter_backfill", is_flag=True, default=False, help="Only sources supporting backfill.")
+@click.option("--streaming", "filter_streaming", is_flag=True, default=False, help="Only sources supporting streaming.")
+@click.option("--open", "filter_open", is_flag=True, default=False, help="Only open-data sources (no auth).")
+@click.option("--compare", "do_compare", is_flag=True, default=False, help="Side-by-side capability comparison.")
+def sources(
+    source_id: str | None,
+    filter_backfill: bool,
+    filter_streaming: bool,
+    filter_open: bool,
+    do_compare: bool,
+) -> None:
+    """List available sources or show details for a specific source.
+
+    Use filters to narrow results: --backfill, --streaming, --open.
+    Use --compare for a side-by-side capability matrix.
+    """
     from neptune_ais.adapters import registry
 
     registry.load_all_adapters()
@@ -231,13 +245,50 @@ def sources(source_id: str | None) -> None:
             click.echo(f"  Quirks:")
             for q in caps.known_quirks:
                 click.echo(f"    - {q}")
-    else:
-        # Summary table of all sources.
-        all_caps = registry.catalog()
-        if not all_caps:
-            click.echo("No sources registered.")
-            return
+        return
 
+    # Apply filters.
+    has_filters = filter_backfill or filter_streaming or filter_open
+    if has_filters:
+        all_caps = registry.find_sources(
+            backfill=True if filter_backfill else None,
+            streaming=True if filter_streaming else None,
+            auth=False if filter_open else None,
+        )
+    else:
+        all_caps = registry.catalog()
+
+    if not all_caps:
+        click.echo("No sources match the given filters." if has_filters else "No sources registered.")
+        return
+
+    if do_compare:
+        # Side-by-side comparison matrix.
+        click.echo(f"\n{'Capability':<20}", nl=False)
+        for caps in all_caps:
+            click.echo(f" {caps.source_id:<14}", nl=False)
+        click.echo()
+        click.echo("-" * (20 + 15 * len(all_caps)))
+
+        rows = [
+            ("Provider", lambda c: c.provider[:13]),
+            ("Coverage", lambda c: c.coverage[:13]),
+            ("Backfill", lambda c: "yes" if c.supports_backfill else "no"),
+            ("Streaming", lambda c: "yes" if c.supports_streaming else "no"),
+            ("Server bbox", lambda c: "yes" if c.supports_server_side_bbox else "no"),
+            ("Auth", lambda c: c.auth_scheme or "none"),
+            ("Latency", lambda c: (c.expected_latency or "?")[:13]),
+            ("History", lambda c: (c.history_start or "?")[:13]),
+            ("Format", lambda c: c.delivery_format[:13]),
+            ("License", lambda c: (c.license_requirements or "?")[:13]),
+        ]
+        for label, fn in rows:
+            click.echo(f"{label:<20}", nl=False)
+            for caps in all_caps:
+                click.echo(f" {fn(caps):<14}", nl=False)
+            click.echo()
+    else:
+        # Summary table.
         click.echo(f"\n{'Source':<12} {'Provider':<30} {'Coverage':<30} {'History':<12} {'Format'}")
         click.echo("-" * 100)
         for caps in all_caps:
