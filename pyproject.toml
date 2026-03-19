@@ -16,19 +16,15 @@ requires-python = ">=3.10"
 # ---------------------------------------------------------------------------
 dependencies = [
     "polars>=1.0",
-    "pyarrow>=14.0",
-    "duckdb>=1.0",
-    "fsspec>=2024.2",
-    "orjson>=3.9",
     "pydantic>=2.0",
     "httpx>=0.27",
-    "tenacity>=8.2",
 ]
 
 # ---------------------------------------------------------------------------
 # Optional dependency groups ("extras").
 #
-# Install with:  pip install neptune-ais[geo]
+# Install with:  pip install neptune-ais[sql]
+#                pip install neptune-ais[geo]
 #                pip install neptune-ais[stream]
 #                pip install neptune-ais[all]
 #
@@ -36,6 +32,21 @@ dependencies = [
 # in each __init__.py for which modules are allowed to import these.
 # ---------------------------------------------------------------------------
 [project.optional-dependencies]
+
+# SQL query engine — used by api.py (Neptune.sql, Neptune.duckdb) and
+# DuckDBSink for streaming landing.
+# Required for: SQL queries over cataloged data, DuckDB landing sink.
+sql = [
+    "duckdb>=1.0",
+]
+
+# Parquet I/O — pyarrow backend for Polars Parquet read/write.
+# Required for: reading/writing Parquet files (archival ingest, sinks,
+# promotion). Polars can use its own engine for basic reads, but pyarrow
+# is needed for full write options (compression, statistics, row groups).
+parquet = [
+    "pyarrow>=14.0",
+]
 
 # Geometry & visualization — used by geometry/ and viz/ subsystems.
 # Required for: GeoDataFrame/MovingPandas bridges, EEZ/port boundary
@@ -49,7 +60,7 @@ geo = [
 ]
 
 # Streaming — used by stream.py and streaming-capable adapters.
-# Required for: real-time AIS feeds via WebSocket.
+# Required for: real-time AIS feeds via WebSocket (e.g. AISStream).
 stream = [
     "websockets>=12.0",
 ]
@@ -70,9 +81,9 @@ dev = [
     "coverage>=7.4",
 ]
 
-# Everything.
+# Convenient bundle: everything needed for full-featured Neptune.
 all = [
-    "neptune-ais[geo,stream,cli,dev]",
+    "neptune-ais[sql,parquet,geo,stream,cli]",
 ]
 
 [project.scripts]
