@@ -20,7 +20,7 @@ Quick start::
 from __future__ import annotations
 
 # --- version ---
-__version__ = "0.1.0dev0"
+__version__ = "0.1.0"
 
 # --- lazy public API ---
 # Imports are deferred so that heavy deps (polars, duckdb) are not paid at
