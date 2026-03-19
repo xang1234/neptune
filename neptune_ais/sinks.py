@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _first_non_none(messages: list[dict[str, Any]], col: str) -> Any:
+    """Return the first non-None value for *col* across *messages*."""
+    for msg in messages:
+        val = msg.get(col)
+        if val is not None:
+            return val
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Parquet sink
 # ---------------------------------------------------------------------------
@@ -113,45 +122,51 @@ class ParquetSink:
         if not self._buffer:
             return
 
-        messages = self._buffer
-        self._buffer = []
+        # Swap buffer before processing but restore on failure to avoid
+        # data loss if the write raises.
+        messages, self._buffer = self._buffer, []
 
-        if self._compact and self._compactor is not None:
-            self._compactor.add(messages)
-            messages = self._compactor.compact()
+        try:
+            if self._compact and self._compactor is not None:
+                self._compactor.add(messages)
+                messages = self._compactor.compact()
 
-        if not messages:
-            return  # compaction removed all duplicates
+            if not messages:
+                return  # compaction removed all duplicates
 
-        df = pl.DataFrame(messages)
+            df = pl.DataFrame(messages)
 
-        # Sort by mmsi, timestamp for efficient downstream reads.
-        # Cache sort_cols on first flush: column presence is fixed per stream.
-        if self._sort_cols is None:
-            self._sort_cols = [c for c in SORT_ORDER_POSITIONS if c in df.columns]
-        if self._sort_cols:
-            df = df.sort(self._sort_cols)
+            # Sort by mmsi, timestamp for efficient downstream reads.
+            # Cache sort_cols on first flush: column presence is fixed per stream.
+            if self._sort_cols is None:
+                self._sort_cols = [c for c in SORT_ORDER_POSITIONS if c in df.columns]
+            if self._sort_cols:
+                df = df.sort(self._sort_cols)
 
-        if not self._dir_created:
-            self._landing_dir.mkdir(parents=True, exist_ok=True)
-            self._dir_created = True
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"landing-{ts}-{self._batch_count:04d}.parquet"
-        filepath = self._landing_dir / filename
+            if not self._dir_created:
+                self._landing_dir.mkdir(parents=True, exist_ok=True)
+                self._dir_created = True
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            filename = f"landing-{ts}-{self._batch_count:04d}.parquet"
+            filepath = self._landing_dir / filename
 
-        df.write_parquet(
-            filepath,
-            compression=PARQUET_COMPRESSION,
-            compression_level=PARQUET_COMPRESSION_LEVEL,
-            row_group_size=DEFAULT_ROW_GROUP_SIZE,
-            statistics=PARQUET_WRITE_STATISTICS,
-        )
+            df.write_parquet(
+                filepath,
+                compression=PARQUET_COMPRESSION,
+                compression_level=PARQUET_COMPRESSION_LEVEL,
+                row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                statistics=PARQUET_WRITE_STATISTICS,
+            )
 
-        self._batch_count += 1
-        self._rows_written += len(df)
-        logger.debug(
-            "ParquetSink: wrote %d rows to %s", len(df), filepath,
-        )
+            self._batch_count += 1
+            self._rows_written += len(df)
+            logger.debug(
+                "ParquetSink: wrote %d rows to %s", len(df), filepath,
+            )
+        except Exception:
+            # Restore buffer so data is not lost on transient failures.
+            self._buffer = messages + self._buffer
+            raise
 
     async def close(self) -> None:
         """Flush remaining data and log summary."""
@@ -232,51 +247,53 @@ class DuckDBSink:
         if not self._buffer:
             return
 
-        messages = self._buffer
-        self._buffer = []
+        messages, self._buffer = self._buffer, []
 
-        if self._compact and self._compactor is not None:
-            self._compactor.add(messages)
-            messages = self._compactor.compact()
+        try:
+            if self._compact and self._compactor is not None:
+                self._compactor.add(messages)
+                messages = self._compactor.compact()
 
-        if not messages:
-            return
+            if not messages:
+                return
 
-        if not self._table_created:
-            # Infer schema from first message, create table, and cache the
-            # INSERT SQL and column order — both are fixed for the lifetime
-            # of the sink.
-            columns = list(messages[0].keys())
-            # bool must precede int (bool subclasses int in Python).
-            type_map = {bool: "BOOLEAN", str: "VARCHAR", int: "BIGINT", float: "DOUBLE"}
-            col_defs = []
-            for col in columns:
-                val = messages[0].get(col)
-                sql_type = type_map.get(type(val), "VARCHAR")
-                col_defs.append(f'"{col}" {sql_type}')
-            self._con.execute(
-                f"CREATE TABLE IF NOT EXISTS {self._table_name} "
-                f"({', '.join(col_defs)})"
+            if not self._table_created:
+                # Infer schema from first batch. For each column, scan
+                # messages for the first non-None value to determine type.
+                columns = list(messages[0].keys())
+                # bool must precede int (bool subclasses int in Python).
+                type_map = {bool: "BOOLEAN", str: "VARCHAR", int: "BIGINT", float: "DOUBLE"}
+                col_defs = []
+                for col in columns:
+                    val = _first_non_none(messages, col)
+                    sql_type = type_map.get(type(val), "VARCHAR") if val is not None else "VARCHAR"
+                    col_defs.append(f'"{col}" {sql_type}')
+                self._con.execute(
+                    f"CREATE TABLE IF NOT EXISTS {self._table_name} "
+                    f"({', '.join(col_defs)})"
+                )
+                self._columns = columns
+                placeholders = ", ".join("?" for _ in columns)
+                quoted_cols = ", ".join(f'"{c}"' for c in columns)
+                self._insert_sql = (
+                    f"INSERT INTO {self._table_name} ({quoted_cols}) "
+                    f"VALUES ({placeholders})"
+                )
+                self._table_created = True
+
+            # Parameterized batch insert using cached SQL and column order.
+            columns = self._columns  # type: ignore[assignment]
+            rows = [tuple(msg.get(c) for c in columns) for msg in messages]
+            self._con.executemany(self._insert_sql, rows)
+
+            self._rows_written += len(messages)
+            logger.debug(
+                "DuckDBSink: inserted %d rows into %s",
+                len(messages), self._table_name,
             )
-            self._columns = columns
-            placeholders = ", ".join("?" for _ in columns)
-            quoted_cols = ", ".join(f'"{c}"' for c in columns)
-            self._insert_sql = (
-                f"INSERT INTO {self._table_name} ({quoted_cols}) "
-                f"VALUES ({placeholders})"
-            )
-            self._table_created = True
-
-        # Parameterized batch insert using cached SQL and column order.
-        columns = self._columns  # type: ignore[assignment]
-        rows = [tuple(msg.get(c) for c in columns) for msg in messages]
-        self._con.executemany(self._insert_sql, rows)
-
-        self._rows_written += len(messages)
-        logger.debug(
-            "DuckDBSink: inserted %d rows into %s",
-            len(messages), self._table_name,
-        )
+        except Exception:
+            self._buffer = messages + self._buffer
+            raise
 
     async def close(self) -> None:
         """Flush remaining data and close the connection."""
