@@ -102,6 +102,18 @@ class TestStreamConfig:
         assert config.bbox == (10.0, 55.0, 30.0, 70.0)
         assert config.mmsi == [111, 222]
 
+    def test_negative_lag_threshold_raises(self):
+        with pytest.raises(ValueError, match="lag_threshold_s"):
+            StreamConfig(lag_threshold_s=-1.0)
+
+    def test_inverted_thresholds_raises(self):
+        with pytest.raises(ValueError, match="stale_threshold_s"):
+            StreamConfig(lag_threshold_s=60.0, stale_threshold_s=30.0)
+
+    def test_equal_thresholds_raises(self):
+        with pytest.raises(ValueError, match="stale_threshold_s"):
+            StreamConfig(lag_threshold_s=30.0, stale_threshold_s=30.0)
+
 
 # ---------------------------------------------------------------------------
 # StreamStats

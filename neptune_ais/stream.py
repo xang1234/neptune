@@ -146,6 +146,15 @@ class StreamConfig:
             self.backpressure = BackpressurePolicy(self.backpressure)
         if not self.dedup_key_fields:
             raise ValueError("dedup_key_fields must not be empty")
+        if self.lag_threshold_s < 0:
+            raise ValueError(
+                f"lag_threshold_s must be >= 0, got {self.lag_threshold_s}"
+            )
+        if self.stale_threshold_s <= self.lag_threshold_s:
+            raise ValueError(
+                f"stale_threshold_s ({self.stale_threshold_s}) must be greater "
+                f"than lag_threshold_s ({self.lag_threshold_s})"
+            )
         if self.max_queue_size < 1:
             raise ValueError(
                 f"max_queue_size must be >= 1, got {self.max_queue_size}"
@@ -278,6 +287,18 @@ class NeptuneStream:
             return None
         return time.monotonic() - self._stats.last_message_time
 
+    def _health_from_lag(self, lag: float | None) -> StreamHealth:
+        """Derive health state from a lag value."""
+        if not self._running:
+            return StreamHealth.DISCONNECTED
+        if lag is None:
+            return StreamHealth.STALE
+        if lag >= self._config.stale_threshold_s:
+            return StreamHealth.STALE
+        if lag >= self._config.lag_threshold_s:
+            return StreamHealth.LAGGING
+        return StreamHealth.HEALTHY
+
     @property
     def health(self) -> StreamHealth:
         """Current health state derived from recency and lifecycle.
@@ -287,29 +308,19 @@ class NeptuneStream:
         - ``LAGGING`` — last message exceeds lag threshold but within stale threshold.
         - ``HEALTHY`` — receiving messages within lag threshold.
         """
-        if not self._running:
-            return StreamHealth.DISCONNECTED
-
-        lag = self.lag_seconds
-        if lag is None:
-            # Running but no messages received yet.
-            return StreamHealth.STALE
-
-        if lag >= self._config.stale_threshold_s:
-            return StreamHealth.STALE
-        if lag >= self._config.lag_threshold_s:
-            return StreamHealth.LAGGING
-        return StreamHealth.HEALTHY
+        return self._health_from_lag(self.lag_seconds)
 
     def health_snapshot(self) -> dict[str, Any]:
         """Return a dict summarizing current stream health.
 
+        Reads lag once so health and lag_seconds are consistent.
         Suitable for logging, monitoring endpoints, or operator dashboards.
         """
+        lag = self.lag_seconds
         return {
-            "health": self.health.value,
+            "health": self._health_from_lag(lag).value,
             "running": self._running,
-            "lag_seconds": self.lag_seconds,
+            "lag_seconds": lag,
             "messages_received": self._stats.messages_received,
             "messages_delivered": self._stats.messages_delivered,
             "messages_dropped": self._stats.messages_dropped,
