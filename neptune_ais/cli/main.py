@@ -203,14 +203,9 @@ def health(cache_dir: str | None) -> None:
 @click.argument("source_id", required=False)
 def sources(source_id: str | None) -> None:
     """List available sources or show details for a specific source."""
-    # Trigger adapter registration for all sources.
-    from neptune_ais.adapters import dma as _dma  # noqa: F401
-    from neptune_ais.adapters import noaa as _noaa  # noqa: F401
-    from neptune_ais.adapters import gfw as _gfw  # noqa: F401
-    from neptune_ais.adapters import finland as _finland  # noqa: F401
-    from neptune_ais.adapters import aishub as _aishub  # noqa: F401
-    from neptune_ais.adapters import aisstream as _aisstream  # noqa: F401
     from neptune_ais.adapters import registry
+
+    registry.load_all_adapters()
 
     if source_id:
         # Detailed view for one source.

@@ -3,14 +3,29 @@
 Provides ``catalog()``, ``available(date)``, ``info(source_id)``, and
 ``capabilities(source_id)`` for programmatic source inspection.
 
+Plugin discovery
+----------------
+External packages can register adapters via Python entry points::
+
+    # In the external package's pyproject.toml:
+    [project.entry-points."neptune_ais.adapters"]
+    my_source = "my_package.adapter:MyAdapter"
+
+Call ``load_all_adapters()`` to import all built-in adapters and
+discover any installed plugins. The CLI ``sources`` command does this
+automatically.
+
 This module is importable as ``neptune_ais.sources``.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from neptune_ais.adapters.base import SourceAdapter, SourceCapabilities
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Adapter registry — maps source_id to adapter class
@@ -18,6 +33,7 @@ from neptune_ais.adapters.base import SourceAdapter, SourceCapabilities
 
 _ADAPTERS: dict[str, type[SourceAdapter]] = {}
 _STREAMING_CAPABILITIES: dict[str, SourceCapabilities] = {}
+_all_loaded = False
 
 
 def register_streaming(caps: SourceCapabilities) -> None:
@@ -138,3 +154,92 @@ def compare(*source_ids: str) -> list[dict[str, str]]:
 def registered_sources() -> list[str]:
     """Return sorted list of all registered source IDs (archival + streaming)."""
     return sorted(set(_ADAPTERS.keys()) | set(_STREAMING_CAPABILITIES.keys()))
+
+
+# ---------------------------------------------------------------------------
+# Plugin discovery and bulk loading
+# ---------------------------------------------------------------------------
+
+# Built-in adapter module names (relative to neptune_ais.adapters).
+# Each is imported to trigger its auto-registration side effect.
+_BUILTIN_ADAPTERS = [
+    "noaa",
+    "dma",
+    "gfw",
+    "finland",
+    "aishub",
+    "aisstream",
+]
+
+ENTRY_POINT_GROUP = "neptune_ais.adapters"
+"""Entry point group for external adapter plugins."""
+
+
+def discover_plugins() -> list[str]:
+    """Discover and load external adapter plugins via entry points.
+
+    External packages register adapters by declaring an entry point in
+    the ``neptune_ais.adapters`` group::
+
+        # In the plugin's pyproject.toml:
+        [project.entry-points."neptune_ais.adapters"]
+        my_source = "my_package.adapter:MyAdapter"
+
+    The entry point value should be an adapter class that satisfies the
+    ``SourceAdapter`` protocol. Loading the entry point calls
+    ``register()`` on the class.
+
+    Returns:
+        List of source IDs successfully loaded from plugins.
+    """
+    from importlib.metadata import entry_points
+
+    loaded: list[str] = []
+
+    try:
+        eps = entry_points(group=ENTRY_POINT_GROUP)
+    except TypeError:
+        # Python 3.9–3.11 compatibility: entry_points() may not accept group=.
+        eps = entry_points().get(ENTRY_POINT_GROUP, [])  # type: ignore[union-attr]
+
+    for ep in eps:
+        try:
+            adapter_cls = ep.load()
+            if adapter_cls not in _ADAPTERS.values():
+                register(adapter_cls)
+            source_id = getattr(adapter_cls, "SOURCE_ID", ep.name)
+            loaded.append(source_id)
+            logger.debug("Loaded plugin adapter: %s (%s)", source_id, ep.value)
+        except Exception as e:
+            logger.warning(
+                "Failed to load adapter plugin %s: %s", ep.name, e,
+            )
+
+    return loaded
+
+
+def load_all_adapters() -> list[str]:
+    """Import all built-in adapters and discover installed plugins.
+
+    Safe to call multiple times — subsequent calls are no-ops.
+
+    Returns:
+        List of all registered source IDs after loading.
+    """
+    global _all_loaded
+    if _all_loaded:
+        return registered_sources()
+
+    # Import built-in adapters (triggers auto-registration).
+    import importlib
+    for mod_name in _BUILTIN_ADAPTERS:
+        try:
+            importlib.import_module(f"neptune_ais.adapters.{mod_name}")
+        except ImportError as e:
+            logger.debug("Built-in adapter %s not loadable: %s", mod_name, e)
+
+    # Discover external plugins.
+    discover_plugins()
+
+    _all_loaded = True
+    return registered_sources()
