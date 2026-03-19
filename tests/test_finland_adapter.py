@@ -275,6 +275,14 @@ class TestFinlandNormalization:
         df = FinlandAdapter().normalize_positions([_make_artifact(str(filepath))])
         assert len(df) == 3
 
+    def test_wrapper_data_format(self, tmp_path):
+        """Handles response wrapped in {"data": [...]}."""
+        records = _sample_records()
+        filepath = tmp_path / "finland_data.json"
+        filepath.write_text(json.dumps({"data": records}))
+        df = FinlandAdapter().normalize_positions([_make_artifact(str(filepath))])
+        assert len(df) == 3
+
     def test_empty_records_raises(self, tmp_path):
         filepath = tmp_path / "finland_empty.json"
         filepath.write_text(json.dumps([]))
