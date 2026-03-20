@@ -1,11 +1,10 @@
 """NOAA — NOAA Marine Cadastre AIS adapter.
 
-Downloads daily GeoParquet/CSV archives from the Marine Cadastre,
+Downloads daily CSV-in-ZIP archives from the Marine Cadastre,
 normalizes to the canonical positions and vessels schemas.
 
-NOAA Marine Cadastre serves AIS data as:
-- Daily CSV-in-ZIP files (historical, pre-2023)
-- Daily GeoParquet files (2023 onward)
+NOAA Marine Cadastre serves AIS data as daily CSV-in-ZIP files
+for all years (2009–present).
 
 Coverage: U.S. coastal waters, 2009–present.
 Delivery: Daily files, typically available next day.
@@ -57,12 +56,8 @@ SOURCE_ID = "noaa"
 ADAPTER_VERSION = "noaa/0.1.0"
 
 # NOAA Marine Cadastre base URL pattern.
-# GeoParquet: https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.parquet
-# CSV ZIP:    https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.zip
+# https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.zip
 BASE_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler"
-
-# Year from which GeoParquet is available (before this, CSV-in-ZIP).
-GEOPARQUET_START_YEAR = 2023
 
 # NOAA raw column names → canonical column names.
 COLUMN_MAP: dict[str, str] = {
@@ -100,8 +95,7 @@ def _build_url(target_date: date) -> str:
 
 def _build_filename(target_date: date) -> str:
     """Build the expected filename for a given date."""
-    ext = "parquet" if target_date.year >= GEOPARQUET_START_YEAR else "zip"
-    return f"AIS_{target_date.year}_{target_date.month:02d}_{target_date.day:02d}.{ext}"
+    return f"AIS_{target_date.year}_{target_date.month:02d}_{target_date.day:02d}.zip"
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +136,7 @@ class NOAAAdapter:
             coverage="U.S. coastal waters",
             history_start="2009-01-01",
             datasets_provided=["positions", "vessels"],
-            delivery_format="GeoParquet (2023+), CSV-in-ZIP (pre-2023)",
+            delivery_format="CSV-in-ZIP (all years)",
             typical_daily_rows="500K-2M",
             known_quirks=[
                 "Heading=511 means unavailable (normalized to null)",
@@ -164,16 +158,9 @@ class NOAAAdapter:
             )
 
         url = _build_url(spec.date)
-        filename = _build_filename(spec.date)
-        dest = self._download_dir / filename
-        content_type = (
-            "application/x-geoparquet"
-            if filename.endswith(".parquet")
-            else "application/zip"
-        )
-
+        dest = self._download_dir / _build_filename(spec.date)
         return [download_and_hash(
-            url, dest, overwrite=spec.overwrite, content_type=content_type,
+            url, dest, overwrite=spec.overwrite, content_type="application/zip",
         )]
 
     def normalize_positions(
@@ -181,29 +168,26 @@ class NOAAAdapter:
     ) -> pl.DataFrame:
         """Normalize NOAA raw data into canonical positions schema.
 
-        Handles both GeoParquet and CSV-in-ZIP formats. Applies column
-        renaming, type casting, and sentinel normalization.
+        Reads daily CSV-in-ZIP archives and applies column renaming,
+        type casting, and sentinel normalization.
         """
+        import io
+        import zipfile
+
         frames: list[pl.DataFrame] = []
 
         for art in artifacts:
             path = Path(art.local_path)
 
-            if path.suffix == ".parquet":
-                raw = pl.read_parquet(path)
-            elif path.suffix == ".zip":
-                # NOAA CSV-in-ZIP: read CSV from inside the archive.
-                import zipfile
-                import io
+            if path.suffix != ".zip":
+                raise ValueError(f"Expected .zip file, got: {path.suffix}")
 
-                with zipfile.ZipFile(path) as zf:
-                    csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
-                    if not csv_names:
-                        raise ValueError(f"No CSV found in {path}")
-                    with zf.open(csv_names[0]) as csv_file:
-                        raw = pl.read_csv(io.BytesIO(csv_file.read()))
-            else:
-                raise ValueError(f"Unsupported file format: {path.suffix}")
+            with zipfile.ZipFile(path) as zf:
+                csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+                if not csv_names:
+                    raise ValueError(f"No CSV found in {path}")
+                with zf.open(csv_names[0]) as csv_file:
+                    raw = pl.read_csv(io.BytesIO(csv_file.read()))
 
             # Rename columns to canonical names.
             rename = {
@@ -268,18 +252,20 @@ class NOAAAdapter:
                 exprs.append(col.cast(pl.Float64, strict=False))
             elif col_name == "heading":
                 # 511 = not available → null
+                heading = col.cast(pl.Float64, strict=False)
                 exprs.append(
-                    pl.when(col.cast(pl.Float64, strict=False) == HEADING_UNAVAILABLE)
+                    pl.when(heading == HEADING_UNAVAILABLE)
                     .then(None)
-                    .otherwise(col.cast(pl.Float64, strict=False))
+                    .otherwise(heading)
                     .alias("heading")
                 )
             elif col_name == "imo":
                 # "IMO0000000" = not available → null
+                imo = col.cast(pl.String)
                 exprs.append(
-                    pl.when(col.cast(pl.String) == IMO_UNAVAILABLE)
+                    pl.when(imo == IMO_UNAVAILABLE)
                     .then(None)
-                    .otherwise(col.cast(pl.String))
+                    .otherwise(imo)
                     .alias("imo")
                 )
             elif col_name == "ship_type":

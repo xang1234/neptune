@@ -277,13 +277,13 @@ class TestReadinessRubric:
 class TestCrossAdapterConsistency:
     """Adapters should be consistent with each other."""
 
-    def test_all_provide_positions(self):
-        """Every source provides at least the positions dataset."""
+    def test_all_provide_at_least_one_dataset(self):
+        """Every source provides at least one dataset."""
         for sid in _ALL_IDS:
             from neptune_ais.adapters.registry import info
             caps = info(sid)
-            assert "positions" in caps.datasets_provided, (
-                f"{sid} does not provide positions dataset"
+            assert len(caps.datasets_provided) >= 1, (
+                f"{sid} provides no datasets"
             )
 
     def test_adapter_versions_follow_convention(self):

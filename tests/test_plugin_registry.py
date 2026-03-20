@@ -146,7 +146,8 @@ class TestFindSources:
         source_ids = [c.source_id for c in results]
         assert "noaa" in source_ids
         assert "gfw" in source_ids
-        assert "finland" in source_ids
+        # finland is streaming-only, no backfill
+        assert "finland" not in source_ids
         # aishub doesn't support backfill
         assert "aishub" not in source_ids
 
@@ -156,7 +157,7 @@ class TestFindSources:
         results = find_sources(streaming=True)
         source_ids = [c.source_id for c in results]
         assert "aisstream" in source_ids
-        assert "finland" in source_ids  # mixed delivery
+        assert "finland" in source_ids  # streaming-only
         # noaa doesn't support streaming
         assert "noaa" not in source_ids
 
@@ -176,7 +177,7 @@ class TestFindSources:
         load_all_adapters()
         results = find_sources(backfill=True, auth=False)
         source_ids = [c.source_id for c in results]
-        # noaa, dma, finland all have backfill + no auth
+        # noaa, dma have backfill + no auth
         assert "noaa" in source_ids
         # gfw has backfill but requires auth
         assert "gfw" not in source_ids
@@ -192,7 +193,7 @@ class TestFindSources:
         load_all_adapters()
         results = find_sources(backfill=True, streaming=True, auth=True)
         # No source has all three
-        # (finland has backfill+streaming but no auth)
+        # (finland has streaming but no auth, not backfill)
         source_ids = [c.source_id for c in results]
         assert "finland" not in source_ids  # finland has no auth
 

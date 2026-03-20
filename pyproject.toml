@@ -59,12 +59,14 @@ geo = [
     "movingpandas>=0.18",
     "lonboard>=0.9",
     "h3>=4.0",
+    "gfw-api-python-client>=1.0",
 ]
 
 # Streaming — used by stream.py and streaming-capable adapters.
 # Required for: real-time AIS feeds via WebSocket (e.g. AISStream).
 stream = [
     "websockets>=12.0",
+    "aiomqtt>=2.0",
 ]
 
 # CLI presentation extras.
@@ -77,6 +79,7 @@ cli = [
 notebooks = [
     "jupyter>=1.0",
     "ipykernel>=6.0",
+    "nest_asyncio>=1.5",
 ]
 
 # Development and testing.

@@ -1,53 +1,61 @@
-"""Finland — Fintraffic Digitraffic marine AIS adapter.
+"""Finland — Fintraffic Digitraffic marine AIS streaming adapter.
 
-Downloads vessel position data from the Digitraffic REST API,
-normalizes to the canonical positions and vessels schemas.
+Real-time vessel positions and metadata via MQTT over WebSocket from the
+Digitraffic marine API. Streaming-only, no backfill.
 
 Digitraffic provides:
-- Real-time vessel locations via REST API (no auth required)
-- Historical vessel locations via date-based queries
-- Vessel metadata (name, type, dimensions)
+- MQTT: ``wss://meri.digitraffic.fi:443/mqtt`` — real-time updates
+  - ``vessels-v2/{mmsi}/location`` — position reports
+  - ``vessels-v2/{mmsi}/metadata`` — vessel identity/static data
 
-Coverage: Finnish waters and Baltic Sea, 2019–present.
-Delivery: REST API JSON (open data, no authentication).
-Latency: Near real-time (<1 minute for latest positions).
+Coverage: Finnish waters and Baltic Sea.
+Delivery: MQTT over WSS (open data, no authentication).
+Latency: Real-time (< 1 second).
 
-This is a mixed-delivery source: it supports both archival backfill
-via date-based REST queries and near-real-time position snapshots.
+MQTT location message wire format (captured 2026-03-20)::
 
-Raw column mapping (Digitraffic → canonical):
-    mmsi → mmsi (Int64)
-    timestampExternal → timestamp (Datetime μs UTC, epoch ms)
-    x → lon (Float64)
-    y → lat (Float64)
-    sog → sog (Float64, knots × 10 → knots)
-    cog → cog (Float64, degrees × 10 → degrees)
-    heading → heading (Float64, 511 → null)
-    name → vessel_name (String)
-    imo → imo (Int64, 0 → null)
-    callSign → callsign (String)
-    destination → destination (String)
-    shipType → ship_type (String, numeric → string)
-    draught → draught (Float64, meters × 10 → meters)
+    topic: vessels-v2/{mmsi}/location
+    {
+        "time": 1773972038,        # Unix epoch seconds
+        "sog": 12.3,               # pre-scaled knots (NOT ×10)
+        "cog": 72.2,               # pre-scaled degrees (NOT ×10)
+        "navStat": 0,              # AIS navigation status code
+        "rot": 0,                  # rate of turn
+        "posAcc": false,
+        "raim": false,
+        "heading": 66,             # 511 = unavailable
+        "lon": 22.96629,
+        "lat": 59.47799
+    }
+
+MQTT metadata message wire format::
+
+    topic: vessels-v2/{mmsi}/metadata
+    {
+        "timestamp": 1773972046685,  # epoch milliseconds
+        "destination": "TURKU",
+        "name": "SATURN",
+        "draught": 40,               # meters × 10 (divide by 10)
+        "eta": 100737,
+        "posType": 1,
+        "refA": 8, "refB": 11, "refC": 5, "refD": 5,
+        "callSign": "OJUV",
+        "imo": 9315410,
+        "type": 52                   # numeric ship type
+    }
+
+Requires: ``pip install neptune-ais[stream]`` (aiomqtt).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any
 
-import polars as pl
-
-from neptune_ais.adapters.base import (
-    FetchSpec,
-    RawArtifact,
-    SourceAdapter,
-    SourceCapabilities,
-    download_and_hash,
-    extract_vessels,
-)
+from neptune_ais.adapters.base import AIS_NAV_STATUS, SourceCapabilities
+from neptune_ais.adapters.registry import register_streaming
 
 logger = logging.getLogger(__name__)
 
@@ -56,263 +64,250 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SOURCE_ID = "finland"
-ADAPTER_VERSION = "finland/0.1.0"
 
-# Digitraffic marine API base URL.
-BASE_URL = "https://meri.digitraffic.fi/api/ais/v1"
+MQTT_BROKER = "meri.digitraffic.fi"
+MQTT_PORT = 443
+MQTT_WEBSOCKET_PATH = "/mqtt"
 
-# Digitraffic raw field names → canonical column names.
-COLUMN_MAP: dict[str, str] = {
-    "mmsi": "mmsi",
-    "timestampExternal": "timestamp",
-    "y": "lat",
-    "x": "lon",
-    "sog": "sog",
-    "cog": "cog",
-    "heading": "heading",
-    "name": "vessel_name",
-    "imo": "imo",
-    "callSign": "callsign",
-    "destination": "destination",
-    "shipType": "ship_type",
-    "draught": "draught",
-}
+LOCATION_TOPIC = "vessels-v2/+/location"
+METADATA_TOPIC = "vessels-v2/+/metadata"
 
 # Sentinel values.
-HEADING_UNAVAILABLE = 511.0
+HEADING_UNAVAILABLE = 511
 IMO_UNAVAILABLE = 0
 
-# Digitraffic scales SOG/COG/draught by 10.
-DIGITRAFFIC_SCALE_FACTOR = 10.0
+# Draught is still ×10 in metadata messages.
+DRAUGHT_SCALE_FACTOR = 10.0
+
+# Cached TLS context for MQTT connections (avoids re-loading the system
+# trust store on every reconnection).
+_tls_context = None
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
+# Capabilities & registration
 # ---------------------------------------------------------------------------
 
 
-def _build_url(target_date: date) -> str:
-    """Build the download URL for a given date's position data."""
-    return (
-        f"{BASE_URL}/locations/history"
-        f"?date={target_date.isoformat()}&format=json"
-    )
+CAPABILITIES = SourceCapabilities(
+    source_id=SOURCE_ID,
+    provider="Fintraffic Digitraffic",
+    description=(
+        "Finnish waters and Baltic Sea AIS from Digitraffic. "
+        "Open data, real-time MQTT streaming."
+    ),
+    supports_backfill=False,
+    supports_streaming=True,
+    supports_server_side_bbox=False,
+    supports_incremental=False,
+    auth_scheme=None,
+    rate_limit=None,
+    expected_latency="real-time",
+    license_requirements=(
+        "CC BY 4.0 — Fintraffic / Digitraffic. "
+        "See https://www.digitraffic.fi/en/terms/"
+    ),
+    coverage="Finnish waters and Baltic Sea",
+    delivery_format="MQTT over WSS",
+    datasets_provided=["positions", "vessels"],
+    known_quirks=[
+        "MMSI is extracted from the MQTT topic, not the payload",
+        "Location timestamps are Unix epoch seconds (not milliseconds)",
+        "Metadata timestamps are Unix epoch milliseconds",
+        "SOG/COG are pre-scaled floats (NOT raw NMEA ×10 units)",
+        "Draught in metadata IS ×10 (divide by 10)",
+        "Heading=511 means unavailable (normalized to null)",
+        "IMO=0 means unavailable (normalized to null)",
+        "Ship type is numeric (cast to string)",
+    ],
+)
 
-
-def _build_filename(target_date: date) -> str:
-    """Build the expected filename for a given date."""
-    return f"finland_{target_date.isoformat()}.json"
+register_streaming(CAPABILITIES)
 
 
 # ---------------------------------------------------------------------------
-# Finland adapter
+# Normalization
 # ---------------------------------------------------------------------------
 
 
-class FinlandAdapter:
-    """Fintraffic Digitraffic marine AIS source adapter.
+def normalize_message(raw: dict[str, Any], topic: str) -> dict[str, Any] | None:
+    """Normalize a raw Digitraffic MQTT message to a canonical dict.
 
-    Implements the ``SourceAdapter`` protocol for fetching and
-    normalizing Finnish maritime AIS data. Digitraffic is open data
-    with no authentication required.
+    Parses the topic once to extract both MMSI and message type, then
+    dispatches: ``location`` → position dict, ``metadata`` → vessel dict.
 
-    This is a mixed-delivery source supporting both archival backfill
-    (date-based REST queries) and near-real-time snapshots.
+    Returns None if the message is invalid (missing MMSI, missing
+    coordinates for location messages, unknown topic structure).
+
+    Args:
+        raw: Parsed JSON payload from the MQTT message.
+        topic: The full MQTT topic string (e.g. ``vessels-v2/230000001/location``).
+
+    Returns:
+        A normalized dict ready for ``NeptuneStream.ingest()``, or None.
     """
+    parts = topic.split("/")
+    if len(parts) < 3:
+        return None
+    try:
+        mmsi = int(parts[1])
+    except ValueError:
+        return None
 
-    SOURCE_ID = SOURCE_ID
+    kind = parts[2]
+    if kind == "location":
+        return _normalize_location(raw, mmsi)
+    elif kind == "metadata":
+        return _normalize_metadata(raw, mmsi)
+    return None
 
-    def __init__(self, download_dir: Path | None = None) -> None:
-        self._download_dir = download_dir
 
-    @property
-    def source_id(self) -> str:
-        return SOURCE_ID
+def _normalize_location(raw: dict[str, Any], mmsi: int) -> dict[str, Any] | None:
+    """Normalize a location message."""
+    lat = raw.get("lat")
+    lon = raw.get("lon")
+    if lat is None or lon is None:
+        return None
 
-    @property
-    def capabilities(self) -> SourceCapabilities:
-        return SourceCapabilities(
-            source_id=SOURCE_ID,
-            provider="Fintraffic Digitraffic",
-            description=(
-                "Finnish waters and Baltic Sea AIS from Digitraffic. "
-                "Open data, near-real-time and historical."
-            ),
-            supports_backfill=True,
-            supports_streaming=True,
-            supports_server_side_bbox=False,
-            supports_incremental=False,
-            auth_scheme=None,
-            rate_limit=None,
-            expected_latency="< 1 minute",
-            license_requirements=(
-                "CC BY 4.0 — Fintraffic / Digitraffic. "
-                "See https://www.digitraffic.fi/en/terms/"
-            ),
-            coverage="Finnish waters and Baltic Sea",
-            history_start="2019-01-01",
-            datasets_provided=["positions", "vessels"],
-            delivery_format="REST API JSON",
-            typical_daily_rows="50K-200K",
-            known_quirks=[
-                "SOG is knots × 10 (divide by 10)",
-                "COG is degrees × 10 (divide by 10)",
-                "Draught is meters × 10 (divide by 10)",
-                "Heading=511 means unavailable (normalized to null)",
-                "IMO=0 means unavailable (normalized to null)",
-                "Coordinates: x=longitude, y=latitude (reversed naming)",
-                "Timestamps are Unix epoch milliseconds",
-                "shipType is numeric (cast to string)",
-            ],
-        )
+    # Timestamp: epoch seconds → ISO-8601.
+    time_val = raw.get("time")
+    if time_val is not None:
+        ts = datetime.fromtimestamp(int(time_val), tz=timezone.utc).isoformat()
+    else:
+        ts = datetime.now(timezone.utc).isoformat()
 
-    def available_dates(self) -> tuple[date, date]:
-        """Digitraffic has data from 2019-01-01 to today."""
-        return (date(2019, 1, 1), date.today())
+    # Heading sentinel.
+    heading = raw.get("heading")
+    if heading == HEADING_UNAVAILABLE:
+        heading = None
+    elif heading is not None:
+        heading = float(heading)
 
-    def fetch_raw(self, spec: FetchSpec) -> list[RawArtifact]:
-        """Download Digitraffic data for the specified date."""
-        if self._download_dir is None:
-            raise ValueError(
-                "download_dir must be set before fetching. "
-                "Pass it via FinlandAdapter(download_dir=...)"
-            )
+    # Nav status.
+    nav_code = raw.get("navStat")
+    nav_status = AIS_NAV_STATUS.get(nav_code) if nav_code is not None else None
 
-        url = _build_url(spec.date)
-        filename = _build_filename(spec.date)
-        dest = self._download_dir / filename
+    return {
+        "mmsi": mmsi,
+        "timestamp": ts,
+        "lat": float(lat),
+        "lon": float(lon),
+        "sog": float(raw["sog"]) if raw.get("sog") is not None else None,
+        "cog": float(raw["cog"]) if raw.get("cog") is not None else None,
+        "heading": heading,
+        "nav_status": nav_status,
+        "source": SOURCE_ID,
+    }
 
-        return [download_and_hash(
-            url, dest, overwrite=spec.overwrite, content_type="application/json",
-        )]
 
-    def normalize_positions(
-        self, artifacts: list[RawArtifact]
-    ) -> pl.DataFrame:
-        """Normalize Digitraffic raw JSON data into canonical positions schema."""
-        frames: list[pl.DataFrame] = []
+def _normalize_metadata(raw: dict[str, Any], mmsi: int) -> dict[str, Any] | None:
+    """Normalize a metadata message."""
+    # Timestamp: epoch milliseconds → ISO-8601.
+    ts_ms = raw.get("timestamp")
+    if ts_ms is not None:
+        ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).isoformat()
+    else:
+        ts = datetime.now(timezone.utc).isoformat()
 
-        for art in artifacts:
-            fpath = Path(art.local_path)
-            raw_data = json.loads(fpath.read_text())
+    # IMO sentinel.
+    imo = raw.get("imo")
+    if imo == IMO_UNAVAILABLE or imo is None:
+        imo = None
+    else:
+        imo = str(imo)
 
-            # Digitraffic returns a list of location records or a
-            # wrapper with a "features" key (GeoJSON style).
-            if isinstance(raw_data, dict):
-                records = raw_data.get("features", raw_data.get("data", []))
-                if not records and "features" not in raw_data and "data" not in raw_data:
-                    logger.warning(
-                        "Digitraffic response has no 'features' or 'data' key: %s",
-                        sorted(raw_data.keys()),
-                    )
-            elif isinstance(raw_data, list):
-                records = raw_data
-            else:
-                raise ValueError(
-                    f"Unexpected Digitraffic response format: {type(raw_data)}"
-                )
+    # Draught: ×10 in metadata messages.
+    draught = raw.get("draught")
+    if draught is not None:
+        draught = float(draught) / DRAUGHT_SCALE_FACTOR
 
-            if not records:
+    # Ship type: numeric → string.
+    ship_type = raw.get("type")
+    if ship_type is not None:
+        ship_type = str(ship_type)
+
+    return {
+        "mmsi": mmsi,
+        "timestamp": ts,
+        "vessel_name": (raw.get("name") or "").strip() or None,
+        "imo": imo,
+        "callsign": (raw.get("callSign") or "").strip() or None,
+        "destination": (raw.get("destination") or "").strip() or None,
+        "ship_type": ship_type,
+        "draught": draught,
+        "source": SOURCE_ID,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streaming connector
+# ---------------------------------------------------------------------------
+
+
+async def connect_and_stream(
+    stream,  # NeptuneStream instance
+    *,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> None:
+    """Connect to Digitraffic MQTT and feed messages into a NeptuneStream.
+
+    Subscribes to both location and metadata topics. Messages are
+    normalized and ingested until the stream is closed or the connection
+    drops.
+
+    Args:
+        stream: A running NeptuneStream instance.
+        bbox: Optional client-side bbox filter ``(west, south, east, north)``.
+            Digitraffic does not support server-side filtering; positions
+            outside the bbox are silently discarded.
+
+    Raises:
+        ImportError: If aiomqtt is not installed.
+    """
+    try:
+        import aiomqtt
+    except ImportError:
+        raise ImportError(
+            "aiomqtt is required for Digitraffic Finland streaming. "
+            "Install with: pip install neptune-ais[stream]"
+        ) from None
+
+    global _tls_context
+    if _tls_context is None:
+        import ssl
+        _tls_context = ssl.create_default_context()
+
+    async with aiomqtt.Client(
+        hostname=MQTT_BROKER,
+        port=MQTT_PORT,
+        transport="websockets",
+        tls_context=_tls_context,
+        websocket_path=MQTT_WEBSOCKET_PATH,
+    ) as client:
+        await client.subscribe(LOCATION_TOPIC)
+        await client.subscribe(METADATA_TOPIC)
+        logger.info("Connected to Digitraffic MQTT, subscribed to location + metadata")
+
+        async for msg in client.messages:
+            if not stream.is_running:
+                break
+
+            try:
+                raw = json.loads(msg.payload)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.warning("Invalid payload from Digitraffic, skipping")
                 continue
 
-            raw = pl.DataFrame(records)
+            topic = str(msg.topic)
+            normalized = normalize_message(raw, topic)
+            if normalized is None:
+                continue
 
-            # Rename columns to canonical names.
-            rename = {
-                src: dst
-                for src, dst in COLUMN_MAP.items()
-                if src in raw.columns
-            }
-            df = raw.rename(rename)
+            # Client-side bbox filtering for location messages.
+            if bbox is not None and "lat" in normalized and "lon" in normalized:
+                west, south, east, north = bbox
+                lat, lon = normalized["lat"], normalized["lon"]
+                if not (south <= lat <= north and west <= lon <= east):
+                    continue
 
-            # Select only mapped columns that exist.
-            canonical_cols = [c for c in COLUMN_MAP.values() if c in df.columns]
-            df = df.select(canonical_cols)
-
-            # Type casting, scaling, and sentinel normalization.
-            df = self._cast_and_normalize(df)
-
-            frames.append(df)
-
-        if not frames:
-            raise ValueError("No data frames produced from Digitraffic artifacts")
-
-        return pl.concat(frames) if len(frames) > 1 else frames[0]
-
-    def normalize_vessels(
-        self, artifacts: list[RawArtifact]
-    ) -> pl.DataFrame | None:
-        """Extract vessel identity records from Digitraffic position data."""
-        positions = self.normalize_positions(artifacts)
-        return extract_vessels(positions, SOURCE_ID)
-
-    def qc_rules(self) -> list:
-        """Digitraffic-specific QC rules.
-
-        Scaling (SOG/COG/draught ÷ 10) and sentinels (heading=511,
-        IMO=0) are handled during normalization. No additional QC
-        rules beyond built-ins.
-        """
-        return []
-
-    # --- Internal helpers ---
-
-    @staticmethod
-    def _cast_and_normalize(df: pl.DataFrame) -> pl.DataFrame:
-        """Apply type casts, scaling, and sentinel normalization."""
-        exprs: list[pl.Expr] = []
-
-        for col_name in df.columns:
-            col = pl.col(col_name)
-
-            if col_name == "mmsi":
-                exprs.append(col.cast(pl.Int64, strict=False))
-            elif col_name == "timestamp":
-                # Digitraffic uses epoch ms; × 1000 converts to μs for Datetime("us").
-                exprs.append(
-                    (col.cast(pl.Int64, strict=False) * 1000)
-                    .cast(pl.Datetime("us", "UTC"))
-                )
-            elif col_name in ("lat", "lon"):
-                exprs.append(col.cast(pl.Float64, strict=False))
-            elif col_name in ("sog", "cog", "draught"):
-                # Digitraffic sends SOG/COG/draught × 10; divide to normalize.
-                exprs.append(
-                    (col.cast(pl.Float64, strict=False) / DIGITRAFFIC_SCALE_FACTOR)
-                    .alias(col_name)
-                )
-            elif col_name == "heading":
-                # 511 = not available → null.
-                float_col = col.cast(pl.Float64, strict=False)
-                exprs.append(
-                    pl.when(float_col == HEADING_UNAVAILABLE)
-                    .then(None)
-                    .otherwise(float_col)
-                    .alias("heading")
-                )
-            elif col_name == "imo":
-                # IMO=0 or null means unavailable → null.
-                casted = col.cast(pl.Int64, strict=False)
-                exprs.append(
-                    pl.when(casted.is_null() | (casted == IMO_UNAVAILABLE))
-                    .then(pl.lit(None, dtype=pl.String))
-                    .otherwise(col.cast(pl.String))
-                    .alias("imo")
-                )
-            elif col_name == "ship_type":
-                # Digitraffic uses numeric vessel type codes.
-                exprs.append(col.cast(pl.String))
-            else:
-                exprs.append(col.cast(pl.String, strict=False))
-
-        exprs.append(pl.lit(SOURCE_ID).alias("source"))
-        return df.with_columns(exprs)
-
-
-# ---------------------------------------------------------------------------
-# Auto-register on import
-# ---------------------------------------------------------------------------
-
-from neptune_ais.adapters.registry import register  # noqa: E402
-
-register(FinlandAdapter)
+            await stream.ingest(normalized)

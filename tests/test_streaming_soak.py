@@ -256,8 +256,8 @@ class TestHealthTransitions:
             assert stream.health is StreamHealth.DISCONNECTED
 
             async with stream:
-                # Running, no messages: STALE.
-                assert stream.health is StreamHealth.STALE
+                # Running, no messages yet: HEALTHY (just started).
+                assert stream.health is StreamHealth.HEALTHY
 
                 # After message: HEALTHY.
                 await stream.ingest(_msg(mmsi=1, ts="2024-01-01T00:00:00"))
@@ -291,10 +291,11 @@ class TestHealthTransitions:
                 stale_threshold_s=0.20,
             )
             async with NeptuneStream(config=config) as stream:
-                # Stale snapshot.
+                # Just-started snapshot: healthy, lag measures from start time.
                 snap = stream.health_snapshot()
-                assert snap["health"] == "stale"
-                assert snap["lag_seconds"] is None
+                assert snap["health"] == "healthy"
+                assert snap["lag_seconds"] is not None
+                assert snap["lag_seconds"] < 1.0
 
                 # Healthy snapshot.
                 await stream.ingest(_msg(mmsi=1, ts="2024-01-01T00:00:00"))

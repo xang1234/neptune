@@ -38,7 +38,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from neptune_ais.adapters.base import SourceCapabilities
+from neptune_ais.adapters.base import AIS_NAV_STATUS, SourceCapabilities
 from neptune_ais.adapters.registry import register_streaming
 
 logger = logging.getLogger(__name__)
@@ -47,23 +47,6 @@ SOURCE_ID = "aisstream"
 ADAPTER_VERSION = "aisstream/0.1.0"
 
 WEBSOCKET_URL = "wss://stream.aisstream.io/v0/stream"
-
-# AIS navigational status codes → human-readable strings.
-_NAV_STATUS = {
-    0: "Under way using engine",
-    1: "At anchor",
-    2: "Not under command",
-    3: "Restricted maneuverability",
-    4: "Constrained by draught",
-    5: "Moored",
-    6: "Aground",
-    7: "Engaged in fishing",
-    8: "Under way sailing",
-    9: "Reserved for HSC",
-    10: "Reserved for WIG",
-    14: "AIS-SART",
-    15: "Not defined",
-}
 
 # Heading sentinel value (511 = not available).
 _HEADING_UNAVAILABLE = 511
@@ -179,7 +162,7 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
 
     # Navigational status.
     nav_code = pos_report.get("NavigationalStatus")
-    nav_status = _NAV_STATUS.get(nav_code) if nav_code is not None else None
+    nav_status = AIS_NAV_STATUS.get(nav_code) if nav_code is not None else None
 
     return {
         "mmsi": int(mmsi),

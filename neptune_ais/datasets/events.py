@@ -30,6 +30,7 @@ EVENT_TYPE_PORT_CALL = "port_call"
 EVENT_TYPE_EEZ_CROSSING = "eez_crossing"
 EVENT_TYPE_ENCOUNTER = "encounter"
 EVENT_TYPE_LOITERING = "loitering"
+EVENT_TYPE_FISHING = "fishing"
 
 EVENT_TYPES: frozenset[str] = frozenset(
     {
@@ -37,6 +38,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_TYPE_EEZ_CROSSING,
         EVENT_TYPE_ENCOUNTER,
         EVENT_TYPE_LOITERING,
+        EVENT_TYPE_FISHING,
     }
 )
 """Known event type values. Detectors may add new types, but these are

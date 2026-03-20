@@ -856,12 +856,13 @@ class TestStreamHealth:
             assert stream.health is StreamHealth.DISCONNECTED
         _run(_test())
 
-    def test_stale_when_no_messages(self):
-        """Running stream with no messages yet is STALE."""
+    def test_healthy_when_just_started(self):
+        """Running stream with no messages yet is HEALTHY (just started)."""
         async def _test():
             async with NeptuneStream() as stream:
-                assert stream.health is StreamHealth.STALE
-                assert stream.lag_seconds is None
+                assert stream.health is StreamHealth.HEALTHY
+                assert stream.lag_seconds is not None
+                assert stream.lag_seconds < 1.0
         _run(_test())
 
     def test_healthy_after_message(self):
@@ -940,9 +941,10 @@ class TestHealthSnapshot:
         async def _test():
             async with NeptuneStream() as stream:
                 snap = stream.health_snapshot()
-                assert snap["health"] == "stale"
+                assert snap["health"] == "healthy"
                 assert snap["running"] is True
-                assert snap["lag_seconds"] is None
+                assert snap["lag_seconds"] is not None
+                assert snap["lag_seconds"] < 1.0
                 assert snap["source"] == "aisstream"
                 assert "messages_received" in snap
                 assert "dedup_rate" in snap

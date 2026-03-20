@@ -15,6 +15,27 @@ import polars as pl
 
 
 # ---------------------------------------------------------------------------
+# AIS protocol constants — shared across adapters
+# ---------------------------------------------------------------------------
+
+AIS_NAV_STATUS: dict[int, str] = {
+    0: "Under way using engine",
+    1: "At anchor",
+    2: "Not under command",
+    3: "Restricted maneuverability",
+    4: "Constrained by draught",
+    5: "Moored",
+    6: "Aground",
+    7: "Engaged in fishing",
+    8: "Under way sailing",
+    9: "Reserved for HSC",
+    10: "Reserved for WIG",
+    14: "AIS-SART",
+    15: "Not defined",
+}
+
+
+# ---------------------------------------------------------------------------
 # Fetch specification — what to download
 # ---------------------------------------------------------------------------
 
@@ -89,44 +110,94 @@ def download_and_hash(
     overwrite: bool = False,
     content_type: str | None = None,
     headers: dict[str, str] | None = None,
+    retries: int = 3,
 ) -> RawArtifact:
     """Download a file and return a RawArtifact with its SHA-256 hash.
 
     Shared by all HTTP-based adapters. Handles caching (skip if exists
-    and not overwrite), streaming download, and hash computation.
+    and not overwrite), streaming download with retries, and hash
+    computation.
 
     Args:
         headers: Optional HTTP headers (e.g. for API key authentication).
+        retries: Number of retry attempts for transient network errors.
     """
     import hashlib
     import logging
+    import time
 
     import httpx
 
     logger = logging.getLogger(__name__)
 
+    content_hash: str | None = None
+
     if dest.exists() and not overwrite:
         logger.info("Using cached raw file: %s", dest)
     else:
-        logger.info("Downloading %s → %s", url, dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.stream("GET", url, follow_redirects=True, headers=headers or {}) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_bytes(chunk_size=8192):
-                    f.write(chunk)
-        logger.info("Downloaded %s (%d bytes)", dest.name, dest.stat().st_size)
+        partial = dest.with_suffix(dest.suffix + ".partial")
 
-    sha256 = hashlib.sha256()
-    with open(dest, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            sha256.update(chunk)
+        timeout = httpx.Timeout(connect=30, read=120, write=30, pool=30)
+        last_exc: Exception | None = None
+        max_wait = 60
+
+        for attempt in range(1, retries + 1):
+            logger.info(
+                "Downloading %s → %s (attempt %d/%d)", url, dest, attempt, retries,
+            )
+            try:
+                sha256 = hashlib.sha256()
+                size_bytes = 0
+                with httpx.stream(
+                    "GET", url,
+                    follow_redirects=True,
+                    headers=headers or {},
+                    timeout=timeout,
+                ) as resp:
+                    resp.raise_for_status()
+                    with open(partial, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                            sha256.update(chunk)
+                            size_bytes += len(chunk)
+                partial.rename(dest)
+                content_hash = sha256.hexdigest()
+                logger.info("Downloaded %s (%d bytes)", dest.name, size_bytes)
+                break
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                last_exc = exc
+                partial.unlink(missing_ok=True)
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code < 500
+                ):
+                    raise  # 4xx errors are not transient
+                logger.warning(
+                    "Download failed (attempt %d/%d): %s", attempt, retries, exc,
+                )
+                if attempt < retries:
+                    wait = min(2 ** attempt, max_wait)
+                    logger.warning("Retrying in %ds", wait)
+                    time.sleep(wait)
+        else:
+            raise RuntimeError(
+                f"Download failed after {retries} attempts ({last_exc}): {url}"
+            ) from last_exc
+
+    # For cache hits, hash must be computed from the existing file.
+    if content_hash is None:
+        sha256 = hashlib.sha256()
+        with open(dest, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        content_hash = sha256.hexdigest()
 
     return RawArtifact(
         source_url=url,
         filename=dest.name,
         local_path=str(dest),
-        content_hash=sha256.hexdigest(),
+        content_hash=content_hash,
         size_bytes=dest.stat().st_size,
         fetch_timestamp=datetime.now(timezone.utc),
         content_type=content_type,

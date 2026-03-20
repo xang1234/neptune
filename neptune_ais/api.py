@@ -119,6 +119,7 @@ class Neptune:
         cache_dir: str | Path | None = None,
         raw_policy: str | RawPolicy = "metadata",
         overwrite: bool = False,
+        api_keys: dict[str, str] | None = None,
     ) -> None:
         from neptune_ais.fusion import FusionConfig, parse_merge_arg
 
@@ -135,6 +136,7 @@ class Neptune:
             RawPolicy(raw_policy) if isinstance(raw_policy, str) else raw_policy
         )
         self._overwrite = overwrite
+        self._api_keys = api_keys or {}
 
         # Catalog registry — loaded lazily on first access.
         self._registry: CatalogRegistry | None = None
@@ -195,9 +197,12 @@ class Neptune:
         for source_id in self._sources:
             adapter = get_adapter(source_id)
 
+            # Pass API key if provided.
+            if source_id in self._api_keys and hasattr(adapter, '_api_key'):
+                adapter._api_key = self._api_keys[source_id]
+
             for target_date in self._dates:
-                partition_key = f"positions/{source_id}/{target_date}"
-                logger.info("Processing %s", partition_key)
+                logger.info("Processing %s/%s", source_id, target_date)
 
                 try:
                     # 1. Fetch raw artifacts.
@@ -215,158 +220,231 @@ class Neptune:
                     )
                     artifacts = adapter.fetch_raw(spec)
 
-                    # 2. Normalize to canonical positions.
-                    positions_df = adapter.normalize_positions(artifacts)
-
-                    # 3. Add pipeline-generated columns.
-                    ingest_id = str(uuid.uuid4())
-                    positions_df = positions_df.with_columns(
-                        pl.lit(artifacts[0].filename).alias("source_file"),
-                        pl.lit(ingest_id).alias("ingest_id"),
-                        pl.lit("ok").alias("qc_severity"),
-                        pl.lit(f"{source_id}:direct").alias("record_provenance"),
-                    )
-
-                    # 4. Sort for optimal Parquet layout.
-                    sort_cols = [
-                        c for c in SORT_ORDER_POSITIONS
-                        if c in positions_df.columns
-                    ]
-                    if sort_cols:
-                        positions_df = positions_df.sort(sort_cols)
-
-                    # 5. Write to canonical store via PartitionWriter.
-                    date_str = target_date.isoformat()
-                    writer = PartitionWriter(
-                        self._store_root, "positions", source_id, date_str
-                    )
-
+                    # 2. Normalize to canonical positions (if supported).
+                    positions_df = None
                     try:
-                        staging = writer.prepare()
-                    except Exception:
-                        # Stale staging — abort and retry.
-                        writer.abort()
-                        staging = writer.prepare()
-
-                    # Shard if necessary.
-                    n_rows = len(positions_df)
-                    shard_files: list[str] = []
-
-                    if n_rows <= DEFAULT_MAX_ROWS_PER_SHARD:
-                        shard_file = shard_filename(0)
-                        positions_df.write_parquet(
-                            staging / shard_file,
-                            compression=PARQUET_COMPRESSION,
-                            compression_level=PARQUET_COMPRESSION_LEVEL,
-                            row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                            statistics=PARQUET_WRITE_STATISTICS,
+                        positions_df = adapter.normalize_positions(artifacts)
+                    except NotImplementedError:
+                        logger.info(
+                            "%s does not provide positions, skipping",
+                            source_id,
                         )
-                        shard_files.append(shard_file)
-                    else:
-                        shard_idx = 0
-                        for offset in range(0, n_rows, DEFAULT_MAX_ROWS_PER_SHARD):
-                            shard_df = positions_df.slice(
-                                offset, DEFAULT_MAX_ROWS_PER_SHARD
+
+                    if positions_df is not None:
+                        # 3. Add pipeline-generated columns.
+                        ingest_id = str(uuid.uuid4())
+                        positions_df = positions_df.with_columns(
+                            pl.lit(artifacts[0].filename).alias("source_file"),
+                            pl.lit(ingest_id).alias("ingest_id"),
+                            pl.lit("ok").alias("qc_severity"),
+                            pl.lit(f"{source_id}:direct").alias("record_provenance"),
+                        )
+
+                        written.extend(
+                            self._write_partition(
+                                "positions", source_id, target_date,
+                                positions_df, artifacts, adapter,
                             )
-                            shard_file = shard_filename(shard_idx)
-                            shard_df.write_parquet(
-                                staging / shard_file,
-                                compression=PARQUET_COMPRESSION,
-                                compression_level=PARQUET_COMPRESSION_LEVEL,
-                                row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                                statistics=PARQUET_WRITE_STATISTICS,
+                        )
+
+                    # 2b. Normalize events (if adapter provides them).
+                    if hasattr(adapter, "normalize_events"):
+                        events_df = adapter.normalize_events(artifacts)
+                        if events_df is not None and len(events_df) > 0:
+                            written.extend(
+                                self._write_partition(
+                                    "events", source_id, target_date,
+                                    events_df, artifacts, adapter,
+                                )
                             )
-                            shard_files.append(shard_file)
-                            shard_idx += 1
 
-                    # 6. Validate.
-                    writer.validate(expected_files=shard_files)
-
-                    # 7. Build manifest.
-                    catalog_artifacts = [
-                        CatalogRawArtifact(
-                            source_url=a.source_url,
-                            filename=a.filename,
-                            content_hash=a.content_hash,
-                            size_bytes=a.size_bytes,
-                            fetch_timestamp=a.fetch_timestamp,
-                            content_type=a.content_type,
-                            local_path=(
-                                a.local_path
-                                if self._raw_policy == RawPolicy.FULL
-                                else None
-                            ),
-                            headers=a.headers,
-                        )
-                        for a in artifacts
-                    ]
-
-                    # Compute stats for manifest.
-                    lat_col = "lat" if "lat" in positions_df.columns else None
-                    lon_col = "lon" if "lon" in positions_df.columns else None
-                    bbox = None
-                    if lat_col and lon_col:
-                        bbox = BBox(
-                            west=positions_df[lon_col].min(),
-                            south=positions_df[lat_col].min(),
-                            east=positions_df[lon_col].max(),
-                            north=positions_df[lat_col].max(),
-                        )
-
-                    ts_col = "timestamp"
-                    min_ts = positions_df[ts_col].min()
-                    max_ts = positions_df[ts_col].max()
-
-                    distinct_mmsi = positions_df["mmsi"].n_unique()
-
-                    manifest = Manifest(
-                        dataset="positions",
-                        source=source_id,
-                        date=date_str,
-                        schema_version=current_schema_version("positions"),
-                        adapter_version=getattr(
-                            adapter, "ADAPTER_VERSION",
-                            f"{source_id}/unknown",
-                        ),
-                        transform_version="normalize/0.1.0",
-                        files=shard_files,
-                        raw_artifacts=catalog_artifacts,
-                        raw_policy=self._raw_policy,
-                        record_count=n_rows,
-                        distinct_mmsi_count=distinct_mmsi,
-                        min_timestamp=min_ts,
-                        max_timestamp=max_ts,
-                        bbox=bbox,
-                        qc_summary=QCSummary(
-                            total_rows=n_rows,
-                            rows_ok=n_rows,
-                            rows_warning=0,
-                            rows_error=0,
-                            rows_dropped=0,
-                        ),
-                        write_status=WriteStatus.COMMITTED,
-                    )
-
-                    # 8. Commit.
-                    writer.commit(
-                        manifest_json=manifest.model_dump_json(indent=2)
-                    )
-
-                    written.append(partition_key)
-                    logger.info(
-                        "Wrote %s: %d rows, %d MMSIs",
-                        partition_key, n_rows, distinct_mmsi,
-                    )
+                    # 2c. Normalize fishing effort (if adapter provides it).
+                    if hasattr(adapter, "normalize_fishing_effort"):
+                        effort_df = adapter.normalize_fishing_effort(artifacts)
+                        if effort_df is not None and len(effort_df) > 0:
+                            written.extend(
+                                self._write_partition(
+                                    "fishing_effort", source_id, target_date,
+                                    effort_df, artifacts, adapter,
+                                )
+                            )
 
                 except Exception:
-                    logger.exception("Failed to process %s", partition_key)
-                    # Clean up staging if it was created.
-                    if "writer" in locals():
-                        writer.abort()
+                    logger.exception(
+                        "Failed to process %s/%s", source_id, target_date,
+                    )
 
         # Re-scan catalog after writes.
         self._rescan()
         return written
+
+    def _write_partition(
+        self,
+        dataset: str,
+        source_id: str,
+        target_date: date,
+        df: pl.DataFrame,
+        artifacts: list,
+        adapter,
+    ) -> list[str]:
+        """Write a normalized DataFrame to the canonical store.
+
+        Handles sharding, manifest creation, and atomic commit via
+        PartitionWriter. Returns a list of partition keys written.
+        """
+        date_str = target_date.isoformat()
+        partition_key = f"{dataset}/{source_id}/{target_date}"
+
+        # Sort for optimal Parquet layout.
+        sort_cols = [
+            c for c in SORT_ORDER_POSITIONS
+            if c in df.columns
+        ]
+        if sort_cols:
+            df = df.sort(sort_cols)
+
+        writer = PartitionWriter(
+            self._store_root, dataset, source_id, date_str
+        )
+
+        try:
+            try:
+                staging = writer.prepare()
+            except Exception:
+                writer.abort()
+                staging = writer.prepare()
+
+            n_rows = len(df)
+            shard_files: list[str] = []
+
+            if n_rows <= DEFAULT_MAX_ROWS_PER_SHARD:
+                sf = shard_filename(0)
+                df.write_parquet(
+                    staging / sf,
+                    compression=PARQUET_COMPRESSION,
+                    compression_level=PARQUET_COMPRESSION_LEVEL,
+                    row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                    statistics=PARQUET_WRITE_STATISTICS,
+                )
+                shard_files.append(sf)
+            else:
+                shard_idx = 0
+                for offset in range(0, n_rows, DEFAULT_MAX_ROWS_PER_SHARD):
+                    shard_df = df.slice(offset, DEFAULT_MAX_ROWS_PER_SHARD)
+                    sf = shard_filename(shard_idx)
+                    shard_df.write_parquet(
+                        staging / sf,
+                        compression=PARQUET_COMPRESSION,
+                        compression_level=PARQUET_COMPRESSION_LEVEL,
+                        row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                        statistics=PARQUET_WRITE_STATISTICS,
+                    )
+                    shard_files.append(sf)
+                    shard_idx += 1
+
+            writer.validate(expected_files=shard_files)
+
+            catalog_artifacts = [
+                CatalogRawArtifact(
+                    source_url=a.source_url,
+                    filename=a.filename,
+                    content_hash=a.content_hash,
+                    size_bytes=a.size_bytes,
+                    fetch_timestamp=a.fetch_timestamp,
+                    content_type=a.content_type,
+                    local_path=(
+                        a.local_path
+                        if self._raw_policy == RawPolicy.FULL
+                        else None
+                    ),
+                    headers=a.headers,
+                )
+                for a in artifacts
+            ]
+
+            # Compute stats for manifest.
+            bbox = None
+            if "lat" in df.columns and "lon" in df.columns:
+                lat_min = df["lat"].drop_nulls().min()
+                lat_max = df["lat"].drop_nulls().max()
+                lon_min = df["lon"].drop_nulls().min()
+                lon_max = df["lon"].drop_nulls().max()
+                if all(v is not None for v in (lat_min, lat_max, lon_min, lon_max)):
+                    bbox = BBox(
+                        west=max(lon_min, -180.0),
+                        south=max(lat_min, -90.0),
+                        east=min(lon_max, 180.0),
+                        north=min(lat_max, 90.0),
+                    )
+
+            # Timestamp stats — try common column names.
+            min_ts = max_ts = None
+            for ts_col in ("timestamp", "start_time", "date"):
+                if ts_col in df.columns:
+                    raw_min = df[ts_col].min()
+                    raw_max = df[ts_col].max()
+                    # Convert date → datetime if needed (Manifest requires datetime).
+                    if isinstance(raw_min, date) and not isinstance(raw_min, datetime):
+                        from datetime import time as time_cls
+                        raw_min = datetime.combine(raw_min, time_cls.min, tzinfo=timezone.utc)
+                        raw_max = datetime.combine(raw_max, time_cls.max, tzinfo=timezone.utc)
+                    min_ts = raw_min
+                    max_ts = raw_max
+                    break
+
+            # Fallback: use target_date if no timestamp column found.
+            if min_ts is None:
+                from datetime import time as time_cls
+                min_ts = datetime.combine(target_date, time_cls.min, tzinfo=timezone.utc)
+                max_ts = datetime.combine(target_date, time_cls.max, tzinfo=timezone.utc)
+
+            distinct_mmsi = (
+                df["mmsi"].n_unique()
+                if "mmsi" in df.columns
+                else 0
+            )
+
+            manifest = Manifest(
+                dataset=dataset,
+                source=source_id,
+                date=date_str,
+                schema_version=current_schema_version(dataset),
+                adapter_version=getattr(
+                    adapter, "ADAPTER_VERSION",
+                    f"{source_id}/unknown",
+                ),
+                transform_version="normalize/0.1.0",
+                files=shard_files,
+                raw_artifacts=catalog_artifacts,
+                raw_policy=self._raw_policy,
+                record_count=n_rows,
+                distinct_mmsi_count=distinct_mmsi,
+                min_timestamp=min_ts,
+                max_timestamp=max_ts,
+                bbox=bbox,
+                qc_summary=QCSummary(
+                    total_rows=n_rows,
+                    rows_ok=n_rows,
+                    rows_warning=0,
+                    rows_error=0,
+                    rows_dropped=0,
+                ),
+                write_status=WriteStatus.COMMITTED,
+            )
+
+            writer.commit(
+                manifest_json=manifest.model_dump_json(indent=2)
+            )
+        except Exception:
+            writer.abort()
+            raise
+
+        logger.info(
+            "Wrote %s: %d rows%s",
+            partition_key, n_rows,
+            f", {distinct_mmsi} MMSIs" if distinct_mmsi else "",
+        )
+        return [partition_key]
 
     # --- Polars lazy accessors ---
 
@@ -613,6 +691,24 @@ class Neptune:
             extra_columns="ignore",
         )
 
+    def fishing_effort(self) -> pl.LazyFrame:
+        """Return fishing effort data as a Polars LazyFrame.
+
+        Scans all committed fishing effort partitions matching the
+        configured dates and sources.
+        """
+        from neptune_ais.datasets.fishing_effort import SCHEMA
+
+        files = self._dataset_files("fishing_effort")
+        if not files:
+            return pl.DataFrame(schema=SCHEMA).lazy()
+
+        return pl.scan_parquet(
+            files,
+            missing_columns="insert",
+            extra_columns="ignore",
+        )
+
     # --- DuckDB access ---
 
     def duckdb(self):
@@ -626,7 +722,7 @@ class Neptune:
 
         con = duckdb.connect()
 
-        for dataset_name in ("positions", "vessels", "tracks", "events"):
+        for dataset_name in ("positions", "vessels", "tracks", "events", "fishing_effort"):
             files = self._dataset_files(dataset_name)
             if files:
                 file_list = ", ".join(f"'{f}'" for f in files)

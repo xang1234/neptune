@@ -47,7 +47,7 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 
 ## Key Features
 
-- **Multi-source ingestion** — Download from NOAA, DMA, Global Fishing Watch, Finland, AISHub, and AISStream through one API
+- **Multi-source ingestion** — Download from NOAA, DMA, AISHub through one API, ingest GFW fishing events and effort grids, and stream from AISStream and Finland (Digitraffic)
 - **Automatic normalization** — Every source is normalized to a canonical schema with QC scoring and provenance tracking
 - **Multi-source fusion** — Merge overlapping sources with configurable dedup strategies (`best`, `union`, `prefer:<source>`)
 - **Polars-native** — Query positions, vessels, tracks, and events as lazy DataFrames with full predicate pushdown
@@ -92,9 +92,10 @@ pip install neptune-ais[all]
 | `sql` | duckdb | `Neptune.sql()`, `Neptune.duckdb()`, `DuckDBSink` |
 | `parquet` | pyarrow | Full Parquet write options (compression, statistics) |
 | `geo` | shapely, geopandas, movingpandas, lonboard, h3 | Boundary lookups, GeoDataFrame bridges, maps |
-| `stream` | websockets | `NeptuneStream`, live AIS feeds |
+| `stream` | websockets, aiomqtt | `NeptuneStream`, live AIS feeds |
 | `cli` | click, rich | `neptune` console commands |
-| `dev` | pytest, mypy, ruff, coverage | Development and testing |
+| `notebooks` | jupyter, ipykernel | Interactive notebook examples |
+| `dev` | pytest, mypy, ruff, coverage, nbstripout | Development and testing |
 | `all` | All of the above (except dev) | Full-featured install |
 
 </details>
@@ -180,7 +181,7 @@ config = StreamConfig(
 async def ingest():
     sink = ParquetSink("/tmp/neptune_landing", source="aisstream")
     async with NeptuneStream(config=config) as stream:
-        await stream.run_sink(sink, max_messages=10_000)
+        await stream.run(sink, max_messages=10_000)
     # Promote to canonical storage
     promote_landing("/tmp/neptune_landing", store_root="~/.neptune", source="aisstream")
 
@@ -195,8 +196,8 @@ Neptune includes adapters for six open AIS data providers, with a plugin system 
 |---|---|---|---|---|---|
 | `noaa` | NOAA AIS Archive | US waters, global ATON | Daily files | None | Yes |
 | `dma` | Danish Maritime Authority | European waters | Daily files | None | Yes |
-| `gfw` | Global Fishing Watch | Global (satellite AIS) | Daily files | API key | Yes |
-| `finland` | Digitraffic Finland | Finnish waters | Epoch-based | None | Yes |
+| `gfw` | Global Fishing Watch | Global | Events API + 4Wings | API token | Yes (2020+) |
+| `finland` | Digitraffic Finland | Finnish waters | MQTT streaming | None | No (live only) |
 | `aishub` | AISHub | Global (variable quality) | Multiple feeds | API key | Yes |
 | `aisstream` | AISStream | Global (real-time) | WebSocket | API key | No (live only) |
 
@@ -343,7 +344,7 @@ Full Sphinx documentation is planned. In the meantime:
 
 | Resource | Description |
 |---|---|
-| [`examples/`](examples/) | Six narrative examples covering the full workflow |
+| [`examples/`](examples/) | Seven narrative examples covering the full workflow |
 | [HEURISTICS.md](HEURISTICS.md) | Event detection assumptions, confidence limits, non-goals |
 | [RELEASING.md](RELEASING.md) | Release procedures and checklist |
 | [RC_CHECKLIST.md](RC_CHECKLIST.md) | Release-candidate validation results |
@@ -352,12 +353,15 @@ Full Sphinx documentation is planned. In the meantime:
 
 | # | Example | Topics |
 |---|---|---|
-| 1 | [Source Discovery](examples/01_source_discovery.py) | Inspect sources, capabilities, filters |
-| 2 | [Archival Ingest](examples/02_archival_ingest.py) | Download, Polars queries, SQL, helpers |
-| 3 | [Multi-Source Fusion](examples/03_multi_source_fusion.py) | Merge strategies, fusion config |
-| 4 | [Event Detection](examples/04_event_detection.py) | Port calls, EEZ crossings, encounters |
-| 5 | [Streaming Pipeline](examples/05_streaming_pipeline.py) | Live feeds, sinks, promotion |
+| 1 | [Source Discovery](examples/01_source_discovery.ipynb) ([.py](examples/01_source_discovery.py)) | Inspect sources, capabilities, filters |
+| 2 | [Archival Ingest](examples/02_archival_ingest.ipynb) ([.py](examples/02_archival_ingest.py)) | Download, Polars queries, SQL, helpers |
+| 3 | [Multi-Source Fusion](examples/03_multi_source_fusion.ipynb) ([.py](examples/03_multi_source_fusion.py)) | Merge strategies, fusion config |
+| 4 | [Event Detection](examples/04_event_detection.ipynb) ([.py](examples/04_event_detection.py)) | Port calls, EEZ crossings, encounters |
+| 5 | [Streaming Pipeline](examples/05_streaming_pipeline.ipynb) ([.py](examples/05_streaming_pipeline.py)) | Live feeds, sinks, promotion |
 | 6 | [External Plugin](examples/06_external_plugin.py) | Custom adapter via entry point |
+| 7 | [Fishing Intelligence](examples/07_fishing_intelligence.ipynb) | GFW events, vessel identity, fishing effort grids |
+
+> **Tip:** Install notebook support with `pip install neptune-ais[notebooks]` to run the interactive examples.
 
 ## Contributing
 

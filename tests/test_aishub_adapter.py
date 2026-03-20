@@ -1,9 +1,12 @@
 """Tests for the AISHub community-sourced adapter.
 
 Covers: registration, capabilities, normalization, vessel extraction,
-scaling (SOG/COG/draught ÷ 10), sentinel handling (heading=511,
-IMO=0/empty/Unknown), dimension derivation (A+B=length, C+D=beam),
-variable-quality metadata, and SourceAdapter protocol conformance.
+sentinel handling (heading=511, IMO=0/empty/Unknown), dimension
+derivation (A+B=length, C+D=beam), variable-quality metadata, and
+SourceAdapter protocol conformance.
+
+Fixtures use real AISHub format=1 field names and values (SOG/COG in
+human-readable units, timestamps as "YYYY-MM-DD HH:MM:SS GMT").
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ import pytest
 
 from neptune_ais.adapters.aishub import (
     ADAPTER_VERSION,
-    AISHUB_SCALE_FACTOR,
     AISHubAdapter,
     COLUMN_MAP,
     IMO_UNAVAILABLE_VALUES,
@@ -34,15 +36,19 @@ from neptune_ais.adapters.base import FetchSpec, RawArtifact, SourceAdapter, Sou
 
 
 def _sample_records() -> list[dict]:
-    """Return sample AISHub API response records."""
+    """Return sample AISHub format=1 API response records.
+
+    Uses real field names (SOG/COG not SPEED/COURSE) and human-readable
+    values (no ×10 scaling). Timestamps match format=1 output.
+    """
     return [
         {
             "MMSI": 211000001,
-            "TIME": "2024-06-15T00:00:00Z",
+            "TIME": "2024-06-15 00:00:00 GMT",
             "LATITUDE": 53.5,
             "LONGITUDE": 9.9,
-            "SPEED": 55,       # 5.5 knots × 10
-            "COURSE": 1800,    # 180.0° × 10
+            "SOG": 5.5,
+            "COG": 180.0,
             "HEADING": 179,
             "NAME": "CONTAINER SHIP A",
             "IMO": "9876543",
@@ -52,18 +58,17 @@ def _sample_records() -> list[dict]:
             "B": 50,
             "C": 10,
             "D": 15,
-            "DRAUGHT": 85,     # 8.5m × 10
+            "DRAUGHT": 8.5,
             "DEST": "HAMBURG",
-            "FLAG": "DE",
             "NAVSTAT": 0,
         },
         {
             "MMSI": 211000002,
-            "TIME": "2024-06-15T00:01:00Z",
+            "TIME": "2024-06-15 00:01:00 GMT",
             "LATITUDE": 54.0,
             "LONGITUDE": 10.0,
-            "SPEED": 0,
-            "COURSE": 0,
+            "SOG": 0,
+            "COG": 0,
             "HEADING": 511,     # unavailable
             "NAME": "FISHING BOAT B",
             "IMO": "0",         # unavailable
@@ -73,18 +78,17 @@ def _sample_records() -> list[dict]:
             "B": 4,
             "C": 2,
             "D": 3,
-            "DRAUGHT": 30,
+            "DRAUGHT": 3.0,
             "DEST": "",
-            "FLAG": "DE",
             "NAVSTAT": 1,
         },
         {
             "MMSI": 211000003,
-            "TIME": "2024-06-15T00:02:00Z",
+            "TIME": "2024-06-15 00:02:00 GMT",
             "LATITUDE": 53.0,
             "LONGITUDE": 9.5,
-            "SPEED": 120,
-            "COURSE": 900,
+            "SOG": 12.0,
+            "COG": 90.0,
             "HEADING": 88,
             "NAME": "TANKER C",
             "IMO": "Unknown",   # unavailable
@@ -94,9 +98,8 @@ def _sample_records() -> list[dict]:
             "B": 100,
             "C": 20,
             "D": 25,
-            "DRAUGHT": 120,
+            "DRAUGHT": 12.0,
             "DEST": "ROTTERDAM",
-            "FLAG": "NL",
             "NAVSTAT": 5,
         },
     ]
@@ -231,21 +234,21 @@ class TestAISHubNormalization:
         df = AISHubAdapter().normalize_positions([_make_artifact(path)])
         assert df["mmsi"].dtype == pl.Int64
 
-    def test_sog_scaling(self, tmp_path):
-        """SOG ÷ 10: 55 → 5.5 knots."""
+    def test_sog_values(self, tmp_path):
+        """SOG is human-readable in format=1 (no scaling)."""
         path = _write_json(tmp_path)
         df = AISHubAdapter().normalize_positions([_make_artifact(path)])
         assert df["sog"][0] == pytest.approx(5.5)
         assert df["sog"][2] == pytest.approx(12.0)
 
-    def test_cog_scaling(self, tmp_path):
-        """COG ÷ 10: 1800 → 180.0°."""
+    def test_cog_values(self, tmp_path):
+        """COG is human-readable in format=1 (no scaling)."""
         path = _write_json(tmp_path)
         df = AISHubAdapter().normalize_positions([_make_artifact(path)])
         assert df["cog"][0] == pytest.approx(180.0)
 
-    def test_draught_scaling(self, tmp_path):
-        """Draught ÷ 10: 85 → 8.5m."""
+    def test_draught_values(self, tmp_path):
+        """Draught is human-readable in format=1 (no scaling)."""
         path = _write_json(tmp_path)
         df = AISHubAdapter().normalize_positions([_make_artifact(path)])
         assert df["draught"][0] == pytest.approx(8.5)
@@ -288,7 +291,7 @@ class TestAISHubNormalization:
         """IMO='' → null."""
         records = [{
             "MMSI": 211000001,
-            "TIME": "2024-06-15T00:00:00Z",
+            "TIME": "2024-06-15 00:00:00 GMT",
             "LATITUDE": 53.5,
             "LONGITUDE": 9.9,
             "IMO": "",
@@ -302,7 +305,7 @@ class TestAISHubNormalization:
         """A+B present but no C+D → length computed, no beam."""
         records = [{
             "MMSI": 211000001,
-            "TIME": "2024-06-15T00:00:00Z",
+            "TIME": "2024-06-15 00:00:00 GMT",
             "LATITUDE": 53.5,
             "LONGITUDE": 9.9,
             "A": 100,
@@ -321,7 +324,7 @@ class TestAISHubNormalization:
         """Records without A/B/C/D fields don't break normalization."""
         records = [{
             "MMSI": 211000001,
-            "TIME": "2024-06-15T00:00:00Z",
+            "TIME": "2024-06-15 00:00:00 GMT",
             "LATITUDE": 53.5,
             "LONGITUDE": 9.9,
         }]
@@ -331,11 +334,6 @@ class TestAISHubNormalization:
         assert len(df) == 1
         assert "length" not in df.columns
         assert "beam" not in df.columns
-
-    def test_flag_preserved(self, tmp_path):
-        path = _write_json(tmp_path)
-        df = AISHubAdapter().normalize_positions([_make_artifact(path)])
-        assert df["flag"][0] == "DE"
 
     def test_nav_status_as_string(self, tmp_path):
         path = _write_json(tmp_path)

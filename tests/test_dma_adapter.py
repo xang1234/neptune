@@ -77,8 +77,11 @@ def _create_dma_csv(path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _create_noaa_parquet_with_shared_vessel(path: Path) -> None:
-    """Write synthetic NOAA data with the shared vessel for fusion tests."""
+def _create_noaa_zip_with_shared_vessel(path: Path) -> None:
+    """Write synthetic NOAA data as CSV-in-ZIP for fusion tests."""
+    import io
+    import zipfile
+
     df = pl.DataFrame({
         "MMSI": [SHARED_MMSI, SHARED_MMSI, 123456789],
         "BaseDateTime": [
@@ -101,7 +104,10 @@ def _create_noaa_parquet_with_shared_vessel(path: Path) -> None:
         "Draft": [5.0, 5.0, 8.0],
     })
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(path)
+    csv_buf = io.BytesIO()
+    df.write_csv(csv_buf)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("AIS_2024_06_15.csv", csv_buf.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +251,12 @@ def test_dma_noaa_schema_compatibility():
         dma_df = DMAAdapter().normalize_positions([dma_art])
 
         # NOAA data.
-        noaa_pq = Path(tmp) / "noaa.parquet"
-        _create_noaa_parquet_with_shared_vessel(noaa_pq)
+        noaa_zip = Path(tmp) / "noaa.zip"
+        _create_noaa_zip_with_shared_vessel(noaa_zip)
         noaa_art = RawArtifact(
-            source_url="test://", filename="noaa.parquet",
-            local_path=str(noaa_pq), content_hash="noaa",
-            size_bytes=noaa_pq.stat().st_size,
+            source_url="test://", filename="noaa.zip",
+            local_path=str(noaa_zip), content_hash="noaa",
+            size_bytes=noaa_zip.stat().st_size,
             fetch_timestamp=datetime.now(timezone.utc),
         )
         noaa_df = NOAAAdapter().normalize_positions([noaa_art])
@@ -326,17 +332,17 @@ def test_dma_multi_source_catalog():
         w1.commit(manifest_json=m1.model_dump_json(indent=2))
 
         # Write NOAA partition.
-        noaa_pq = store / "raw" / "noaa.parquet"
-        _create_noaa_parquet_with_shared_vessel(noaa_pq)
+        noaa_zip = store / "raw" / "noaa.zip"
+        _create_noaa_zip_with_shared_vessel(noaa_zip)
         noaa_art = RawArtifact(
-            source_url="test://", filename="noaa.parquet",
-            local_path=str(noaa_pq), content_hash="noaa",
-            size_bytes=noaa_pq.stat().st_size,
+            source_url="test://", filename="noaa.zip",
+            local_path=str(noaa_zip), content_hash="noaa",
+            size_bytes=noaa_zip.stat().st_size,
             fetch_timestamp=datetime.now(timezone.utc),
         )
         noaa_df = NOAAAdapter().normalize_positions([noaa_art])
         noaa_df = noaa_df.with_columns(
-            pl.lit("noaa.parquet").alias("source_file"),
+            pl.lit("noaa.zip").alias("source_file"),
             pl.lit("batch-noaa").alias("ingest_id"),
             pl.lit("ok").alias("qc_severity"),
             pl.lit("noaa:direct").alias("record_provenance"),

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import random
@@ -261,6 +262,7 @@ class NeptuneStream:
         )
         self._dedup_set: set[tuple] = set()
         self._running = False
+        self._start_time: float | None = None
         self._last_message_time: float | None = None
         self._message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
             maxsize=self._config.max_queue_size
@@ -283,10 +285,16 @@ class NeptuneStream:
 
     @property
     def lag_seconds(self) -> float | None:
-        """Seconds since the last message was received, or None if no messages yet."""
-        if self._last_message_time is None:
-            return None
-        return time.monotonic() - self._last_message_time
+        """Seconds since the last message was received.
+
+        Before any messages arrive, measures time since the stream started.
+        Returns None only if the stream has never been started.
+        """
+        if self._last_message_time is not None:
+            return time.monotonic() - self._last_message_time
+        if self._start_time is not None:
+            return time.monotonic() - self._start_time
+        return None
 
     def _health_from_lag(self, lag: float | None) -> StreamHealth:
         """Derive health state from a lag value."""
@@ -332,6 +340,7 @@ class NeptuneStream:
 
     async def __aenter__(self) -> NeptuneStream:
         self._running = True
+        self._start_time = time.monotonic()
         logger.info(
             "NeptuneStream started: source=%s", self._config.source
         )
@@ -459,6 +468,75 @@ class NeptuneStream:
         finally:
             await sink.flush()
             await sink.close()
+
+    async def run(
+        self,
+        sink: StreamSink | None = None,
+        *,
+        max_messages: int | None = None,
+    ) -> None:
+        """Run the stream end-to-end: connect source and optionally pipe to a sink.
+
+        Resolves the connect function for the configured source, then runs
+        the connection with automatic reconnection. If a sink is provided,
+        the connection and sink run concurrently via ``TaskGroup``.
+
+        Args:
+            sink: Optional output sink. If None, messages are available
+                via the async iterator interface.
+            max_messages: Stop the sink after this many messages.
+        """
+        connect_fn = _get_connect_fn(self)
+        if sink is not None:
+            async with asyncio.TaskGroup() as tg:
+                connect_task = tg.create_task(run_with_reconnect(self, connect_fn))
+
+                async def _sink_then_stop():
+                    try:
+                        await self.run_sink(sink, max_messages=max_messages)
+                    finally:
+                        # Signal the connect loop to stop so TaskGroup can exit.
+                        self._running = False
+
+                tg.create_task(_sink_then_stop())
+        else:
+            await run_with_reconnect(self, connect_fn)
+
+
+# ---------------------------------------------------------------------------
+# Source dispatcher — resolves config.source → connect_fn
+# ---------------------------------------------------------------------------
+
+
+def _get_connect_fn(stream: NeptuneStream):
+    """Resolve the connect function for the configured source.
+
+    Returns a zero-argument async callable that connects to the source
+    and feeds messages into the stream.
+
+    Raises:
+        ValueError: If no streaming connector exists for the source.
+    """
+    source = stream.config.source
+
+    if source == "aisstream":
+        from neptune_ais.adapters.aisstream import connect_and_stream
+        return functools.partial(
+            connect_and_stream, stream,
+            api_key=stream.config.api_key,
+            bbox=stream.config.bbox,
+        )
+    elif source == "finland":
+        from neptune_ais.adapters.finland import connect_and_stream
+        return functools.partial(
+            connect_and_stream, stream,
+            bbox=stream.config.bbox,
+        )
+    else:
+        raise ValueError(
+            f"No streaming connector for source={source!r}. "
+            f"Available: 'aisstream', 'finland'"
+        )
 
 
 # ---------------------------------------------------------------------------

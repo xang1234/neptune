@@ -12,13 +12,13 @@ Coverage: Global terrestrial (dependent on community receiver network).
 Delivery: REST API returning CSV or XML, API key required.
 Latency: Near real-time for latest positions.
 
-Raw column mapping (AISHub → canonical):
+Raw column mapping (AISHub format=1 → canonical):
     MMSI → mmsi (Int64)
-    TIME → timestamp (Datetime, ISO-8601)
+    TIME → timestamp (Datetime, "YYYY-MM-DD HH:MM:SS GMT")
     LATITUDE → lat (Float64)
     LONGITUDE → lon (Float64)
-    SPEED → sog (Float64, knots × 10 → knots)
-    COURSE → cog (Float64, degrees × 10 → degrees)
+    SOG → sog (Float64, knots, already human-readable in format=1)
+    COG → cog (Float64, degrees, already human-readable in format=1)
     HEADING → heading (Float64, 511 → null)
     NAME → vessel_name (String)
     IMO → imo (String, "0" → null)
@@ -26,9 +26,8 @@ Raw column mapping (AISHub → canonical):
     TYPE → ship_type (String, numeric → string)
     A + B → length (Float64, meters, derived from A+B)
     C + D → beam (Float64, meters, derived from C+D)
-    DRAUGHT → draught (Float64, meters × 10 → meters)
+    DRAUGHT → draught (Float64, meters, already human-readable in format=1)
     DEST → destination (String)
-    FLAG → flag (String, ISO country code)
     NAVSTAT → nav_status (String, numeric → string)
 """
 
@@ -36,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -68,8 +68,8 @@ COLUMN_MAP: dict[str, str] = {
     "TIME": "timestamp",
     "LATITUDE": "lat",
     "LONGITUDE": "lon",
-    "SPEED": "sog",
-    "COURSE": "cog",
+    "SOG": "sog",
+    "COG": "cog",
     "HEADING": "heading",
     "NAME": "vessel_name",
     "IMO": "imo",
@@ -77,7 +77,6 @@ COLUMN_MAP: dict[str, str] = {
     "TYPE": "ship_type",
     "DRAUGHT": "draught",
     "DEST": "destination",
-    "FLAG": "flag",
     "NAVSTAT": "nav_status",
     "A": "_dim_a",
     "B": "_dim_b",
@@ -89,8 +88,11 @@ COLUMN_MAP: dict[str, str] = {
 HEADING_UNAVAILABLE = 511.0
 IMO_UNAVAILABLE_VALUES = {"0", "", "Unknown"}
 
-# AISHub scales SOG/COG/draught by 10 (same as raw AIS encoding).
-AISHUB_SCALE_FACTOR = 10.0
+# Note: with format=1, AISHub returns human-readable values for
+# SOG (knots), COG (degrees), and DRAUGHT (meters). No scaling needed.
+
+# AISHub format=1 timestamp format (after stripping " GMT" suffix).
+AISHUB_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +135,7 @@ class AISHubAdapter:
         api_key: str = "",
     ) -> None:
         self._download_dir = download_dir
-        self._api_key = api_key
+        self._api_key = api_key or os.environ.get("AISHUB_API_KEY", "")
 
     @property
     def source_id(self) -> str:
@@ -166,8 +168,6 @@ class AISHubAdapter:
             typical_daily_rows="50K-500K",
             known_quirks=[
                 "Community-sourced: variable receiver quality and coverage",
-                "SPEED/COURSE are × 10 (raw AIS encoding, divide by 10)",
-                "DRAUGHT is × 10 (divide by 10)",
                 "Heading=511 means unavailable (normalized to null)",
                 "IMO='0' or empty means unavailable (normalized to null)",
                 "Dimensions A+B=length, C+D=beam (derived fields)",
@@ -256,7 +256,7 @@ class AISHubAdapter:
             # Derive length and beam from dimension fields if present.
             df = self._derive_dimensions(df)
 
-            # Type casting, scaling, and sentinel normalization.
+            # Type casting and sentinel normalization.
             df = self._cast_and_normalize(df)
 
             frames.append(df)
@@ -277,7 +277,7 @@ class AISHubAdapter:
         """AISHub-specific QC rules.
 
         AISHub data has higher quality variance than institutional
-        sources. Scaling and sentinels are handled during normalization.
+        sources. Sentinels are handled during normalization.
         Known quirks (clock drift, GPS anomalies) are documented in
         capabilities but not automatically correctable.
         """
@@ -316,7 +316,7 @@ class AISHubAdapter:
 
     @staticmethod
     def _cast_and_normalize(df: pl.DataFrame) -> pl.DataFrame:
-        """Apply type casts, scaling, and sentinel normalization."""
+        """Apply type casts and sentinel normalization."""
         exprs: list[pl.Expr] = []
 
         for col_name in df.columns:
@@ -325,19 +325,14 @@ class AISHubAdapter:
             if col_name == "mmsi":
                 exprs.append(col.cast(pl.Int64, strict=False))
             elif col_name == "timestamp":
+                # AISHub format=1: "2021-07-09 08:06:53 GMT"
                 exprs.append(
-                    col.str.to_datetime(
-                        "%Y-%m-%dT%H:%M:%S%#z", strict=False
-                    ).cast(pl.Datetime("us", "UTC"))
+                    col.str.strip_suffix(" GMT")
+                    .str.to_datetime(AISHUB_TIMESTAMP_FORMAT, strict=False)
+                    .cast(pl.Datetime("us", "UTC"))
                 )
-            elif col_name in ("lat", "lon"):
+            elif col_name in ("lat", "lon", "sog", "cog", "draught", "length", "beam"):
                 exprs.append(col.cast(pl.Float64, strict=False))
-            elif col_name in ("sog", "cog", "draught"):
-                # AISHub sends SOG/COG/draught × 10 (raw AIS encoding).
-                exprs.append(
-                    (col.cast(pl.Float64, strict=False) / AISHUB_SCALE_FACTOR)
-                    .alias(col_name)
-                )
             elif col_name == "heading":
                 # 511 = not available → null.
                 float_col = col.cast(pl.Float64, strict=False)
@@ -347,8 +342,6 @@ class AISHubAdapter:
                     .otherwise(float_col)
                     .alias("heading")
                 )
-            elif col_name in ("length", "beam"):
-                exprs.append(col.cast(pl.Float64, strict=False))
             elif col_name == "imo":
                 # "0", "", "Unknown" mean unavailable → null.
                 str_col = col.cast(pl.String, strict=False)

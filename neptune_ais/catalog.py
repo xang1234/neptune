@@ -307,6 +307,7 @@ KNOWN_SCHEMA_VERSIONS: dict[str, list[str]] = {
     "vessels": ["vessels/v1"],
     "tracks": ["tracks/v1"],
     "events": ["events/v1"],
+    "fishing_effort": ["fishing_effort/v1"],
 }
 """Registry of known schema versions per dataset.
 

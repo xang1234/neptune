@@ -114,9 +114,9 @@ class TestEventTypes:
         assert EVENT_TYPE_LOITERING == "loitering"
 
     def test_event_types_frozenset(self):
-        assert len(EVENT_TYPES) == 4
+        assert len(EVENT_TYPES) == 5
         assert EVENT_TYPES == {
-            "port_call", "eez_crossing", "encounter", "loitering",
+            "port_call", "eez_crossing", "encounter", "loitering", "fishing",
         }
 
 

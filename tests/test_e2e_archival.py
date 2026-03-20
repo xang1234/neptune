@@ -43,8 +43,11 @@ from neptune_ais.storage import (
 )
 
 
-def _create_synthetic_noaa_parquet(path: Path) -> None:
-    """Write a synthetic NOAA-format Parquet file."""
+def _create_synthetic_noaa_zip(path: Path) -> None:
+    """Write a synthetic NOAA-format CSV-in-ZIP file."""
+    import io
+    import zipfile
+
     df = pl.DataFrame(
         {
             "MMSI": [123456789, 123456789, 123456789, 987654321, 987654321],
@@ -71,18 +74,21 @@ def _create_synthetic_noaa_parquet(path: Path) -> None:
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(path)
+    csv_buf = io.BytesIO()
+    df.write_csv(csv_buf)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("AIS_2024_06_15.csv", csv_buf.getvalue())
 
 
 def test_noaa_normalize_positions():
     """Test that NOAA normalization produces valid canonical positions."""
     with tempfile.TemporaryDirectory() as tmp:
-        raw_path = Path(tmp) / "test.parquet"
-        _create_synthetic_noaa_parquet(raw_path)
+        raw_path = Path(tmp) / "test.zip"
+        _create_synthetic_noaa_zip(raw_path)
 
         artifact = RawArtifact(
             source_url="test://",
-            filename="test.parquet",
+            filename="test.zip",
             local_path=str(raw_path),
             content_hash="test",
             size_bytes=raw_path.stat().st_size,
@@ -111,12 +117,12 @@ def test_noaa_normalize_positions():
 def test_noaa_normalize_vessels():
     """Test vessel extraction from NOAA position data."""
     with tempfile.TemporaryDirectory() as tmp:
-        raw_path = Path(tmp) / "test.parquet"
-        _create_synthetic_noaa_parquet(raw_path)
+        raw_path = Path(tmp) / "test.zip"
+        _create_synthetic_noaa_zip(raw_path)
 
         artifact = RawArtifact(
             source_url="test://",
-            filename="test.parquet",
+            filename="test.zip",
             local_path=str(raw_path),
             content_hash="test",
             size_bytes=raw_path.stat().st_size,
@@ -140,13 +146,13 @@ def test_end_to_end_archival_pipeline():
         store_root = Path(tmp)
 
         # --- Step 1: Write synthetic NOAA data through the pipeline ---
-        raw_path = store_root / "raw" / "noaa" / "2024" / "06" / "15" / "test.parquet"
-        _create_synthetic_noaa_parquet(raw_path)
+        raw_path = store_root / "raw" / "noaa" / "2024" / "06" / "15" / "test.zip"
+        _create_synthetic_noaa_zip(raw_path)
 
         adapter = NOAAAdapter()
         artifact = RawArtifact(
             source_url="test://",
-            filename="test.parquet",
+            filename="test.zip",
             local_path=str(raw_path),
             content_hash="testhash",
             size_bytes=raw_path.stat().st_size,
@@ -158,7 +164,7 @@ def test_end_to_end_archival_pipeline():
 
         # Add pipeline-generated columns.
         positions_df = positions_df.with_columns(
-            pl.lit("test.parquet").alias("source_file"),
+            pl.lit("test.zip").alias("source_file"),
             pl.lit("test-batch-001").alias("ingest_id"),
             pl.lit("ok").alias("qc_severity"),
             pl.lit("noaa:direct").alias("record_provenance"),
@@ -280,18 +286,18 @@ def test_cli_commands():
         store_root = Path(tmp)
 
         # Write synthetic data.
-        raw_path = store_root / "raw" / "test.parquet"
-        _create_synthetic_noaa_parquet(raw_path)
+        raw_path = store_root / "raw" / "test.zip"
+        _create_synthetic_noaa_zip(raw_path)
         adapter = NOAAAdapter()
         artifact = RawArtifact(
-            source_url="test://", filename="test.parquet",
+            source_url="test://", filename="test.zip",
             local_path=str(raw_path), content_hash="test",
             size_bytes=raw_path.stat().st_size,
             fetch_timestamp=datetime.now(timezone.utc),
         )
         positions_df = adapter.normalize_positions([artifact])
         positions_df = positions_df.with_columns(
-            pl.lit("test.parquet").alias("source_file"),
+            pl.lit("test.zip").alias("source_file"),
             pl.lit("batch").alias("ingest_id"),
             pl.lit("ok").alias("qc_severity"),
             pl.lit("noaa:direct").alias("record_provenance"),
