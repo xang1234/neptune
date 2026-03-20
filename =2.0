@@ -1,0 +1,5 @@
+Requirement already satisfied: aiomqtt in /usr/local/lib/python3.11/site-packages (2.5.1)
+Requirement already satisfied: paho-mqtt<3.0.0,>=2.1.0 in /usr/local/lib/python3.11/site-packages (from aiomqtt) (2.1.0)
+
+[notice] A new release of pip is available: 26.0 -> 26.0.1
+[notice] To update, run: /usr/local/opt/python@3.11/bin/python3.11 -m pip install --upgrade pip
