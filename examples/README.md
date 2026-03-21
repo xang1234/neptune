@@ -42,5 +42,5 @@ Interactive notebooks covering the full Neptune workflow — from data discovery
 | 4 | `pip install neptune-ais[geo]` | No |
 | 5 | `pip install neptune-ais[stream]` | AISStream |
 | 6 | — | No |
-| 7 | `pip install neptune-ais[notebooks] gfw-api-python-client` | GFW |
+| 7 | `pip install neptune-ais[notebooks,gfw]` | GFW |
 | 8 | `pip install neptune-ais[geo,sql]` | No |
