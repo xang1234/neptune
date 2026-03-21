@@ -60,6 +60,7 @@ geo = [
     "lonboard>=0.9",
     "h3>=4.0",
     "folium>=0.14",
+    "mapclassify>=2.6",
     "matplotlib>=3.7",
 ]
 

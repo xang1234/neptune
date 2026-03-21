@@ -91,7 +91,7 @@ pip install neptune-ais[all]
 |---|---|---|
 | `sql` | duckdb | `Neptune.sql()`, `Neptune.duckdb()`, `DuckDBSink` |
 | `parquet` | pyarrow | Full Parquet write options (compression, statistics) |
-| `geo` | shapely, geopandas, movingpandas, lonboard, h3, folium, matplotlib | Boundary lookups, GeoDataFrame bridges, maps |
+| `geo` | shapely, geopandas, movingpandas, lonboard, h3, folium, mapclassify, matplotlib | Boundary lookups, GeoDataFrame bridges, maps |
 | `gfw` | gfw-api-python-client | GFW source adapter (events, vessels, fishing effort) |
 | `stream` | websockets, aiomqtt | `NeptuneStream`, live AIS feeds |
 | `cli` | click, rich | `neptune` console commands |
