@@ -437,7 +437,7 @@ def prepare_events(
 # ---------------------------------------------------------------------------
 
 # Vessel color palette — 10 distinct colors for up to 10 vessels.
-_PALETTE = [
+PALETTE = [
     [0, 200, 255],    # cyan
     [255, 100, 50],   # orange
     [50, 255, 130],   # green
@@ -551,7 +551,7 @@ def generate_replay(
 
         # Assign color per vessel.
         if mmsi not in mmsi_to_color:
-            mmsi_to_color[mmsi] = _PALETTE[color_idx % len(_PALETTE)]
+            mmsi_to_color[mmsi] = PALETTE[color_idx % len(PALETTE)]
             color_idx += 1
 
         # Compute timestamps as seconds from global start.
