@@ -56,7 +56,14 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 - **Real-time streaming** — Connect to live AIS feeds with backpressure, checkpointing, and durable sinks
 - **Interactive maps** — Visualize positions, tracks, and events with lonboard
 - **Plugin system** — Add custom source adapters via Python entry points
+- **Animated vessel replay** — Generate standalone HTML animations with deck.gl TripsLayer
 - **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, and more
+
+<p align="center">
+  <img src="docs/replay_screenshot.png" alt="Neptune AIS vessel replay — animated deck.gl visualization" width="800">
+  <br>
+  <em>Animated vessel replay with glowing trails, time controls, and dark basemap</em>
+</p>
 
 ## Installation
 
