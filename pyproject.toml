@@ -59,6 +59,13 @@ geo = [
     "movingpandas>=0.18",
     "lonboard>=0.9",
     "h3>=4.0",
+    "folium>=0.14",
+    "matplotlib>=3.7",
+]
+
+# GFW adapter — optional client for Global Fishing Watch API.
+# Required for: GFW source adapter (events, vessels, fishing effort).
+gfw = [
     "gfw-api-python-client>=1.0",
 ]
 
@@ -94,7 +101,7 @@ dev = [
 
 # Convenient bundle: everything needed for full-featured Neptune.
 all = [
-    "neptune-ais[sql,parquet,geo,stream,cli,notebooks]",
+    "neptune-ais[sql,parquet,geo,gfw,stream,cli,notebooks]",
 ]
 
 [project.scripts]
