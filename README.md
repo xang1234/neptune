@@ -344,7 +344,7 @@ Full Sphinx documentation is planned. In the meantime:
 
 | Resource | Description |
 |---|---|
-| [`examples/`](examples/) | Seven narrative examples covering the full workflow |
+| [`examples/`](examples/) | Eight narrative examples covering the full workflow |
 | [HEURISTICS.md](HEURISTICS.md) | Event detection assumptions, confidence limits, non-goals |
 | [RELEASING.md](RELEASING.md) | Release procedures and checklist |
 | [RC_CHECKLIST.md](RC_CHECKLIST.md) | Release-candidate validation results |
@@ -360,6 +360,7 @@ Full Sphinx documentation is planned. In the meantime:
 | 5 | [Streaming Pipeline](examples/05_streaming_pipeline.ipynb) ([.py](examples/05_streaming_pipeline.py)) | Live feeds, sinks, promotion |
 | 6 | [External Plugin](examples/06_external_plugin.py) | Custom adapter via entry point |
 | 7 | [Fishing Intelligence](examples/07_fishing_intelligence.ipynb) | GFW events, vessel identity, fishing effort grids |
+| 8 | [Spatial Visualization](examples/08_spatial_visualization.ipynb) | Interactive maps, GeoDataFrames, MovingPandas trajectories |
 
 > **Tip:** Install notebook support with `pip install neptune-ais[notebooks]` to run the interactive examples.
 
