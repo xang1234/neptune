@@ -39,3 +39,6 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Generated replay files
+replay.html
