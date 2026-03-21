@@ -455,7 +455,7 @@ def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
     """Decode a WKB LineString to [[lon, lat], ...].
 
     Handles the little-endian WKB format produced by _encode_wkb_linestring
-    in derive/tracks.py.
+    in derive/tracks.py. Uses bulk struct.unpack for efficiency.
     """
     import struct
 
@@ -465,13 +465,13 @@ def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
     byte_order = wkb[0]
     fmt_prefix = "<" if byte_order == 1 else ">"
     _geom_type, n_points = struct.unpack_from(f"{fmt_prefix}II", wkb, 1)
-    coords = []
-    offset = 9
-    for _ in range(n_points):
-        lon, lat = struct.unpack_from(f"{fmt_prefix}dd", wkb, offset)
-        coords.append([round(lon, 6), round(lat, 6)])
-        offset += 16
-    return coords
+    if n_points == 0:
+        return []
+    flat = struct.unpack_from(f"{fmt_prefix}{n_points * 2}d", wkb, 9)
+    return [
+        [round(flat[i], 6), round(flat[i + 1], 6)]
+        for i in range(0, len(flat), 2)
+    ]
 
 
 def generate_replay(
@@ -510,12 +510,11 @@ def generate_replay(
     import json
     from pathlib import Path
 
-    if isinstance(tracks, pl.LazyFrame):
-        tracks = tracks.collect()
+    tracks = _collect(tracks)
 
     # Validate required columns.
     required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
-    if not required.issubset(set(tracks.columns)):
+    if not required.issubset(tracks.columns):
         raise ValueError(
             "Tracks must have geometry_wkb and timestamp_offsets_ms columns. "
             "Use Neptune.tracks(include_geometry=True) to generate them."
@@ -530,14 +529,16 @@ def generate_replay(
     if len(tracks) == 0:
         raise ValueError("No tracks with geometry found.")
 
-    # Build trip data for deck.gl.
+    # Precompute global start time so all tracks share the same time origin.
+    min_start = tracks[TrackCol.START_TIME].min()
+    global_start_ms = (
+        int(min_start.timestamp() * 1000) if min_start is not None else None
+    )
+
+    # Build trip data for deck.gl in a single pass.
     trips = []
     mmsi_to_color: dict[int, list[int]] = {}
     color_idx = 0
-
-    # Compute global time range from start_time + offsets.
-    global_start_ms = None
-    global_end_ms = None
 
     for row in tracks.iter_rows(named=True):
         wkb = row[TrackCol.GEOMETRY_WKB]
@@ -553,22 +554,13 @@ def generate_replay(
             mmsi_to_color[mmsi] = _PALETTE[color_idx % len(_PALETTE)]
             color_idx += 1
 
-        # Convert offsets from ms to seconds.
-        timestamps_s = [t / 1000.0 for t in offsets_ms]
-
-        # Track global time range (offsets are relative to each track's start).
-        start_time = row.get(TrackCol.START_TIME)
-        if start_time is not None:
-            epoch_ms = int(start_time.timestamp() * 1000)
-            abs_start = epoch_ms
-            abs_end = epoch_ms + offsets_ms[-1]
-            if global_start_ms is None or abs_start < global_start_ms:
-                global_start_ms = abs_start
-            if global_end_ms is None or abs_end > global_end_ms:
-                global_end_ms = abs_end
-            # Use absolute seconds for timestamp alignment across tracks.
-            base_s = (epoch_ms - (global_start_ms or epoch_ms)) / 1000.0
+        # Compute timestamps as seconds from global start.
+        start_time = row[TrackCol.START_TIME]
+        if start_time is not None and global_start_ms is not None:
+            base_s = (int(start_time.timestamp() * 1000) - global_start_ms) / 1000.0
             timestamps_s = [base_s + t / 1000.0 for t in offsets_ms]
+        else:
+            timestamps_s = [t / 1000.0 for t in offsets_ms]
 
         trips.append({
             "path": coords,
@@ -580,27 +572,17 @@ def generate_replay(
     if not trips:
         raise ValueError("No valid trip geometries found.")
 
-    # Recompute timestamps relative to global start after all tracks processed.
-    if global_start_ms is not None:
-        for trip, row in zip(trips, tracks.iter_rows(named=True)):
-            start_time = row.get(TrackCol.START_TIME)
-            if start_time is not None:
-                offsets_ms = row[TrackCol.TIMESTAMP_OFFSETS_MS]
-                epoch_ms = int(start_time.timestamp() * 1000)
-                base_s = (epoch_ms - global_start_ms) / 1000.0
-                trip["timestamps"] = [base_s + t / 1000.0 for t in offsets_ms]
-
     max_time = max(t["timestamps"][-1] for t in trips)
 
-    # Compute map center from all track coordinates.
-    all_lons = [c[0] for t in trips for c in t["path"]]
-    all_lats = [c[1] for t in trips for c in t["path"]]
-    center_lon = sum(all_lons) / len(all_lons)
-    center_lat = sum(all_lats) / len(all_lats)
-
-    # Auto-zoom: rough heuristic from coordinate spread.
-    lon_spread = max(all_lons) - min(all_lons)
-    lat_spread = max(all_lats) - min(all_lats)
+    # Compute map center and zoom from track bounding boxes.
+    center_lon = float(
+        (tracks[TrackCol.BBOX_WEST].mean() + tracks[TrackCol.BBOX_EAST].mean()) / 2
+    )
+    center_lat = float(
+        (tracks[TrackCol.BBOX_SOUTH].mean() + tracks[TrackCol.BBOX_NORTH].mean()) / 2
+    )
+    lon_spread = float(tracks[TrackCol.BBOX_EAST].max() - tracks[TrackCol.BBOX_WEST].min())
+    lat_spread = float(tracks[TrackCol.BBOX_NORTH].max() - tracks[TrackCol.BBOX_SOUTH].min())
     spread = max(lon_spread, lat_spread, 0.01)
     if spread > 50:
         zoom = 3
