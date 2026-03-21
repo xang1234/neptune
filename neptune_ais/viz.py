@@ -430,3 +430,421 @@ def prepare_events(
 
     result = _sample(result, max_events)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Animated vessel replay — standalone HTML with deck.gl TripsLayer
+# ---------------------------------------------------------------------------
+
+# Vessel color palette — 10 distinct colors for up to 10 vessels.
+_PALETTE = [
+    [0, 200, 255],    # cyan
+    [255, 100, 50],   # orange
+    [50, 255, 130],   # green
+    [255, 50, 200],   # pink
+    [255, 230, 50],   # yellow
+    [130, 80, 255],   # purple
+    [255, 160, 130],  # salmon
+    [80, 255, 255],   # light cyan
+    [255, 100, 100],  # red
+    [100, 200, 100],  # forest
+]
+
+
+def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
+    """Decode a WKB LineString to [[lon, lat], ...].
+
+    Handles the little-endian WKB format produced by _encode_wkb_linestring
+    in derive/tracks.py.
+    """
+    import struct
+
+    if wkb is None or len(wkb) < 13:
+        return []
+
+    byte_order = wkb[0]
+    fmt_prefix = "<" if byte_order == 1 else ">"
+    _geom_type, n_points = struct.unpack_from(f"{fmt_prefix}II", wkb, 1)
+    coords = []
+    offset = 9
+    for _ in range(n_points):
+        lon, lat = struct.unpack_from(f"{fmt_prefix}dd", wkb, offset)
+        coords.append([round(lon, 6), round(lat, 6)])
+        offset += 16
+    return coords
+
+
+def generate_replay(
+    tracks: pl.DataFrame | pl.LazyFrame,
+    output: str = "replay.html",
+    *,
+    trail_length: int = 180,
+    speed: float = 60.0,
+) -> str:
+    """Generate a standalone HTML vessel replay animation.
+
+    Takes tracks with ``geometry_wkb`` and ``timestamp_offsets_ms``
+    (from ``Neptune.tracks(include_geometry=True)``) and produces a
+    self-contained HTML file with an animated deck.gl TripsLayer
+    showing vessels moving along their routes.
+
+    The output file loads deck.gl and MapLibre GL from CDNs — no
+    Python server or Jupyter required. Open it in any browser.
+
+    Args:
+        tracks: Tracks DataFrame with geometry columns. Must have
+            ``geometry_wkb`` and ``timestamp_offsets_ms`` columns.
+            Call ``Neptune.tracks(include_geometry=True)`` to get these.
+        output: Output file path. Default ``"replay.html"``.
+        trail_length: Seconds of glowing trail behind each vessel.
+            Default 180 (3 minutes).
+        speed: Playback speed multiplier. At ``speed=60``, one real
+            second of animation = 60 seconds of vessel time. Default 60.
+
+    Returns:
+        The absolute path to the generated HTML file.
+
+    Raises:
+        ValueError: If the tracks DataFrame lacks geometry columns.
+    """
+    import json
+    from pathlib import Path
+
+    if isinstance(tracks, pl.LazyFrame):
+        tracks = tracks.collect()
+
+    # Validate required columns.
+    required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
+    if not required.issubset(set(tracks.columns)):
+        raise ValueError(
+            "Tracks must have geometry_wkb and timestamp_offsets_ms columns. "
+            "Use Neptune.tracks(include_geometry=True) to generate them."
+        )
+
+    # Filter to tracks with geometry.
+    tracks = tracks.filter(
+        pl.col(TrackCol.GEOMETRY_WKB).is_not_null()
+        & pl.col(TrackCol.TIMESTAMP_OFFSETS_MS).is_not_null()
+    )
+
+    if len(tracks) == 0:
+        raise ValueError("No tracks with geometry found.")
+
+    # Build trip data for deck.gl.
+    trips = []
+    mmsi_to_color: dict[int, list[int]] = {}
+    color_idx = 0
+
+    # Compute global time range from start_time + offsets.
+    global_start_ms = None
+    global_end_ms = None
+
+    for row in tracks.iter_rows(named=True):
+        wkb = row[TrackCol.GEOMETRY_WKB]
+        offsets_ms = row[TrackCol.TIMESTAMP_OFFSETS_MS]
+        mmsi = row[TrackCol.MMSI]
+
+        coords = _decode_wkb_linestring(wkb)
+        if len(coords) < 2 or not offsets_ms or len(offsets_ms) != len(coords):
+            continue
+
+        # Assign color per vessel.
+        if mmsi not in mmsi_to_color:
+            mmsi_to_color[mmsi] = _PALETTE[color_idx % len(_PALETTE)]
+            color_idx += 1
+
+        # Convert offsets from ms to seconds.
+        timestamps_s = [t / 1000.0 for t in offsets_ms]
+
+        # Track global time range (offsets are relative to each track's start).
+        start_time = row.get(TrackCol.START_TIME)
+        if start_time is not None:
+            epoch_ms = int(start_time.timestamp() * 1000)
+            abs_start = epoch_ms
+            abs_end = epoch_ms + offsets_ms[-1]
+            if global_start_ms is None or abs_start < global_start_ms:
+                global_start_ms = abs_start
+            if global_end_ms is None or abs_end > global_end_ms:
+                global_end_ms = abs_end
+            # Use absolute seconds for timestamp alignment across tracks.
+            base_s = (epoch_ms - (global_start_ms or epoch_ms)) / 1000.0
+            timestamps_s = [base_s + t / 1000.0 for t in offsets_ms]
+
+        trips.append({
+            "path": coords,
+            "timestamps": timestamps_s,
+            "color": mmsi_to_color[mmsi],
+            "mmsi": mmsi,
+        })
+
+    if not trips:
+        raise ValueError("No valid trip geometries found.")
+
+    # Recompute timestamps relative to global start after all tracks processed.
+    if global_start_ms is not None:
+        for trip, row in zip(trips, tracks.iter_rows(named=True)):
+            start_time = row.get(TrackCol.START_TIME)
+            if start_time is not None:
+                offsets_ms = row[TrackCol.TIMESTAMP_OFFSETS_MS]
+                epoch_ms = int(start_time.timestamp() * 1000)
+                base_s = (epoch_ms - global_start_ms) / 1000.0
+                trip["timestamps"] = [base_s + t / 1000.0 for t in offsets_ms]
+
+    max_time = max(t["timestamps"][-1] for t in trips)
+
+    # Compute map center from all track coordinates.
+    all_lons = [c[0] for t in trips for c in t["path"]]
+    all_lats = [c[1] for t in trips for c in t["path"]]
+    center_lon = sum(all_lons) / len(all_lons)
+    center_lat = sum(all_lats) / len(all_lats)
+
+    # Auto-zoom: rough heuristic from coordinate spread.
+    lon_spread = max(all_lons) - min(all_lons)
+    lat_spread = max(all_lats) - min(all_lats)
+    spread = max(lon_spread, lat_spread, 0.01)
+    if spread > 50:
+        zoom = 3
+    elif spread > 10:
+        zoom = 5
+    elif spread > 2:
+        zoom = 7
+    elif spread > 0.5:
+        zoom = 9
+    else:
+        zoom = 11
+
+    # Build vessel legend entries.
+    legend_entries = [
+        {"mmsi": mmsi, "color": color}
+        for mmsi, color in mmsi_to_color.items()
+    ]
+
+    # Serialize trip data (drop mmsi field — not needed by deck.gl).
+    trips_json = json.dumps(
+        [{"path": t["path"], "timestamps": t["timestamps"], "color": t["color"]}
+         for t in trips],
+    )
+
+    html = _REPLAY_HTML_TEMPLATE.format(
+        trips_json=trips_json,
+        center_lon=center_lon,
+        center_lat=center_lat,
+        zoom=zoom,
+        max_time=max_time,
+        trail_length=trail_length,
+        speed=speed,
+        legend_json=json.dumps(legend_entries),
+        n_vessels=len(mmsi_to_color),
+        n_tracks=len(trips),
+    )
+
+    out_path = Path(output).resolve()
+    out_path.write_text(html)
+    return str(out_path)
+
+
+_REPLAY_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neptune AIS — Vessel Replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/deck.gl@9.1.4/dist.min.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0a0a1a; color: #e0e0e0; overflow: hidden; }}
+  #map {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; }}
+  #controls {{
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(10, 10, 30, 0.92); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px; padding: 14px 20px; display: flex; align-items: center;
+    gap: 14px; backdrop-filter: blur(12px); z-index: 10;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }}
+  #controls button {{
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+    color: #fff; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 14px; transition: background 0.15s;
+  }}
+  #controls button:hover {{ background: rgba(255,255,255,0.2); }}
+  #controls button.active {{ background: rgba(0,200,255,0.3); border-color: rgba(0,200,255,0.5); }}
+  #slider {{ width: 280px; accent-color: #00c8ff; }}
+  #clock {{ font-variant-numeric: tabular-nums; font-size: 15px; min-width: 60px;
+            color: #00c8ff; font-weight: 600; }}
+  #speed-btn {{ font-variant-numeric: tabular-nums; min-width: 44px; text-align: center; }}
+  #legend {{
+    position: absolute; top: 16px; right: 16px;
+    background: rgba(10, 10, 30, 0.88); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 12px 16px; z-index: 10;
+    backdrop-filter: blur(12px); font-size: 13px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+  }}
+  #legend h3 {{ font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+                color: rgba(255,255,255,0.5); margin-bottom: 8px; }}
+  .legend-item {{ display: flex; align-items: center; gap: 8px; margin: 4px 0; }}
+  .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }}
+  #header {{
+    position: absolute; top: 16px; left: 16px; z-index: 10;
+    background: rgba(10, 10, 30, 0.88); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 12px 16px; backdrop-filter: blur(12px);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+  }}
+  #header h2 {{ font-size: 15px; font-weight: 600; margin-bottom: 2px; }}
+  #header p {{ font-size: 12px; color: rgba(255,255,255,0.5); }}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="header">
+  <h2>Neptune AIS Replay</h2>
+  <p>{n_vessels} vessels &middot; {n_tracks} tracks</p>
+</div>
+
+<div id="legend">
+  <h3>Vessels</h3>
+  <div id="legend-items"></div>
+</div>
+
+<div id="controls">
+  <button id="play-btn" class="active" title="Play / Pause">&#9654;</button>
+  <input type="range" id="slider" min="0" max="1000" value="0">
+  <span id="clock">00:00:00</span>
+  <button id="speed-btn" title="Playback speed">{speed:.0f}x</button>
+</div>
+
+<script>
+const TRIPS = {trips_json};
+const LEGEND = {legend_json};
+const MAX_TIME = {max_time};
+const TRAIL_LENGTH = {trail_length};
+let speed = {speed};
+let playing = true;
+let currentTime = 0;
+const speedSteps = [10, 30, 60, 120, 300, 600];
+let speedIdx = speedSteps.indexOf(speed);
+if (speedIdx < 0) speedIdx = 2;
+
+// Legend
+const legendEl = document.getElementById('legend-items');
+LEGEND.forEach(v => {{
+  const item = document.createElement('div');
+  item.className = 'legend-item';
+  item.innerHTML = '<div class="legend-dot" style="background:rgb(' +
+    v.color.join(',') + ')"></div><span>' + v.mmsi + '</span>';
+  legendEl.appendChild(item);
+}});
+
+// Format seconds as HH:MM:SS
+function fmt(s) {{
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' +
+         String(sec).padStart(2,'0');
+}}
+
+// deck.gl overlay
+const deckgl = new deck.DeckGL({{
+  container: 'map',
+  mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  initialViewState: {{
+    longitude: {center_lon},
+    latitude: {center_lat},
+    zoom: {zoom},
+    pitch: 35,
+    bearing: 0,
+  }},
+  controller: true,
+  getTooltip: ({{object}}) => object && ('MMSI: ' + (object.mmsi || '')),
+  layers: [],
+}});
+
+function updateLayers() {{
+  deckgl.setProps({{
+    layers: [
+      new deck.TripsLayer({{
+        id: 'trips',
+        data: TRIPS,
+        getPath: d => d.path,
+        getTimestamps: d => d.timestamps,
+        getColor: d => d.color,
+        currentTime: currentTime,
+        trailLength: TRAIL_LENGTH,
+        widthMinPixels: 3,
+        widthMaxPixels: 8,
+        capRounded: true,
+        jointRounded: true,
+        opacity: 0.9,
+      }}),
+      new deck.ScatterplotLayer({{
+        id: 'heads',
+        data: TRIPS.filter(d => {{
+          const ts = d.timestamps;
+          return ts[0] <= currentTime && currentTime <= ts[ts.length - 1];
+        }}).map(d => {{
+          const ts = d.timestamps;
+          let idx = 0;
+          for (let i = 0; i < ts.length - 1; i++) {{
+            if (ts[i + 1] >= currentTime) {{ idx = i; break; }}
+          }}
+          const frac = ts[idx + 1] !== ts[idx]
+            ? (currentTime - ts[idx]) / (ts[idx + 1] - ts[idx]) : 0;
+          const p0 = d.path[idx], p1 = d.path[Math.min(idx + 1, d.path.length - 1)];
+          return {{
+            position: [p0[0] + (p1[0] - p0[0]) * frac, p0[1] + (p1[1] - p0[1]) * frac],
+            color: d.color,
+          }};
+        }}),
+        getPosition: d => d.position,
+        getFillColor: d => [...d.color, 255],
+        getLineColor: [255, 255, 255, 180],
+        radiusMinPixels: 5,
+        radiusMaxPixels: 12,
+        lineWidthMinPixels: 2,
+        stroked: true,
+      }}),
+    ],
+  }});
+}}
+
+// Animation loop
+let lastFrame = performance.now();
+function animate(now) {{
+  if (playing) {{
+    const dt = (now - lastFrame) / 1000;
+    currentTime += dt * speed;
+    if (currentTime > MAX_TIME) currentTime = 0;
+    document.getElementById('slider').value = (currentTime / MAX_TIME * 1000) | 0;
+    document.getElementById('clock').textContent = fmt(currentTime);
+    updateLayers();
+  }}
+  lastFrame = now;
+  requestAnimationFrame(animate);
+}}
+requestAnimationFrame(animate);
+
+// Controls
+document.getElementById('play-btn').onclick = () => {{
+  playing = !playing;
+  const btn = document.getElementById('play-btn');
+  btn.textContent = playing ? '\u25B6' : '\u23F8';
+  btn.classList.toggle('active', playing);
+}};
+document.getElementById('slider').oninput = (e) => {{
+  currentTime = (e.target.value / 1000) * MAX_TIME;
+  document.getElementById('clock').textContent = fmt(currentTime);
+  updateLayers();
+}};
+document.getElementById('speed-btn').onclick = () => {{
+  speedIdx = (speedIdx + 1) % speedSteps.length;
+  speed = speedSteps[speedIdx];
+  document.getElementById('speed-btn').textContent = speed + 'x';
+}};
+</script>
+</body>
+</html>"""
