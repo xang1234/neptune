@@ -324,12 +324,16 @@ const PANELS_CFG = PANELS_RAW.map(function(p) {
 
 _JS_ENGINE = """\
 // ── Three.js WebGL engine ─────────────────────
+// Two-layer rendering with per-vessel trailing polylines:
+//   accumulation RT — persistent corridor traces (dim, slow fade)
+//   active RT — bright vessel trails (last ~25 positions) + head dots
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
 // ── Shaders ───────────────────────────────────
+// Line segment quad shader — used for both accumulation and trail rendering
 const LINE_VERT = `
 attribute vec2 aStart;
 attribute vec2 aEnd;
@@ -358,17 +362,32 @@ void main() {
   vAlpha = aAlpha;
 }`;
 
-const LINE_FRAG = `
+// Corridor accumulation — moderate glow, feeds into persistent layer
+const LINE_FRAG_ACCUM = `
 precision highp float;
 varying float vDist;
 varying vec3 vColor;
 varying float vAlpha;
 void main() {
   float d = abs(vDist);
-  float core = smoothstep(0.35, 0.0, d);
-  float glow = exp(-d * d * 5.0);
-  float intensity = core * 0.9 + glow * 0.35;
-  gl_FragColor = vec4(vColor * intensity * 1.3 * vAlpha, intensity * vAlpha);
+  float core = smoothstep(0.3, 0.0, d);
+  float glow = exp(-d * d * 4.0);
+  float intensity = core * 0.8 + glow * 0.3;
+  gl_FragColor = vec4(vColor * intensity * 1.5 * vAlpha, intensity * vAlpha);
+}`;
+
+// Active trail — brighter, more vivid for moving vessel trails
+const LINE_FRAG_TRAIL = `
+precision highp float;
+varying float vDist;
+varying vec3 vColor;
+varying float vAlpha;
+void main() {
+  float d = abs(vDist);
+  float core = smoothstep(0.25, 0.0, d);
+  float glow = exp(-d * d * 3.5);
+  float intensity = core * 1.0 + glow * 0.4;
+  gl_FragColor = vec4(vColor * intensity * 2.0 * vAlpha, intensity * vAlpha);
 }`;
 
 const FADE_FRAG = `
@@ -410,10 +429,10 @@ varying vec3 vColor;
 void main() {
   float d = length(gl_PointCoord - 0.5) * 2.0;
   if (d > 1.0) discard;
-  float core = smoothstep(0.3, 0.0, d);
+  float core = smoothstep(0.25, 0.0, d);
   float glow = exp(-d * d * 3.0);
-  float intensity = core + glow * 0.5;
-  gl_FragColor = vec4(vColor * intensity * 1.5, intensity);
+  float intensity = core * 0.8 + glow * 0.4;
+  gl_FragColor = vec4(vColor * intensity * 1.2, intensity);
 }`;
 
 // ── State ─────────────────────────────────────
@@ -423,7 +442,9 @@ let speedIdx = speedSteps.indexOf(CONFIG.speed);
 if (speedIdx < 0) speedIdx = 2;
 const MAX_TRAIL_DIST = 150;
 const BIN_MAX_SEGS = 8000;
+const TRAIL_MAX_SEGS = 50000;  // for all vessel trails combined
 const MAX_HEADS = 10000;
+const TRAIL_LENGTH = 25;       // keep last N positions per vessel
 
 const state = {
   playing: false,
@@ -431,7 +452,8 @@ const state = {
   accumBins: [],
   projected: [],
   speed: CONFIG.speed,
-  vesselPos: [],
+  vesselPos: [],    // per-panel: Map of mmsiIdx → {px, py, typeIdx}
+  vesselTrail: [],  // per-panel: Map of mmsiIdx → [{px, py, typeIdx}, ...]
 };
 
 const panelCtx = [];
@@ -504,8 +526,9 @@ function initPanel(idx) {
   lineGeom.setIndex(new THREE.BufferAttribute(idxArr, 1));
   lineGeom.setDrawRange(0, 0);
 
+  // Accumulation line material (moderate glow for corridor traces)
   const lineMat = new THREE.RawShaderMaterial({
-    vertexShader: LINE_VERT, fragmentShader: LINE_FRAG,
+    vertexShader: LINE_VERT, fragmentShader: LINE_FRAG_ACCUM,
     uniforms: { uResolution: { value: new THREE.Vector2(w, h) },
                 uLineWidth: { value: Math.max(5.0, cfg.dotRadius * 6.0) } },
     blending: THREE.AdditiveBlending, transparent: true,
@@ -516,6 +539,44 @@ function initPanel(idx) {
   const lineMesh = new THREE.Mesh(lineGeom, lineMat);
   const lineScene = new THREE.Scene();
   lineScene.add(lineMesh);
+
+  // ── Trail line geometry (per-vessel recent polylines, brighter) ──
+  const tStartArr = new Float32Array(TRAIL_MAX_SEGS * 4 * 2);
+  const tEndArr = new Float32Array(TRAIL_MAX_SEGS * 4 * 2);
+  const tQvArr = new Float32Array(TRAIL_MAX_SEGS * 4);
+  const tColArr = new Float32Array(TRAIL_MAX_SEGS * 4 * 3);
+  const tAlpArr = new Float32Array(TRAIL_MAX_SEGS * 4);
+  const tPosArr = new Float32Array(TRAIL_MAX_SEGS * 4 * 3);
+
+  const trailGeom = new THREE.BufferGeometry();
+  trailGeom.setAttribute('position', mkAttr(tPosArr, 3));
+  trailGeom.setAttribute('aStart', mkAttr(tStartArr, 2));
+  trailGeom.setAttribute('aEnd', mkAttr(tEndArr, 2));
+  trailGeom.setAttribute('aQuadVertex', mkAttr(tQvArr, 1));
+  trailGeom.setAttribute('aColor', mkAttr(tColArr, 3));
+  trailGeom.setAttribute('aAlpha', mkAttr(tAlpArr, 1));
+  const tIdxArr = new Uint32Array(TRAIL_MAX_SEGS * 6);
+  for (let i = 0; i < TRAIL_MAX_SEGS; i++) {
+    const b = i * 4, o = i * 6;
+    tIdxArr[o]=b; tIdxArr[o+1]=b+1; tIdxArr[o+2]=b+2;
+    tIdxArr[o+3]=b; tIdxArr[o+4]=b+2; tIdxArr[o+5]=b+3;
+  }
+  trailGeom.setIndex(new THREE.BufferAttribute(tIdxArr, 1));
+  trailGeom.setDrawRange(0, 0);
+
+  // Trail material (brighter glow for active vessel movement)
+  const trailMat = new THREE.RawShaderMaterial({
+    vertexShader: LINE_VERT, fragmentShader: LINE_FRAG_TRAIL,
+    uniforms: { uResolution: { value: new THREE.Vector2(w, h) },
+                uLineWidth: { value: Math.max(6.0, cfg.dotRadius * 7.0) } },
+    blending: THREE.AdditiveBlending, transparent: true,
+    depthTest: false, depthWrite: false,
+    glslVersion: THREE.GLSL1,
+  });
+
+  const trailMesh = new THREE.Mesh(trailGeom, trailMat);
+  const trailScene = new THREE.Scene();
+  trailScene.add(trailMesh);
 
   // ── Fade fullscreen quad ──
   const fadeGeom = new THREE.PlaneGeometry(2, 2);
@@ -583,6 +644,7 @@ function initPanel(idx) {
     map, renderer, camera, quadCamera,
     rtA, rtB, rtActive,
     lineScene, lineGeom, lineMat, startArr, endArr, qvArr, colArr, alpArr,
+    trailScene, trailGeom, trailMat, tStartArr, tEndArr, tQvArr, tColArr, tAlpArr,
     fadeScene, fadeMat,
     headScene, headGeom, headPosArr, headColArr,
     composer, compPass, bloomPass,
@@ -593,6 +655,7 @@ function initPanel(idx) {
   state.accumBins.push(0);
   state.projected.push(false);
   state.vesselPos.push(new Map());
+  state.vesselTrail.push(new Map());
 
   // Project coordinates once map loads
   // Point format: [lat, lon, typeIdx, mmsiIdx] → append [px, py] at indices 4,5
@@ -650,25 +713,86 @@ function flushSegments(p) {
   g.setDrawRange(0, p.binSegCount * 6);
 }
 
-// ── Vessel heads ──────────────────────────────
-function updateHeads(pIdx) {
+// ── Trail segment helper ─────────────────────
+function addTrailSeg(p, sx, sy, ex, ey, r, g, b, alpha) {
+  if (p._trailCount >= TRAIL_MAX_SEGS) return;
+  const i = p._trailCount;
+  const b4 = i * 4;
+  for (let v = 0; v < 4; v++) {
+    const vi = b4 + v;
+    p.tStartArr[vi * 2] = sx; p.tStartArr[vi * 2 + 1] = sy;
+    p.tEndArr[vi * 2] = ex; p.tEndArr[vi * 2 + 1] = ey;
+    p.tQvArr[vi] = v;
+    p.tColArr[vi * 3] = r; p.tColArr[vi * 3 + 1] = g; p.tColArr[vi * 3 + 2] = b;
+    p.tAlpArr[vi] = alpha;
+  }
+  p._trailCount++;
+}
+
+// ── Build vessel heads + trail polylines on active RT ──
+function renderActive(pIdx) {
   const p = panelCtx[pIdx];
   const vpos = state.vesselPos[pIdx];
-  let count = 0;
-  vpos.forEach(function(v) {
-    if (count >= MAX_HEADS) return;
-    p.headPosArr[count*3] = v.px;
-    p.headPosArr[count*3+1] = v.py;
-    p.headPosArr[count*3+2] = 0;
-    const col = PALETTE[v.typeIdx] || PALETTE[0];
-    p.headColArr[count*3] = col[0]/255;
-    p.headColArr[count*3+1] = col[1]/255;
-    p.headColArr[count*3+2] = col[2]/255;
-    count++;
+  const vtrail = state.vesselTrail[pIdx];
+
+  // Build trail line segments from per-vessel recent positions
+  p._trailCount = 0;
+  vtrail.forEach(function(trail, mmsiIdx) {
+    if (trail.length < 2) return;
+    const col = PALETTE[trail[0].typeIdx] || PALETTE[0];
+    const r = col[0]/255, g = col[1]/255, b = col[2]/255;
+    const len = trail.length;
+
+    for (let i = 1; i < len; i++) {
+      const prev = trail[i - 1], cur = trail[i];
+      const dx = cur.px - prev.px, dy = cur.py - prev.py;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist < 0.5 || dist > MAX_TRAIL_DIST) continue;
+
+      // Alpha gradient: oldest segment = 0.15, newest = 0.9
+      const frac = i / (len - 1);
+      const alpha = 0.15 + frac * 0.75;
+      addTrailSeg(p, prev.px, prev.py, cur.px, cur.py, r, g, b, alpha);
+    }
   });
-  p.headGeom.setDrawRange(0, count);
+
+  // Flush trail geometry
+  if (p._trailCount > 0) {
+    const tg = p.trailGeom;
+    tg.attributes.aStart.needsUpdate = true;
+    tg.attributes.aEnd.needsUpdate = true;
+    tg.attributes.aQuadVertex.needsUpdate = true;
+    tg.attributes.aColor.needsUpdate = true;
+    tg.attributes.aAlpha.needsUpdate = true;
+    tg.setDrawRange(0, p._trailCount * 6);
+  } else {
+    p.trailGeom.setDrawRange(0, 0);
+  }
+
+  // Build head points
+  let headCount = 0;
+  vpos.forEach(function(v) {
+    if (headCount >= MAX_HEADS) return;
+    p.headPosArr[headCount*3] = v.px;
+    p.headPosArr[headCount*3+1] = v.py;
+    p.headPosArr[headCount*3+2] = 0;
+    const col = PALETTE[v.typeIdx] || PALETTE[0];
+    p.headColArr[headCount*3] = col[0]/255;
+    p.headColArr[headCount*3+1] = col[1]/255;
+    p.headColArr[headCount*3+2] = col[2]/255;
+    headCount++;
+  });
+  p.headGeom.setDrawRange(0, headCount);
   p.headGeom.attributes.position.needsUpdate = true;
   p.headGeom.attributes.aHeadColor.needsUpdate = true;
+
+  // Render trails + heads to active RT
+  p.renderer.setRenderTarget(p.rtActive);
+  p.renderer.clear();
+  if (p._trailCount > 0) {
+    p.renderer.render(p.trailScene, p.camera);
+  }
+  p.renderer.render(p.headScene, p.camera);
 }
 
 // ── Per-frame render ──────────────────────────
@@ -676,17 +800,18 @@ function renderFrame(pIdx, binIdx) {
   const p = panelCtx[pIdx];
   const bin = p.cfg.bins[binIdx];
 
-  // Step 1: Fade rtA → rtB
+  // Step 1: Fade accumulation rtA → rtB
   p.fadeMat.uniforms.tDiffuse.value = p.rtA.texture;
   p.fadeMat.uniforms.uFadeFactor.value = p.cfg.fadeFactor;
   p.renderer.setRenderTarget(p.rtB);
   p.renderer.clear();
   p.renderer.render(p.fadeScene, p.quadCamera);
 
-  // Step 2: Render new line segments additively onto rtB
+  // Step 2: Process new bin — update vessel positions/trails, add accumulation lines
   if (bin && bin.length > 0) {
     p.binSegCount = 0;
     const vpos = state.vesselPos[pIdx];
+    const vtrail = state.vesselTrail[pIdx];
     const alpha = p.cfg.dotAlpha;
 
     for (let i = 0; i < bin.length; i++) {
@@ -697,6 +822,7 @@ function renderFrame(pIdx, binIdx) {
       const col = PALETTE[typeIdx] || PALETTE[0];
       const r = col[0]/255, g = col[1]/255, b = col[2]/255;
 
+      // Add accumulation line segment (dim, persistent corridor trace)
       const prev = vpos.get(mmsiIdx);
       if (prev) {
         const dx = px - prev.px, dy = py - prev.py;
@@ -705,22 +831,27 @@ function renderFrame(pIdx, binIdx) {
           addSegment(p, prev.px, prev.py, px, py, r, g, b, alpha);
         }
       }
-      vpos.set(mmsiIdx, { px, py, typeIdx });
-    }
-    flushSegments(p);
 
+      // Update vessel position
+      vpos.set(mmsiIdx, { px, py, typeIdx });
+
+      // Update vessel trail (ring buffer of last TRAIL_LENGTH positions)
+      let trail = vtrail.get(mmsiIdx);
+      if (!trail) { trail = []; vtrail.set(mmsiIdx, trail); }
+      trail.push({ px, py, typeIdx });
+      if (trail.length > TRAIL_LENGTH) trail.shift();
+    }
+
+    flushSegments(p);
     p.renderer.setRenderTarget(p.rtB);
     p.renderer.render(p.lineScene, p.camera);
   }
 
-  // Step 3: Swap
+  // Step 3: Swap render targets
   const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
 
-  // Step 4: Render heads
-  updateHeads(pIdx);
-  p.renderer.setRenderTarget(p.rtActive);
-  p.renderer.clear();
-  p.renderer.render(p.headScene, p.camera);
+  // Step 4: Render active layer (vessel trails + heads)
+  renderActive(pIdx);
 
   // Step 5: Composite + bloom → screen
   p.compPass.uniforms.tAccum.value = p.rtA.texture;
@@ -730,7 +861,7 @@ function renderFrame(pIdx, binIdx) {
   p.composer.render();
 }
 
-// Fade-only frame (no new bin)
+// Fade-only frame (no new bin, still render active trails)
 function renderIdle(pIdx) {
   const p = panelCtx[pIdx];
   p.fadeMat.uniforms.tDiffuse.value = p.rtA.texture;
@@ -739,6 +870,9 @@ function renderIdle(pIdx) {
   p.renderer.render(p.fadeScene, p.quadCamera);
   const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
 
+  // Still render active trails + heads
+  renderActive(pIdx);
+
   p.compPass.uniforms.tAccum.value = p.rtA.texture;
   p.compPass.uniforms.tActive.value = p.rtActive.texture;
   p.renderer.setRenderTarget(null);
@@ -746,12 +880,13 @@ function renderIdle(pIdx) {
   p.composer.render();
 }
 
-// Scrub/seek
+// Scrub/seek — replay all bins to rebuild state
 function renderUpTo(pIdx, targetBin) {
   const p = panelCtx[pIdx];
   p.renderer.setRenderTarget(p.rtA); p.renderer.clear();
   p.renderer.setRenderTarget(p.rtB); p.renderer.clear();
   state.vesselPos[pIdx] = new Map();
+  state.vesselTrail[pIdx] = new Map();
   for (let i = 0; i <= targetBin; i++) {
     renderFrame(pIdx, i);
   }
@@ -792,6 +927,7 @@ function animate(now) {
         p.renderer.setRenderTarget(p.rtA); p.renderer.clear();
         p.renderer.setRenderTarget(p.rtB); p.renderer.clear();
         state.vesselPos[i] = new Map();
+        state.vesselTrail[i] = new Map();
       }
     }
 
