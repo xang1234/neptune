@@ -61,7 +61,14 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 - **Interactive maps** — Visualize positions, tracks, and events with lonboard
 - **Plugin system** — Add custom source adapters via Python entry points
 - **Animated vessel replay** — Generate standalone HTML animations with deck.gl TripsLayer
+- **Timelapse corridor visualization** — Cinematic AIS timelapses that reveal shipping corridors through cumulative dot accumulation with additive blending, bloom, and vessel-type color coding
 - **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, and more
+
+<p align="center">
+  <img src="assets/timelapse_screenshot.png" alt="Neptune AIS timelapse — Gulf of Mexico vessel corridors" width="960">
+  <br>
+  <em>Timelapse corridor visualization — 6,778 vessels in the Gulf of Mexico, colored by type</em>
+</p>
 
 <p align="center">
   <img src="docs/replay_screenshot.png" alt="Neptune AIS vessel replay — animated deck.gl visualization" width="800">
@@ -374,6 +381,7 @@ Full Sphinx documentation is planned. In the meantime:
 | 7 | [Fishing Intelligence](examples/07_fishing_intelligence.ipynb) | GFW events, vessel identity, fishing effort grids |
 | 8 | [Spatial Visualization](examples/08_spatial_visualization.ipynb) | Interactive maps, GeoDataFrames, MovingPandas trajectories |
 | 9 | [Intelligence Dashboard](examples/09_intelligence_dashboard.ipynb) | Gate crossings, live counters, filters, standalone HTML dashboard |
+| 10 | [Timelapse Visualization](examples/10_timelapse_visualization.ipynb) | Cinematic corridor timelapse, vessel-type coloring, multi-panel |
 
 > **Tip:** Install notebook support with `pip install neptune-ais[notebooks]` to run the interactive examples.
 

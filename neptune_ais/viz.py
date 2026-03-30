@@ -98,6 +98,51 @@ class InfrastructurePoint:
 
 
 @dataclass(frozen=True)
+class TimelapsConfig:
+    """Configuration for a timelapse corridor visualization.
+
+    Parameterizes the cinematic vessel-corridor timelapse effect —
+    positions accumulate over time on a dark basemap to reveal shipping
+    lanes through density, similar to long-exposure photography.
+
+    Args:
+        title: Display title (e.g., ``"VESSEL MARKET - AIS TIMELAPSE"``).
+        subtitle: Subtitle line below the title.
+        date_from: Start of analysis period (ISO-8601 string).
+        date_to: End of analysis period (ISO-8601 string).
+        center_lat: Map center latitude. Auto-computed from data if None.
+        center_lon: Map center longitude. Auto-computed if None.
+        zoom: Initial map zoom level. Auto-computed if None.
+        dot_radius: Radius of each position dot in pixels. Default 2.
+        dot_alpha: Base alpha per dot (0.0–1.0). Default 0.3.
+        bin_interval_minutes: Time bin size for animation steps. Default 60.
+        speed: Animation speed — bins per second of playback. Default 4.
+        color_by_type: Color-code dots by vessel type. Default True.
+        fade_factor: Per-frame multiplicative fade for the accumulation
+            canvas (1.0 = no fade, keep all trails). Default 0.998.
+        bloom: Apply gaussian-blur bloom post-processing. Default True.
+        layout: Multi-panel layout direction. ``"vertical"`` (rows,
+            default), ``"horizontal"`` (columns), or ``"grid"``.
+    """
+
+    title: str = "AIS TIMELAPSE"
+    subtitle: str = ""
+    date_from: str = ""
+    date_to: str = ""
+    center_lat: float | None = None
+    center_lon: float | None = None
+    zoom: int | None = None
+    dot_radius: float = 1.0
+    dot_alpha: float = 0.10
+    bin_interval_minutes: int = 30
+    speed: float = 2.0
+    color_by_type: bool = True
+    fade_factor: float = 0.992
+    bloom: bool = True
+    layout: str = "vertical"
+
+
+@dataclass(frozen=True)
 class DashboardConfig:
     """Configuration for a maritime intelligence dashboard.
 
@@ -521,6 +566,56 @@ PALETTE = [
 ]
 
 
+# Vessel type palette — muted tones tuned for additive blending.
+# Overlapping types produce natural white highlights instead of neon clashing.
+VESSEL_TYPE_PALETTE: dict[str, list[int]] = {
+    "cargo": [40, 100, 220],       # deep blue
+    "tanker": [200, 50, 120],      # muted rose
+    "passenger": [50, 180, 120],   # teal green
+    "fishing": [200, 180, 50],     # warm amber
+    "tug": [120, 60, 200],         # soft purple
+    "other": [120, 130, 160],      # cool gray
+}
+
+# Ordered list for index-based lookups in the JS template.
+_VESSEL_TYPE_ORDER = list(VESSEL_TYPE_PALETTE.keys())
+
+
+def _categorize_vessel_type(ship_type: str | None) -> str:
+    """Map AIS ship type code to a visualization category.
+
+    Handles both numeric codes (NOAA) and text descriptions (DMA/Finland).
+    """
+    if not ship_type:
+        return "other"
+    try:
+        code = int(ship_type)
+    except (ValueError, TypeError):
+        lower = ship_type.lower()
+        if "cargo" in lower or "container" in lower or "bulk" in lower:
+            return "cargo"
+        if "tanker" in lower or "oil" in lower or "chemical" in lower:
+            return "tanker"
+        if "passenger" in lower or "cruise" in lower or "ferry" in lower:
+            return "passenger"
+        if "fish" in lower:
+            return "fishing"
+        if "tug" in lower or "pilot" in lower or "tow" in lower:
+            return "tug"
+        return "other"
+    if 70 <= code <= 79:
+        return "cargo"
+    if 80 <= code <= 89:
+        return "tanker"
+    if 60 <= code <= 69:
+        return "passenger"
+    if 30 <= code <= 39:
+        return "fishing"
+    if 31 <= code <= 32 or 50 <= code <= 59:
+        return "tug"
+    return "other"
+
+
 def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
     """Decode a WKB LineString to [[lon, lat], ...].
 
@@ -619,6 +714,28 @@ def _auto_view(
     lat_spread = float(
         tracks[TrackCol.BBOX_NORTH].max() - tracks[TrackCol.BBOX_SOUTH].min()
     )
+    spread = max(lon_spread, lat_spread, 0.01)
+    if spread > 50:
+        zoom = 3
+    elif spread > 10:
+        zoom = 5
+    elif spread > 2:
+        zoom = 7
+    elif spread > 0.5:
+        zoom = 9
+    else:
+        zoom = 11
+    return center_lat, center_lon, zoom
+
+
+def _auto_view_positions(
+    df: pl.DataFrame,
+) -> tuple[float, float, int]:
+    """Compute map center and zoom from positions lat/lon."""
+    center_lat = float(df[PosCol.LAT].mean())
+    center_lon = float(df[PosCol.LON].mean())
+    lat_spread = float(df[PosCol.LAT].max() - df[PosCol.LAT].min())
+    lon_spread = float(df[PosCol.LON].max() - df[PosCol.LON].min())
     spread = max(lon_spread, lat_spread, 0.01)
     if spread > 50:
         zoom = 3
@@ -1364,6 +1481,324 @@ def generate_dashboard(
     }
 
     html = render_dashboard(data)
+
+    out_path = Path(output).resolve()
+    out_path.write_text(html)
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Timelapse corridor visualization
+# ---------------------------------------------------------------------------
+
+
+def prepare_timelapse(
+    df: pl.DataFrame | pl.LazyFrame,
+    *,
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    viewport: Viewport | None = None,
+    max_points: int | None = 200_000,
+    bin_interval_minutes: int = 60,
+    color_by_type: bool = True,
+) -> dict:
+    """Prepare positions for timelapse corridor rendering.
+
+    Groups positions into time bins and extracts minimal fields for
+    compact JSON embedding. Optionally enriches ``ship_type`` from a
+    vessels DataFrame.
+
+    Args:
+        df: Positions DataFrame or LazyFrame.
+        vessels: Optional vessels DataFrame for ``ship_type`` enrichment
+            via MMSI join.
+        viewport: Optional bounding box to clip to.
+        max_points: Max total points. Default 200K.
+        bin_interval_minutes: Size of each time bin in minutes.
+        color_by_type: Whether to assign type-based color indices.
+
+    Returns:
+        A dict with keys:
+
+        - ``bins``: list of lists — each inner list contains
+          ``[lat, lon, type_idx]`` triples for one time bin.
+        - ``type_counts``: dict mapping type name → count.
+        - ``cumul_vessels``: list of cumulative unique vessel counts
+          (one per bin).
+        - ``bin_timestamps_ms``: list of epoch-millis for each bin start.
+        - ``center_lat``, ``center_lon``, ``zoom``: auto-computed view.
+        - ``color_by_type``: whether type coloring is active (may be
+          auto-disabled if too few typed positions).
+        - ``palette``: list of ``[r, g, b]`` colors in type-index order.
+        - ``type_names``: list of type names in index order.
+    """
+    result = _collect(df)
+
+    if viewport is not None:
+        result = _clip_positions(result, viewport)
+
+    result = _sample(result, max_points)
+
+    if len(result) == 0:
+        return {
+            "bins": [],
+            "type_counts": {},
+            "cumul_vessels": [],
+            "bin_timestamps_ms": [],
+            "center_lat": 0.0,
+            "center_lon": 0.0,
+            "zoom": 3,
+            "color_by_type": False,
+            "palette": [c for c in VESSEL_TYPE_PALETTE.values()],
+            "type_names": _VESSEL_TYPE_ORDER[:],
+        }
+
+    # Enrich ship_type from vessels table if available.
+    if vessels is not None and PosCol.SHIP_TYPE in result.columns:
+        vessels_df = _collect(vessels)
+        if VesselCol.SHIP_TYPE in vessels_df.columns:
+            type_lookup = vessels_df.select(
+                pl.col(VesselCol.MMSI), pl.col(VesselCol.SHIP_TYPE).alias("_vtype"),
+            ).unique(VesselCol.MMSI)
+            result = result.join(type_lookup, on=PosCol.MMSI, how="left")
+            result = result.with_columns(
+                pl.coalesce(PosCol.SHIP_TYPE, "_vtype").alias(PosCol.SHIP_TYPE),
+            ).drop("_vtype")
+
+    # Categorize vessel types.
+    ship_type_col = PosCol.SHIP_TYPE if PosCol.SHIP_TYPE in result.columns else None
+    if ship_type_col is not None and color_by_type:
+        type_series = result[ship_type_col].fill_null("").map_elements(
+            _categorize_vessel_type, return_dtype=pl.String,
+        )
+    else:
+        type_series = pl.Series("_vcat", ["other"] * len(result))
+
+    result = result.with_columns(type_series.alias("_vcat"))
+
+    # Auto-fallback: if >60% are "other", disable type coloring.
+    other_frac = (result["_vcat"] == "other").sum() / max(len(result), 1)
+    effective_color_by_type = color_by_type and other_frac <= 0.6
+
+    if not effective_color_by_type:
+        result = result.with_columns(pl.lit("other").alias("_vcat"))
+
+    # Map type names to indices.
+    type_to_idx = {name: i for i, name in enumerate(_VESSEL_TYPE_ORDER)}
+    other_idx = type_to_idx["other"]
+
+    result = result.with_columns(
+        result["_vcat"].fill_null("other").map_elements(
+            lambda v: type_to_idx.get(v, other_idx),
+            return_dtype=pl.Int32,
+        ).alias("_tidx"),
+    )
+
+    # Type counts.
+    type_counts = dict(
+        result.group_by("_vcat")
+        .agg(pl.len().alias("n"))
+        .iter_rows()
+    )
+
+    # Round coordinates.
+    result = result.with_columns(
+        pl.col(PosCol.LAT).round(4).alias(PosCol.LAT),
+        pl.col(PosCol.LON).round(4).alias(PosCol.LON),
+    )
+
+    # Sort by timestamp and bin.
+    result = result.sort(PosCol.TIMESTAMP)
+    bin_dur = f"{bin_interval_minutes}m"
+    result = result.with_columns(
+        pl.col(PosCol.TIMESTAMP).dt.truncate(bin_dur).alias("_bin"),
+    )
+
+    # Group into bins.
+    grouped = result.group_by("_bin", maintain_order=True).agg(
+        pl.col(PosCol.LAT).alias("_lats"),
+        pl.col(PosCol.LON).alias("_lons"),
+        pl.col("_tidx").alias("_types"),
+        pl.col(PosCol.MMSI).alias("_mmsis"),
+    ).sort("_bin")
+
+    # Build MMSI → index mapping for compact JS-side vessel tracking.
+    unique_mmsis = result[PosCol.MMSI].unique().sort().to_list()
+    mmsi_to_idx = {m: i for i, m in enumerate(unique_mmsis)}
+
+    bins: list[list[list[float | int]]] = []
+    bin_timestamps_ms: list[int] = []
+    cumul_vessels: list[int] = []
+    seen_mmsis: set[int] = set()
+
+    for row in grouped.iter_rows(named=True):
+        bin_ts = row["_bin"]
+        lats = row["_lats"]
+        lons = row["_lons"]
+        types = row["_types"]
+        mmsis = row["_mmsis"]
+
+        bin_data: list[list[float | int]] = []
+        for lat, lon, tidx, mmsi in zip(lats, lons, types, mmsis):
+            bin_data.append([lat, lon, tidx, mmsi_to_idx.get(mmsi, 0)])
+
+        bins.append(bin_data)
+        bin_timestamps_ms.append(int(bin_ts.timestamp() * 1000))
+        seen_mmsis.update(mmsis)
+        cumul_vessels.append(len(seen_mmsis))
+
+    # Auto view.
+    center_lat, center_lon, zoom = _auto_view_positions(result)
+
+    return {
+        "bins": bins,
+        "type_counts": type_counts,
+        "cumul_vessels": cumul_vessels,
+        "bin_timestamps_ms": bin_timestamps_ms,
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "zoom": zoom,
+        "color_by_type": effective_color_by_type,
+        "palette": [VESSEL_TYPE_PALETTE[name] for name in _VESSEL_TYPE_ORDER],
+        "type_names": _VESSEL_TYPE_ORDER[:],
+    }
+
+
+def generate_timelapse(
+    positions: pl.DataFrame | pl.LazyFrame,
+    *,
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    config: TimelapsConfig | None = None,
+    output: str = "timelapse.html",
+    max_points: int | None = 200_000,
+    panels: list[dict] | None = None,
+) -> str:
+    """Generate a standalone HTML timelapse corridor visualization.
+
+    Produces a self-contained HTML file showing AIS positions
+    accumulating over time to reveal shipping corridors — similar to
+    Kpler's AIS timelapse videos. Uses Canvas 2D with additive blending
+    over a MapLibre GL dark basemap.
+
+    For multi-panel mode, pass ``panels`` — a list of dicts each with
+    ``"positions"`` (DataFrame), ``"config"`` (TimelapsConfig), and
+    ``"label"`` (str) keys. The top-level ``positions``/``config`` are
+    ignored when ``panels`` is set.
+
+    Args:
+        positions: Positions DataFrame or LazyFrame.
+        vessels: Optional vessels DataFrame for ship-type enrichment.
+        config: Timelapse configuration. Default settings if None.
+        output: Output file path. Default ``"timelapse.html"``.
+        max_points: Max positions per panel. Default 200K.
+        panels: Optional list of panel specifications for multi-panel.
+
+    Returns:
+        The absolute path to the generated HTML file.
+    """
+    from neptune_ais._timelapse_template import render_timelapse
+
+    if config is None:
+        config = TimelapsConfig()
+
+    if panels is not None:
+        # Multi-panel mode.
+        panels_data = []
+        for p in panels:
+            p_config = p.get("config") or TimelapsConfig()
+            prep = prepare_timelapse(
+                p["positions"],
+                vessels=p.get("vessels", vessels),
+                max_points=max_points,
+                bin_interval_minutes=p_config.bin_interval_minutes,
+                color_by_type=p_config.color_by_type,
+            )
+            center_lat = p_config.center_lat or prep["center_lat"]
+            center_lon = p_config.center_lon or prep["center_lon"]
+            zoom = p_config.zoom or prep["zoom"]
+            panels_data.append({
+                "label": p.get("label", ""),
+                "bins_json": _safe_json_embed(prep["bins"]),
+                "cumul_vessels_json": _safe_json_embed(prep["cumul_vessels"]),
+                "bin_timestamps_ms_json": _safe_json_embed(
+                    prep["bin_timestamps_ms"],
+                ),
+                "center_lat": center_lat,
+                "center_lon": center_lon,
+                "zoom": zoom,
+                "n_bins": len(prep["bins"]),
+                "config": {
+                    "dot_radius": p_config.dot_radius,
+                    "dot_alpha": p_config.dot_alpha,
+                    "fade_factor": p_config.fade_factor,
+                    "bloom": p_config.bloom,
+                },
+            })
+
+        # Use global palette + type info from first panel.
+        first_prep = prepare_timelapse(
+            panels[0]["positions"],
+            vessels=panels[0].get("vessels", vessels),
+            max_points=1,
+            color_by_type=config.color_by_type,
+        )
+
+        data = {
+            "multi": True,
+            "panels_json": _safe_json_embed(panels_data),
+            "n_panels": len(panels_data),
+            "title": config.title,
+            "subtitle": config.subtitle,
+            "palette_json": _safe_json_embed(first_prep["palette"]),
+            "type_names_json": _safe_json_embed(first_prep["type_names"]),
+            "color_by_type": first_prep["color_by_type"],
+            "speed": config.speed,
+            "layout": config.layout,
+            "dot_radius": config.dot_radius,
+            "dot_alpha": config.dot_alpha,
+            "fade_factor": config.fade_factor,
+            "bloom": config.bloom,
+        }
+    else:
+        # Single-panel mode.
+        prep = prepare_timelapse(
+            positions,
+            vessels=vessels,
+            max_points=max_points,
+            bin_interval_minutes=config.bin_interval_minutes,
+            color_by_type=config.color_by_type,
+        )
+
+        if not prep["bins"]:
+            raise ValueError("No positions found for timelapse.")
+
+        center_lat = config.center_lat or prep["center_lat"]
+        center_lon = config.center_lon or prep["center_lon"]
+        zoom = config.zoom or prep["zoom"]
+
+        data = {
+            "multi": False,
+            "title": config.title,
+            "subtitle": config.subtitle,
+            "bins_json": _safe_json_embed(prep["bins"]),
+            "cumul_vessels_json": _safe_json_embed(prep["cumul_vessels"]),
+            "bin_timestamps_ms_json": _safe_json_embed(
+                prep["bin_timestamps_ms"],
+            ),
+            "type_counts_json": _safe_json_embed(prep["type_counts"]),
+            "palette_json": _safe_json_embed(prep["palette"]),
+            "type_names_json": _safe_json_embed(prep["type_names"]),
+            "color_by_type": prep["color_by_type"],
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "zoom": zoom,
+            "speed": config.speed,
+            "dot_radius": config.dot_radius,
+            "dot_alpha": config.dot_alpha,
+            "fade_factor": config.fade_factor,
+            "bloom": config.bloom,
+        }
+
+    html = render_timelapse(data)
 
     out_path = Path(output).resolve()
     out_path.write_text(html)
