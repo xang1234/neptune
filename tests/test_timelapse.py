@@ -328,19 +328,19 @@ class TestGenerateTimelapse:
             output=str(tmp_path / "t.html"),
         )
         html = Path(out).read_text()
-        assert "blur(4px)" in html
+        assert "UnrealBloomPass" in html
 
     def test_hidpi_scaling(self, tmp_path: Path) -> None:
         df = _sample_positions(30, with_ship_type=True)
         out = generate_timelapse(df, output=str(tmp_path / "t.html"))
         html = Path(out).read_text()
-        assert "devicePixelRatio" in html
+        assert "setPixelRatio" in html
 
     def test_fade_uses_destination_out(self, tmp_path: Path) -> None:
         df = _sample_positions(30, with_ship_type=True)
         out = generate_timelapse(df, output=str(tmp_path / "t.html"))
         html = Path(out).read_text()
-        assert "destination-out" in html
+        assert "uFadeFactor" in html
 
     def test_xss_protection(self, tmp_path: Path) -> None:
         df = _sample_positions(10, with_ship_type=True)

@@ -1,9 +1,8 @@
 """Timelapse HTML template — cinematic vessel corridor visualization.
 
-Produces a standalone HTML file with Canvas 2D additive-blending
-accumulation over a MapLibre GL dark basemap. Positions build up
-over time to reveal shipping corridors — like long-exposure
-photography of maritime traffic.
+Produces a standalone HTML file with Three.js WebGL rendering over a
+MapLibre GL dark basemap. Line segments with custom glow shaders and
+UnrealBloomPass post-processing create neon-tube corridor effects.
 
 Assembled from named ``string.Template`` sections and rendered by
 :func:`viz.generate_timelapse`. Uses ``$var`` substitution so that
@@ -43,6 +42,11 @@ body {
 .panel-overlay {
   position: absolute; top: 0; left: 0; right: 0; bottom: 0;
   pointer-events: none; z-index: 2;
+}
+.panel-overlay canvas {
+  position: absolute; top: 0; left: 0;
+  pointer-events: none;
+  mix-blend-mode: screen;
 }
 
 /* ── multi-panel grid ──────────────────────── */
@@ -149,6 +153,15 @@ body {
 # HTML
 # ---------------------------------------------------------------------------
 
+_IMPORTMAP = """\
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.170.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.170.0/examples/jsm/"
+}}
+</script>
+"""
+
 _SINGLE_PANEL_HTML = Template("""\
 <!DOCTYPE html>
 <html lang="en">
@@ -158,6 +171,7 @@ _SINGLE_PANEL_HTML = Template("""\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+""" + _IMPORTMAP + """
 <style>
 """ + _CSS + """
 </style>
@@ -167,7 +181,7 @@ _SINGLE_PANEL_HTML = Template("""\
   <div class="panel-cell" id="panel-0">
     <div class="panel-map" id="map-0"></div>
     <div class="panel-darken"></div>
-    <canvas class="panel-overlay" id="display-0"></canvas>
+    <div class="panel-overlay" id="display-0"></div>
   </div>
 </div>
 
@@ -194,7 +208,7 @@ _SINGLE_PANEL_HTML = Template("""\
   <span id="speed-label">$speed_label</span>
 </div>
 
-<script>
+<script type="module">
 """)
 
 _MULTI_PANEL_HTML = Template("""\
@@ -206,6 +220,7 @@ _MULTI_PANEL_HTML = Template("""\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+""" + _IMPORTMAP + """
 <style>
 """ + _CSS + """
 #container {
@@ -236,11 +251,11 @@ _MULTI_PANEL_HTML = Template("""\
   <span id="speed-label">$speed_label</span>
 </div>
 
-<script>
+<script type="module">
 """)
 
 # ---------------------------------------------------------------------------
-# JavaScript
+# JavaScript — data sections (unchanged from Canvas 2D version)
 # ---------------------------------------------------------------------------
 
 _JS_SINGLE_DATA = Template("""\
@@ -303,16 +318,112 @@ const PANELS_CFG = PANELS_RAW.map(function(p) {
 });
 """)
 
+# ---------------------------------------------------------------------------
+# JavaScript — Three.js WebGL engine
+# ---------------------------------------------------------------------------
+
 _JS_ENGINE = """\
-// ── Canvas engine ─────────────────────────────
-// Two-layer rendering:
-//   accumCanvas — persistent corridor traces (line segments, slow fade)
-//   activeCanvas — bright moving vessel heads + short trails (cleared each frame)
+// ── Three.js WebGL engine ─────────────────────
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+// ── Shaders ───────────────────────────────────
+const LINE_VERT = `
+attribute vec2 aStart;
+attribute vec2 aEnd;
+attribute float aQuadVertex;
+attribute vec3 aColor;
+attribute float aAlpha;
+varying float vDist;
+varying vec3 vColor;
+varying float vAlpha;
+uniform vec2 uResolution;
+uniform float uLineWidth;
+void main() {
+  vec2 dir = aEnd - aStart;
+  float len = length(dir);
+  if (len < 0.001) { gl_Position = vec4(2.0,2.0,0.0,1.0); return; }
+  vec2 fwd = dir / len;
+  vec2 nrm = vec2(-fwd.y, fwd.x);
+  float side = (mod(aQuadVertex, 2.0) < 0.5) ? -1.0 : 1.0;
+  float along = (aQuadVertex < 1.5) ? 0.0 : 1.0;
+  vec2 pos = mix(aStart, aEnd, along) + nrm * side * uLineWidth * 0.5;
+  vec2 ndc = (pos / uResolution) * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vDist = side;
+  vColor = aColor;
+  vAlpha = aAlpha;
+}`;
+
+const LINE_FRAG = `
+precision highp float;
+varying float vDist;
+varying vec3 vColor;
+varying float vAlpha;
+void main() {
+  float d = abs(vDist);
+  float core = smoothstep(0.35, 0.0, d);
+  float glow = exp(-d * d * 5.0);
+  float intensity = core * 0.9 + glow * 0.35;
+  gl_FragColor = vec4(vColor * intensity * 1.3 * vAlpha, intensity * vAlpha);
+}`;
+
+const FADE_FRAG = `
+precision highp float;
+uniform sampler2D tDiffuse;
+uniform float uFadeFactor;
+varying vec2 vUv;
+void main() {
+  gl_FragColor = texture2D(tDiffuse, vUv) * uFadeFactor;
+}`;
+
+const COMPOSITE_FRAG = `
+precision highp float;
+uniform sampler2D tAccum;
+uniform sampler2D tActive;
+varying vec2 vUv;
+void main() {
+  gl_FragColor = texture2D(tAccum, vUv) + texture2D(tActive, vUv);
+}`;
+
+const HEAD_VERT = `
+precision highp float;
+attribute vec3 position;
+attribute vec3 aHeadColor;
+varying vec3 vColor;
+uniform float uPointSize;
+uniform vec2 uResolution;
+void main() {
+  vColor = aHeadColor;
+  gl_PointSize = uPointSize;
+  vec2 ndc = (position.xy / uResolution) * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+}`;
+
+const HEAD_FRAG = `
+precision highp float;
+varying vec3 vColor;
+void main() {
+  float d = length(gl_PointCoord - 0.5) * 2.0;
+  if (d > 1.0) discard;
+  float core = smoothstep(0.3, 0.0, d);
+  float glow = exp(-d * d * 3.0);
+  float intensity = core + glow * 0.5;
+  gl_FragColor = vec4(vColor * intensity * 1.5, intensity);
+}`;
+
+// ── State ─────────────────────────────────────
 const dpr = window.devicePixelRatio || 1;
 const speedSteps = [1, 2, 4, 8, 16, 32];
 let speedIdx = speedSteps.indexOf(CONFIG.speed);
 if (speedIdx < 0) speedIdx = 2;
-const MAX_TRAIL_DIST = 150; // max pixel distance for line continuity
+const MAX_TRAIL_DIST = 150;
+const BIN_MAX_SEGS = 8000;
+const MAX_HEADS = 10000;
 
 const state = {
   playing: false,
@@ -320,16 +431,17 @@ const state = {
   accumBins: [],
   projected: [],
   speed: CONFIG.speed,
-  vesselPos: [],   // per-panel: Map of mmsiIdx → {px, py, typeIdx}
+  vesselPos: [],
 };
 
 const panelCtx = [];
 
+// ── Panel init ────────────────────────────────
 function initPanel(idx) {
   const cfg = PANELS_CFG[idx];
   const mapContainer = document.getElementById('map-' + idx);
-  const displayCanvas = document.getElementById('display-' + idx);
-  const cell = displayCanvas.parentElement;
+  const overlayDiv = document.getElementById('display-' + idx);
+  const cell = overlayDiv.parentElement;
 
   const map = new maplibregl.Map({
     container: mapContainer,
@@ -341,69 +453,140 @@ function initPanel(idx) {
   });
 
   const rect = cell.getBoundingClientRect();
-  const w = rect.width;
-  const h = rect.height;
+  const w = rect.width, h = rect.height;
+  const pw = Math.floor(w * dpr), ph = Math.floor(h * dpr);
 
-  function sizeCanvas(canvas) {
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    return ctx;
+  // Renderer
+  const renderer = new THREE.WebGLRenderer({ alpha: true, premultipliedAlpha: false });
+  renderer.setSize(w, h);
+  renderer.setPixelRatio(dpr);
+  renderer.setClearColor(0x000000, 0);
+  renderer.autoClear = false;
+  overlayDiv.appendChild(renderer.domElement);
+
+  // Camera (pixel-space orthographic)
+  const camera = new THREE.OrthographicCamera(0, w, 0, h, -1, 1);
+  // Fullscreen quad camera for post-processing
+  const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+  // HDR render targets
+  const rtOpts = { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter,
+                   magFilter: THREE.LinearFilter, format: THREE.RGBAFormat };
+  let rtA = new THREE.WebGLRenderTarget(pw, ph, rtOpts);
+  let rtB = new THREE.WebGLRenderTarget(pw, ph, rtOpts);
+  const rtActive = new THREE.WebGLRenderTarget(pw, ph, rtOpts);
+
+  // ── Line segment geometry (per-bin, reusable) ──
+  const startArr = new Float32Array(BIN_MAX_SEGS * 4 * 2);
+  const endArr = new Float32Array(BIN_MAX_SEGS * 4 * 2);
+  const qvArr = new Float32Array(BIN_MAX_SEGS * 4);
+  const colArr = new Float32Array(BIN_MAX_SEGS * 4 * 3);
+  const alpArr = new Float32Array(BIN_MAX_SEGS * 4);
+  const posArr = new Float32Array(BIN_MAX_SEGS * 4 * 3); // dummy position
+
+  const lineGeom = new THREE.BufferGeometry();
+  const mkAttr = (arr, sz) => { const a = new THREE.BufferAttribute(arr, sz);
+    a.setUsage(THREE.DynamicDrawUsage); return a; };
+  lineGeom.setAttribute('position', mkAttr(posArr, 3));
+  lineGeom.setAttribute('aStart', mkAttr(startArr, 2));
+  lineGeom.setAttribute('aEnd', mkAttr(endArr, 2));
+  lineGeom.setAttribute('aQuadVertex', mkAttr(qvArr, 1));
+  lineGeom.setAttribute('aColor', mkAttr(colArr, 3));
+  lineGeom.setAttribute('aAlpha', mkAttr(alpArr, 1));
+
+  // Index buffer (static pattern)
+  const idxArr = new Uint32Array(BIN_MAX_SEGS * 6);
+  for (let i = 0; i < BIN_MAX_SEGS; i++) {
+    const b = i * 4, o = i * 6;
+    idxArr[o]=b; idxArr[o+1]=b+1; idxArr[o+2]=b+2;
+    idxArr[o+3]=b; idxArr[o+4]=b+2; idxArr[o+5]=b+3;
   }
+  lineGeom.setIndex(new THREE.BufferAttribute(idxArr, 1));
+  lineGeom.setDrawRange(0, 0);
 
-  const displayCtx = sizeCanvas(displayCanvas);
-  const accumCanvas = document.createElement('canvas');
-  const accumCtx = sizeCanvas(accumCanvas);
-  const activeCanvas = document.createElement('canvas');
-  const activeCtx = sizeCanvas(activeCanvas);
-  const bloomCanvas = document.createElement('canvas');
-  const bloomCtx = sizeCanvas(bloomCanvas);
+  const lineMat = new THREE.RawShaderMaterial({
+    vertexShader: LINE_VERT, fragmentShader: LINE_FRAG,
+    uniforms: { uResolution: { value: new THREE.Vector2(w, h) },
+                uLineWidth: { value: Math.max(5.0, cfg.dotRadius * 6.0) } },
+    blending: THREE.AdditiveBlending, transparent: true,
+    depthTest: false, depthWrite: false,
+    glslVersion: THREE.GLSL1,
+  });
 
-  // Dot stamps for accumulation layer (dim, for corridor traces).
-  const dotStamps = [];
-  const dotSize = Math.ceil(cfg.dotRadius * 4);
-  for (let t = 0; t < PALETTE.length; t++) {
-    const c = document.createElement('canvas');
-    c.width = dotSize * dpr; c.height = dotSize * dpr;
-    const dc = c.getContext('2d'); dc.scale(dpr, dpr);
-    const cx = dotSize / 2, cy = dotSize / 2;
-    const grad = dc.createRadialGradient(cx, cy, 0, cx, cy, dotSize / 2);
-    const col = PALETTE[t]; const a = cfg.dotAlpha;
-    grad.addColorStop(0, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + a + ')');
-    grad.addColorStop(0.3, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + (a * 0.4) + ')');
-    grad.addColorStop(1, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',0)');
-    dc.fillStyle = grad; dc.fillRect(0, 0, dotSize, dotSize);
-    dotStamps.push(c);
-  }
+  const lineMesh = new THREE.Mesh(lineGeom, lineMat);
+  const lineScene = new THREE.Scene();
+  lineScene.add(lineMesh);
 
-  // Bright dot stamps for active layer (vessel heads).
-  const brightDotStamps = [];
-  const brightSize = Math.ceil(cfg.dotRadius * 6);
-  for (let t = 0; t < PALETTE.length; t++) {
-    const c = document.createElement('canvas');
-    c.width = brightSize * dpr; c.height = brightSize * dpr;
-    const dc = c.getContext('2d'); dc.scale(dpr, dpr);
-    const cx = brightSize / 2, cy = brightSize / 2;
-    const grad = dc.createRadialGradient(cx, cy, 0, cx, cy, brightSize / 2);
-    const col = PALETTE[t];
-    grad.addColorStop(0, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',0.9)');
-    grad.addColorStop(0.2, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',0.5)');
-    grad.addColorStop(0.5, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',0.15)');
-    grad.addColorStop(1, 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',0)');
-    dc.fillStyle = grad; dc.fillRect(0, 0, brightSize, brightSize);
-    brightDotStamps.push(c);
-  }
+  // ── Fade fullscreen quad ──
+  const fadeGeom = new THREE.PlaneGeometry(2, 2);
+  const fadeMat = new THREE.ShaderMaterial({
+    vertexShader: 'varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+    fragmentShader: FADE_FRAG,
+    uniforms: { tDiffuse: { value: null }, uFadeFactor: { value: cfg.fadeFactor } },
+    depthTest: false, depthWrite: false,
+  });
+  const fadeQuad = new THREE.Mesh(fadeGeom, fadeMat);
+  const fadeScene = new THREE.Scene();
+  fadeScene.add(fadeQuad);
+
+  // ── Vessel head points ──
+  const headPosArr = new Float32Array(MAX_HEADS * 3);
+  const headColArr = new Float32Array(MAX_HEADS * 3);
+  const headGeom = new THREE.BufferGeometry();
+  const hpAttr = new THREE.BufferAttribute(headPosArr, 3);
+  hpAttr.setUsage(THREE.DynamicDrawUsage);
+  headGeom.setAttribute('position', hpAttr);
+  const hcAttr = new THREE.BufferAttribute(headColArr, 3);
+  hcAttr.setUsage(THREE.DynamicDrawUsage);
+  headGeom.setAttribute('aHeadColor', hcAttr);
+  headGeom.setDrawRange(0, 0);
+
+  const headMat = new THREE.RawShaderMaterial({
+    vertexShader: HEAD_VERT, fragmentShader: HEAD_FRAG,
+    uniforms: {
+      uPointSize: { value: Math.max(8.0, cfg.dotRadius * 8.0) * dpr },
+      uResolution: { value: new THREE.Vector2(w, h) },
+    },
+    blending: THREE.AdditiveBlending, transparent: true,
+    depthTest: false, depthWrite: false,
+    glslVersion: THREE.GLSL1,
+  });
+  const headPoints = new THREE.Points(headGeom, headMat);
+  const headScene = new THREE.Scene();
+  headScene.add(headPoints);
+
+  // ── EffectComposer ──
+  // First pass: composite accumulation + active textures
+  const compShader = {
+    uniforms: {
+      tDiffuse: { value: null },  // required by ShaderPass convention (unused)
+      tAccum: { value: null },
+      tActive: { value: null },
+    },
+    vertexShader: 'varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+    fragmentShader: COMPOSITE_FRAG,
+  };
+  const composer = new EffectComposer(renderer);
+  const compPass = new ShaderPass(compShader);
+  composer.addPass(compPass);
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(pw, ph),
+    cfg.bloom ? 1.5 : 0.0,
+    0.4,
+    0.1
+  );
+  composer.addPass(bloomPass);
+
+  let binSegCount = 0;
 
   const panel = {
-    map, displayCanvas, displayCtx,
-    accumCanvas, accumCtx,
-    activeCanvas, activeCtx,
-    bloomCanvas, bloomCtx,
-    dotStamps, brightDotStamps,
-    w, h, dotSize, brightSize, cfg,
+    map, renderer, camera, quadCamera,
+    rtA, rtB, rtActive,
+    lineScene, lineGeom, lineMat, startArr, endArr, qvArr, colArr, alpArr,
+    fadeScene, fadeMat,
+    headScene, headGeom, headPosArr, headColArr,
+    composer, compPass, bloomPass,
+    w, h, pw, ph, cfg, binSegCount,
   };
 
   panelCtx.push(panel);
@@ -411,16 +594,16 @@ function initPanel(idx) {
   state.projected.push(false);
   state.vesselPos.push(new Map());
 
-  // Project coordinates once map loads.
-  // Point format: [lat, lon, typeIdx, mmsiIdx, px, py]
+  // Project coordinates once map loads
+  // Point format: [lat, lon, typeIdx, mmsiIdx] → append [px, py] at indices 4,5
   map.on('load', function() {
     const bins = cfg.bins;
     for (let b = 0; b < bins.length; b++) {
       const bin = bins[b];
-      for (let p = 0; p < bin.length; p++) {
-        const pt = bin[p];
+      for (let i = 0; i < bin.length; i++) {
+        const pt = bin[i];
         const proj = map.project([pt[1], pt[0]]);
-        pt.push(proj.x, proj.y);  // indices 4, 5
+        pt.push(proj.x, proj.y);
       }
     }
     state.projected[idx] = true;
@@ -440,124 +623,144 @@ function checkAllProjected() {
   requestAnimationFrame(animate);
 }
 
-// Render a bin: draw line segments + dots on accumulation canvas,
-// update per-vessel positions for active layer.
-function renderBin(pIdx, binIdx) {
+// ── Line segment buffer ───────────────────────
+function addSegment(p, sx, sy, ex, ey, r, g, b, alpha) {
+  if (p.binSegCount >= BIN_MAX_SEGS) return;
+  const i = p.binSegCount;
+  const b4 = i * 4;
+  for (let v = 0; v < 4; v++) {
+    const vi = b4 + v;
+    p.startArr[vi * 2] = sx; p.startArr[vi * 2 + 1] = sy;
+    p.endArr[vi * 2] = ex; p.endArr[vi * 2 + 1] = ey;
+    p.qvArr[vi] = v;
+    p.colArr[vi * 3] = r; p.colArr[vi * 3 + 1] = g; p.colArr[vi * 3 + 2] = b;
+    p.alpArr[vi] = alpha;
+  }
+  p.binSegCount++;
+}
+
+function flushSegments(p) {
+  if (p.binSegCount === 0) return;
+  const g = p.lineGeom;
+  g.attributes.aStart.needsUpdate = true;
+  g.attributes.aEnd.needsUpdate = true;
+  g.attributes.aQuadVertex.needsUpdate = true;
+  g.attributes.aColor.needsUpdate = true;
+  g.attributes.aAlpha.needsUpdate = true;
+  g.setDrawRange(0, p.binSegCount * 6);
+}
+
+// ── Vessel heads ──────────────────────────────
+function updateHeads(pIdx) {
+  const p = panelCtx[pIdx];
+  const vpos = state.vesselPos[pIdx];
+  let count = 0;
+  vpos.forEach(function(v) {
+    if (count >= MAX_HEADS) return;
+    p.headPosArr[count*3] = v.px;
+    p.headPosArr[count*3+1] = v.py;
+    p.headPosArr[count*3+2] = 0;
+    const col = PALETTE[v.typeIdx] || PALETTE[0];
+    p.headColArr[count*3] = col[0]/255;
+    p.headColArr[count*3+1] = col[1]/255;
+    p.headColArr[count*3+2] = col[2]/255;
+    count++;
+  });
+  p.headGeom.setDrawRange(0, count);
+  p.headGeom.attributes.position.needsUpdate = true;
+  p.headGeom.attributes.aHeadColor.needsUpdate = true;
+}
+
+// ── Per-frame render ──────────────────────────
+function renderFrame(pIdx, binIdx) {
   const p = panelCtx[pIdx];
   const bin = p.cfg.bins[binIdx];
-  if (!bin) return;
 
-  const vpos = state.vesselPos[pIdx];
-  const half = p.dotSize / 2;
+  // Step 1: Fade rtA → rtB
+  p.fadeMat.uniforms.tDiffuse.value = p.rtA.texture;
+  p.fadeMat.uniforms.uFadeFactor.value = p.cfg.fadeFactor;
+  p.renderer.setRenderTarget(p.rtB);
+  p.renderer.clear();
+  p.renderer.render(p.fadeScene, p.quadCamera);
 
-  p.accumCtx.globalCompositeOperation = 'lighter';
+  // Step 2: Render new line segments additively onto rtB
+  if (bin && bin.length > 0) {
+    p.binSegCount = 0;
+    const vpos = state.vesselPos[pIdx];
+    const alpha = p.cfg.dotAlpha;
 
-  for (let i = 0; i < bin.length; i++) {
-    const pt = bin[i];
-    const px = pt[4], py = pt[5];
-    const typeIdx = pt[2] || 0;
-    const mmsiIdx = pt[3] || 0;
-    const col = PALETTE[typeIdx] || PALETTE[0];
-    const a = p.cfg.dotAlpha;
+    for (let i = 0; i < bin.length; i++) {
+      const pt = bin[i];
+      const px = pt[4], py = pt[5];
+      const typeIdx = pt[2] || 0;
+      const mmsiIdx = pt[3] || 0;
+      const col = PALETTE[typeIdx] || PALETTE[0];
+      const r = col[0]/255, g = col[1]/255, b = col[2]/255;
 
-    // Draw line segment from previous position (corridor trace).
-    const prev = vpos.get(mmsiIdx);
-    if (prev) {
-      const dx = px - prev.px, dy = py - prev.py;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist > 0.5 && dist < MAX_TRAIL_DIST) {
-        p.accumCtx.strokeStyle = 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + (a * 0.7) + ')';
-        p.accumCtx.lineWidth = Math.max(0.8, p.cfg.dotRadius * 0.8);
-        p.accumCtx.beginPath();
-        p.accumCtx.moveTo(prev.px, prev.py);
-        p.accumCtx.lineTo(px, py);
-        p.accumCtx.stroke();
+      const prev = vpos.get(mmsiIdx);
+      if (prev) {
+        const dx = px - prev.px, dy = py - prev.py;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist > 0.5 && dist < MAX_TRAIL_DIST) {
+          addSegment(p, prev.px, prev.py, px, py, r, g, b, alpha);
+        }
       }
+      vpos.set(mmsiIdx, { px, py, typeIdx });
     }
+    flushSegments(p);
 
-    // Draw dot at position.
-    p.accumCtx.drawImage(p.dotStamps[typeIdx], px - half, py - half, p.dotSize, p.dotSize);
-
-    // Update vessel position.
-    vpos.set(mmsiIdx, {px, py, typeIdx});
-  }
-}
-
-// Render bright active vessel heads on the active canvas.
-function renderActive(pIdx) {
-  const p = panelCtx[pIdx];
-  p.activeCtx.clearRect(0, 0, p.w, p.h);
-  p.activeCtx.globalCompositeOperation = 'lighter';
-
-  const vpos = state.vesselPos[pIdx];
-  const half = p.brightSize / 2;
-
-  vpos.forEach(function(v) {
-    p.activeCtx.drawImage(
-      p.brightDotStamps[v.typeIdx],
-      v.px - half, v.py - half,
-      p.brightSize, p.brightSize
-    );
-  });
-}
-
-// Apply fade to accumulated canvas.
-function applyFade(pIdx) {
-  const p = panelCtx[pIdx];
-  const ff = p.cfg.fadeFactor;
-  if (ff >= 1.0) return;
-  p.accumCtx.globalCompositeOperation = 'destination-out';
-  p.accumCtx.fillStyle = 'rgba(0,0,0,' + (1 - ff) + ')';
-  p.accumCtx.fillRect(0, 0, p.w, p.h);
-}
-
-// Composite all layers to display.
-function compositeDisplay(pIdx) {
-  const p = panelCtx[pIdx];
-  p.displayCtx.clearRect(0, 0, p.w, p.h);
-
-  if (p.cfg.bloom) {
-    p.bloomCtx.clearRect(0, 0, p.w, p.h);
-    p.bloomCtx.filter = 'blur(4px)';
-    p.bloomCtx.globalCompositeOperation = 'source-over';
-    p.bloomCtx.drawImage(p.accumCanvas, 0, 0, p.w * dpr, p.h * dpr, 0, 0, p.w, p.h);
-    p.bloomCtx.filter = 'none';
-
-    p.displayCtx.globalCompositeOperation = 'lighter';
-    p.displayCtx.globalAlpha = 0.3;
-    p.displayCtx.drawImage(p.bloomCanvas, 0, 0, p.w * dpr, p.h * dpr, 0, 0, p.w, p.h);
-    p.displayCtx.globalAlpha = 1.0;
+    p.renderer.setRenderTarget(p.rtB);
+    p.renderer.render(p.lineScene, p.camera);
   }
 
-  // Corridor traces.
-  p.displayCtx.globalCompositeOperation = 'lighter';
-  p.displayCtx.drawImage(p.accumCanvas, 0, 0, p.w * dpr, p.h * dpr, 0, 0, p.w, p.h);
+  // Step 3: Swap
+  const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
 
-  // Bright vessel heads on top.
-  p.displayCtx.drawImage(p.activeCanvas, 0, 0, p.w * dpr, p.h * dpr, 0, 0, p.w, p.h);
+  // Step 4: Render heads
+  updateHeads(pIdx);
+  p.renderer.setRenderTarget(p.rtActive);
+  p.renderer.clear();
+  p.renderer.render(p.headScene, p.camera);
+
+  // Step 5: Composite + bloom → screen
+  p.compPass.uniforms.tAccum.value = p.rtA.texture;
+  p.compPass.uniforms.tActive.value = p.rtActive.texture;
+  p.renderer.setRenderTarget(null);
+  p.renderer.clear();
+  p.composer.render();
 }
 
-// Re-render all bins up to target (for scrub/seek).
+// Fade-only frame (no new bin)
+function renderIdle(pIdx) {
+  const p = panelCtx[pIdx];
+  p.fadeMat.uniforms.tDiffuse.value = p.rtA.texture;
+  p.renderer.setRenderTarget(p.rtB);
+  p.renderer.clear();
+  p.renderer.render(p.fadeScene, p.quadCamera);
+  const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
+
+  p.compPass.uniforms.tAccum.value = p.rtA.texture;
+  p.compPass.uniforms.tActive.value = p.rtActive.texture;
+  p.renderer.setRenderTarget(null);
+  p.renderer.clear();
+  p.composer.render();
+}
+
+// Scrub/seek
 function renderUpTo(pIdx, targetBin) {
   const p = panelCtx[pIdx];
-  p.accumCtx.clearRect(0, 0, p.w, p.h);
+  p.renderer.setRenderTarget(p.rtA); p.renderer.clear();
+  p.renderer.setRenderTarget(p.rtB); p.renderer.clear();
   state.vesselPos[pIdx] = new Map();
-
   for (let i = 0; i <= targetBin; i++) {
-    // Apply fade between bins during rebuild for consistent look.
-    applyFade(pIdx);
-    renderBin(pIdx, i);
+    renderFrame(pIdx, i);
   }
   state.accumBins[pIdx] = targetBin + 1;
-  renderActive(pIdx);
-  compositeDisplay(pIdx);
 }
 
 function maxBins() {
   let m = 0;
-  for (let i = 0; i < N_PANELS; i++) {
-    m = Math.max(m, PANELS_CFG[i].bins.length);
-  }
+  for (let i = 0; i < N_PANELS; i++) m = Math.max(m, PANELS_CFG[i].bins.length);
   return m;
 }
 
@@ -585,34 +788,35 @@ function animate(now) {
       state.currentBin = 0;
       for (let i = 0; i < N_PANELS; i++) {
         state.accumBins[i] = 0;
-        panelCtx[i].accumCtx.clearRect(0, 0, panelCtx[i].w, panelCtx[i].h);
+        const p = panelCtx[i];
+        p.renderer.setRenderTarget(p.rtA); p.renderer.clear();
+        p.renderer.setRenderTarget(p.rtB); p.renderer.clear();
         state.vesselPos[i] = new Map();
       }
     }
 
     const targetBin = Math.min(Math.floor(state.currentBin), MB - 1);
+    let rendered = false;
 
     for (let i = 0; i < N_PANELS; i++) {
       const nBins = PANELS_CFG[i].bins.length;
       const panelTarget = Math.min(targetBin, nBins - 1);
 
-      applyFade(i);
-
-      while (state.accumBins[i] <= panelTarget) {
-        renderBin(i, state.accumBins[i]);
-        state.accumBins[i]++;
+      if (state.accumBins[i] <= panelTarget) {
+        while (state.accumBins[i] <= panelTarget) {
+          renderFrame(i, state.accumBins[i]);
+          state.accumBins[i]++;
+        }
+        rendered = true;
+      } else {
+        renderIdle(i);
       }
-
-      renderActive(i);
-      compositeDisplay(i);
     }
 
     sliderEl.value = Math.floor((targetBin / Math.max(MB - 1, 1)) * 1000);
-
     const ts0 = PANELS_CFG[0].binTimestamps;
     const tIdx = Math.min(targetBin, ts0.length - 1);
     if (tIdx >= 0) tsEl.textContent = formatTimestamp(ts0[tIdx]);
-
     if (vcEl && N_PANELS === 1) {
       const cv = PANELS_CFG[0].cumulVessels;
       const vIdx = Math.min(targetBin, cv.length - 1);
@@ -670,6 +874,7 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
+// ── Init ──────────────────────────────────────
 for (let i = 0; i < N_PANELS; i++) {
   initPanel(i);
 }
@@ -753,7 +958,7 @@ def render_timelapse(data: dict) -> str:
                 f'<div class="panel-cell" id="panel-cell-{i}">\n'
                 f'    <div class="panel-map" id="map-{i}"></div>\n'
                 f'    <div class="panel-darken"></div>\n'
-                f'    <canvas class="panel-overlay" id="display-{i}"></canvas>\n'
+                f'    <div class="panel-overlay" id="display-{i}"></div>\n'
                 f'    <div class="panel-label"><h3>{label}</h3></div>\n'
                 f'  </div>'
             )
@@ -767,9 +972,6 @@ def render_timelapse(data: dict) -> str:
             speed_label=speed_label,
         )
 
-        # For multi-panel, we need to serialize each panel's bins
-        # individually and pass them via PANELS_RAW. The bins_json in
-        # each panel dict is already a JSON string from _safe_json_embed.
         js_data = _JS_MULTI_DATA.substitute(
             palette_json=data["palette_json"],
             type_names_json=data["type_names_json"],

@@ -569,12 +569,12 @@ PALETTE = [
 # Vessel type palette — muted tones tuned for additive blending.
 # Overlapping types produce natural white highlights instead of neon clashing.
 VESSEL_TYPE_PALETTE: dict[str, list[int]] = {
-    "cargo": [40, 100, 220],       # deep blue
-    "tanker": [200, 50, 120],      # muted rose
-    "passenger": [50, 180, 120],   # teal green
-    "fishing": [200, 180, 50],     # warm amber
-    "tug": [120, 60, 200],         # soft purple
-    "other": [120, 130, 160],      # cool gray
+    "cargo": [30, 120, 255],       # vivid blue
+    "tanker": [255, 40, 130],      # vivid magenta
+    "passenger": [40, 230, 150],   # bright teal
+    "fishing": [255, 200, 40],     # vivid amber
+    "tug": [160, 50, 255],         # vivid purple
+    "other": [140, 150, 180],      # cool gray
 }
 
 # Ordered list for index-based lookups in the JS template.
