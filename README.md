@@ -65,7 +65,7 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 - **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, and more
 
 <p align="center">
-  <img src="assets/timelapse_screenshot.png" alt="Neptune AIS timelapse — Gulf of Mexico vessel corridors" width="960">
+  <img src="assets/timelapse.gif" alt="Neptune AIS timelapse — Gulf of Mexico vessel corridors" width="960">
   <br>
   <em>Timelapse corridor visualization — 6,778 vessels in the Gulf of Mexico, colored by type</em>
 </p>
