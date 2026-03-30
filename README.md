@@ -25,6 +25,10 @@
   <a href="https://github.com/yourorg/neptune-ais/actions"><img src="https://img.shields.io/badge/tests-768%20passing-brightgreen" alt="Tests"></a>
 </p>
 
+<p align="center">
+  <img src="assets/dashboard.gif" alt="Neptune AIS Intelligence Dashboard — Port of Los Angeles" width="960">
+</p>
+
 ---
 
 ## What is Neptune?
