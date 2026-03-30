@@ -10,14 +10,22 @@ import polars as pl
 import pytest
 
 from neptune_ais.viz import (
+    DashboardConfig,
+    InfrastructurePoint,
     Viewport,
     _TRIP_PROGRESS,
+    _auto_view,
+    _build_trips,
+    _safe_json_embed,
+    _validate_track_geometry,
+    generate_dashboard,
     prepare_density,
     prepare_events,
     prepare_positions,
     prepare_tracks,
     prepare_trips,
 )
+from neptune_ais.derive.crossings import GateLine
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +376,258 @@ class TestPrepareEvents:
         df = _sample_events(5)
         result = prepare_events(df, event_type="fishing")
         assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# DashboardConfig
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardConfig:
+    def test_defaults(self):
+        cfg = DashboardConfig(title="Test")
+        assert cfg.title == "Test"
+        assert cfg.gate is None
+        assert cfg.event_date is None
+        assert cfg.speed == 21600.0
+        assert cfg.infrastructure == []
+
+    def test_with_gate(self):
+        gate = GateLine("G", (0.0, 0.0), (1.0, 1.0))
+        cfg = DashboardConfig(title="T", gate=gate, event_date="2026-03-01")
+        assert cfg.gate is not None
+        assert cfg.event_date == "2026-03-01"
+
+    def test_with_infrastructure(self):
+        infra = [InfrastructurePoint("Port", 25.0, 55.0, "port")]
+        cfg = DashboardConfig(title="T", infrastructure=infra)
+        assert len(cfg.infrastructure) == 1
+        assert cfg.infrastructure[0].name == "Port"
+
+
+class TestInfrastructurePoint:
+    def test_construction(self):
+        p = InfrastructurePoint("Refinery", 26.0, 56.0, "refinery")
+        assert p.name == "Refinery"
+        assert p.kind == "refinery"
+
+    def test_default_kind(self):
+        p = InfrastructurePoint("Harbor", 10.0, 20.0)
+        assert p.kind == "port"
+
+
+# ---------------------------------------------------------------------------
+# _build_trips helper
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_tracks_with_geometry() -> pl.DataFrame:
+    """Create synthetic tracks DataFrame with geometry for testing."""
+    import struct
+    from datetime import datetime, timezone
+
+    def _encode_wkb(coords: list[tuple[float, float]]) -> bytes:
+        """Encode [[lon, lat], ...] as WKB LineString."""
+        n = len(coords)
+        buf = struct.pack("<BII", 1, 2, n)
+        for lon, lat in coords:
+            buf += struct.pack("<dd", lon, lat)
+        return buf
+
+    ts1 = datetime(2026, 2, 25, 0, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 2, 25, 1, 0, 0, tzinfo=timezone.utc)
+    ts3 = datetime(2026, 2, 25, 2, 0, 0, tzinfo=timezone.utc)
+    ts4 = datetime(2026, 2, 25, 3, 0, 0, tzinfo=timezone.utc)
+
+    return pl.DataFrame({
+        "track_id": ["t1", "t2"],
+        "mmsi": [111, 222],
+        "start_time": [ts1, ts3],
+        "end_time": [ts2, ts4],
+        "point_count": [3, 3],
+        "distance_m": [1000.0, 2000.0],
+        "duration_s": [3600.0, 3600.0],
+        "mean_speed": [1.0, 2.0],
+        "max_speed": [2.0, 3.0],
+        "bbox_west": [55.0, 56.0],
+        "bbox_south": [25.0, 26.0],
+        "bbox_east": [56.0, 57.0],
+        "bbox_north": [26.0, 27.0],
+        "geometry_wkb": [
+            _encode_wkb([(55.0, 25.0), (55.5, 25.5), (56.0, 26.0)]),
+            _encode_wkb([(56.0, 26.0), (56.5, 26.5), (57.0, 27.0)]),
+        ],
+        "timestamp_offsets_ms": [
+            [0, 1800000, 3600000],
+            [0, 1800000, 3600000],
+        ],
+        "source": ["noaa", "noaa"],
+    })
+
+
+class TestBuildTrips:
+    def test_basic_extraction(self):
+        df = _synthetic_tracks_with_geometry()
+        trips, colors, max_time, global_start = _build_trips(df)
+        assert len(trips) == 2
+        assert len(colors) == 2
+        assert max_time > 0
+        assert global_start is not None
+
+    def test_trip_has_mmsi(self):
+        df = _synthetic_tracks_with_geometry()
+        trips, _, _, _ = _build_trips(df)
+        assert trips[0]["mmsi"] in (111, 222)
+
+    def test_trip_has_path_and_timestamps(self):
+        df = _synthetic_tracks_with_geometry()
+        trips, _, _, _ = _build_trips(df)
+        for trip in trips:
+            assert len(trip["path"]) == 3
+            assert len(trip["timestamps"]) == 3
+            assert len(trip["color"]) == 3
+
+
+class TestAutoView:
+    def test_computes_center_and_zoom(self):
+        df = _synthetic_tracks_with_geometry()
+        lat, lon, zoom = _auto_view(df)
+        assert 25.0 < lat < 27.0
+        assert 55.0 < lon < 57.0
+        assert isinstance(zoom, int)
+
+
+class TestSafeJsonEmbed:
+    def test_escapes_script_close(self):
+        result = _safe_json_embed({"name": "</script><script>alert(1)"})
+        assert "</script>" not in result
+        assert r"\u003c" in result
+
+    def test_escapes_html_comment(self):
+        result = _safe_json_embed({"x": "<!--comment-->"})
+        assert "<!--" not in result
+
+    def test_no_raw_angle_brackets(self):
+        result = _safe_json_embed({"a": "<b>bold</b>"})
+        assert "<b>" not in result
+        assert r"\u003c" in result
+
+    def test_normal_json_unchanged(self):
+        result = _safe_json_embed({"mmsi": 123, "lat": 25.5})
+        assert '"mmsi": 123' in result
+
+
+class TestValidateTrackGeometry:
+    def test_valid_tracks(self):
+        df = _synthetic_tracks_with_geometry()
+        result = _validate_track_geometry(df)
+        assert len(result) == 2
+
+    def test_missing_columns_raises(self):
+        df = pl.DataFrame({"mmsi": [111], "foo": ["bar"]})
+        with pytest.raises(ValueError, match="geometry_wkb"):
+            _validate_track_geometry(df)
+
+
+# ---------------------------------------------------------------------------
+# generate_dashboard
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateDashboard:
+    def test_generates_html_file(self, tmp_path):
+        df = _synthetic_tracks_with_geometry()
+        cfg = DashboardConfig(title="Test Dashboard")
+        out = generate_dashboard(df, config=cfg, output=str(tmp_path / "test.html"))
+        assert out.endswith("test.html")
+        import pathlib
+        assert pathlib.Path(out).exists()
+        html = pathlib.Path(out).read_text()
+        assert "Test Dashboard" in html
+        assert "deck.gl" in html
+
+    def test_with_gate(self, tmp_path):
+        df = _synthetic_tracks_with_geometry()
+        gate = GateLine("Test Gate", (25.5, 55.5), (26.5, 55.5))
+        cfg = DashboardConfig(title="Gate Test", gate=gate)
+        out = generate_dashboard(df, config=cfg, output=str(tmp_path / "gate.html"))
+        html = open(out).read()
+        assert "Test Gate" in html or "gate" in html.lower()
+        assert "HAS_GATE = true" in html
+
+    def test_no_gate_mode(self, tmp_path):
+        df = _synthetic_tracks_with_geometry()
+        cfg = DashboardConfig(title="No Gate")
+        out = generate_dashboard(df, config=cfg, output=str(tmp_path / "nogate.html"))
+        html = open(out).read()
+        assert "HAS_GATE = false" in html
+        assert "no-gate" in html
+
+    def test_with_vessels(self, tmp_path):
+        from datetime import datetime, timezone
+        df = _synthetic_tracks_with_geometry()
+        vessels = pl.DataFrame({
+            "mmsi": [111, 222],
+            "vessel_name": ["MV Test", "SS Demo"],
+            "ship_type": ["CARGO", "TANKER"],
+            "flag": ["PA", "LR"],
+            "imo": ["1234567", "7654321"],
+            "length": [200.0, 150.0],
+            "beam": [30.0, 25.0],
+            "first_seen": [datetime(2026, 1, 1, tzinfo=timezone.utc)] * 2,
+            "last_seen": [datetime(2026, 3, 1, tzinfo=timezone.utc)] * 2,
+            "source": ["noaa", "noaa"],
+        })
+        out = generate_dashboard(
+            df, vessels=vessels, config=DashboardConfig(title="V"),
+            output=str(tmp_path / "v.html"),
+        )
+        html = open(out).read()
+        assert "MV Test" in html
+        assert "CARGO" in html
+
+    def test_xss_protection(self, tmp_path):
+        """Vessel names with </script> must not break the HTML."""
+        from datetime import datetime, timezone
+        df = _synthetic_tracks_with_geometry()
+        vessels = pl.DataFrame({
+            "mmsi": [111],
+            "vessel_name": ["Evil</script><script>alert(1)"],
+            "ship_type": ["CARGO"],
+            "flag": ["XX"],
+            "imo": ["0"],
+            "length": [0.0],
+            "beam": [0.0],
+            "first_seen": [datetime(2026, 1, 1, tzinfo=timezone.utc)],
+            "last_seen": [datetime(2026, 3, 1, tzinfo=timezone.utc)],
+            "source": ["noaa"],
+        })
+        out = generate_dashboard(
+            df, vessels=vessels, config=DashboardConfig(title="XSS"),
+            output=str(tmp_path / "xss.html"),
+        )
+        html = open(out).read()
+        # All '<' in embedded JSON must be escaped as \u003c so the HTML
+        # parser can't see </script> or <!-- inside the <script> block.
+        json_start = html.index("const TRIPS =")
+        json_end = html.index("</script>", json_start)
+        json_block = html[json_start:json_end]
+        assert "</script>" not in json_block
+        assert r"\u003c" in json_block
+
+    def test_max_tracks_downsampling(self, tmp_path):
+        df = _synthetic_tracks_with_geometry()
+        cfg = DashboardConfig(title="Small")
+        out = generate_dashboard(
+            df, config=cfg, output=str(tmp_path / "small.html"), max_tracks=1,
+        )
+        html = open(out).read()
+        assert "Showing" in html or "showing" in html.lower() or "1 of 2" in html
+
+    def test_with_infrastructure(self, tmp_path):
+        df = _synthetic_tracks_with_geometry()
+        infra = [InfrastructurePoint("Test Port", 25.5, 55.5)]
+        cfg = DashboardConfig(title="Infra", infrastructure=infra)
+        out = generate_dashboard(df, config=cfg, output=str(tmp_path / "infra.html"))
+        html = open(out).read()
+        assert "Test Port" in html

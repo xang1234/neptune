@@ -33,4 +33,5 @@ __all__ = [
     "tracks",
     "events",
     "density",
+    "crossings",
 ]

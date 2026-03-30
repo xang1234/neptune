@@ -16,6 +16,7 @@ Interactive notebooks covering the full Neptune workflow — from data discovery
 | 6 | [External Plugin](06_external_plugin.py) | Custom adapter via entry point | — |
 | 7 | [Fishing Intelligence](07_fishing_intelligence.ipynb) | GFW events, vessels, fishing effort grids | [view](https://nbviewer.org/github/xang1234/neptune/blob/main/examples/07_fishing_intelligence.ipynb) |
 | 8 | [Spatial Visualization](08_spatial_visualization.ipynb) | Interactive maps, GeoDataFrames, MovingPandas, animated replay | [view](https://nbviewer.org/github/xang1234/neptune/blob/main/examples/08_spatial_visualization.ipynb) |
+| 9 | [Intelligence Dashboard](09_intelligence_dashboard.ipynb) | Gate crossings, live counters, filters, standalone HTML dashboard | [view](https://nbviewer.org/github/xang1234/neptune/blob/main/examples/09_intelligence_dashboard.ipynb) |
 
 ## Suggested order
 
@@ -30,6 +31,7 @@ Interactive notebooks covering the full Neptune workflow — from data discovery
 6 External Plugin      → Build your own adapter
 7 Fishing Intelligence → GFW events & effort (requires GFW API token)
 8 Spatial Visualization → Maps, trajectories, animated replay
+9 Intelligence Dashboard → Gate crossings, filters, standalone HTML
 ```
 
 ## Requirements by example
@@ -44,3 +46,4 @@ Interactive notebooks covering the full Neptune workflow — from data discovery
 | 6 | — | No |
 | 7 | `pip install neptune-ais[notebooks,gfw]` | GFW |
 | 8 | `pip install neptune-ais[geo,sql]` | No |
+| 9 | `pip install neptune-ais[geo]` | No |

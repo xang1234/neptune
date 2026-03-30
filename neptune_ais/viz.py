@@ -9,16 +9,17 @@ Module role — presentation layer (optional dependency)
 - Map layer construction: positions, tracks, trips, density, events.
 - Viewport clipping and sampling for dense point clouds.
 - Color-by logic and layer styling.
-- HTML export for standalone map files.
+- HTML export for standalone map files and dashboards.
 
 **Does not own:**
 - Data access or derivation — receives DataFrames/LazyFrames from ``api``.
 - Geometry conversions — delegates to ``geometry.bridges`` if needed.
 
-**Import rule:** Viz may import from ``datasets`` (column names for color-by)
-and ``geometry.bridges`` (for GeoArrow conversion). lonboard is an optional
+**Import rule:** Viz may import from ``datasets`` (column names for color-by),
+``geometry.bridges`` (for GeoArrow conversion), and ``derive.crossings``
+(for dashboard gate-crossing analytics). lonboard is an optional
 dependency — viz must handle its absence gracefully. Viz must not import
-from ``adapters``, ``derive``, ``storage``, ``catalog``, or ``cli``.
+from ``adapters``, ``storage``, ``catalog``, or ``cli``.
 
 **Install extra:** ``pip install neptune-ais[geo]`` (lonboard is part of the
 geo extra since it is used alongside spatial data).
@@ -26,13 +27,21 @@ geo extra since it is used alongside spatial data).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import struct
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import polars as pl
 
 from neptune_ais.datasets.events import Col as EventCol
 from neptune_ais.datasets.positions import Col as PosCol
 from neptune_ais.datasets.tracks import Col as TrackCol
+from neptune_ais.datasets.vessels import Col as VesselCol
+from neptune_ais.derive.crossings import GateLine  # noqa: F401 — re-exported
 
 # Viz-only derived column name (not part of the tracks schema).
 _TRIP_PROGRESS = "trip_progress"
@@ -68,6 +77,67 @@ class Viewport:
             raise ValueError(
                 f"Invalid longitude range: west={self.west}, east={self.east}"
             )
+
+
+@dataclass(frozen=True)
+class InfrastructurePoint:
+    """Named point feature for map display (port, refinery, etc.).
+
+    Args:
+        name: Human-readable label.
+        lat: WGS-84 latitude.
+        lon: WGS-84 longitude.
+        kind: Feature category (``"port"``, ``"refinery"``,
+            ``"desalination"``, ``"anchorage"``, etc.).
+    """
+
+    name: str
+    lat: float
+    lon: float
+    kind: str = "port"
+
+
+@dataclass(frozen=True)
+class DashboardConfig:
+    """Configuration for a maritime intelligence dashboard.
+
+    Parameterizes the analysis scenario so the same function can
+    generate dashboards for any chokepoint or region.
+
+    Args:
+        title: Dashboard title (e.g., ``"STRAIT OF HORMUZ"``).
+        description: Analysis description paragraph.
+        gate: Optional chokepoint line. Enables crossing analytics
+            (inbound/outbound counts, transit detection, reversals).
+        event_date: ISO-8601 date string for the regime-change event
+            (e.g., ``"2026-03-01"``). Anchors before/after comparison.
+        date_from: Start of analysis period (ISO-8601 string).
+        date_to: End of analysis period (ISO-8601 string).
+        center_lat: Map center latitude. Auto-computed from tracks if None.
+        center_lon: Map center longitude. Auto-computed if None.
+        zoom: Initial map zoom level. Auto-computed if None.
+        pitch: Map pitch in degrees.
+        bearing: Map bearing in degrees.
+        trail_length: TripsLayer trail length in seconds.
+        speed: Playback speed — seconds of vessel time per second of
+            animation.  ``21600`` = 6 hours/second, ``86400`` = 1 day/second.
+        infrastructure: Optional named point features for the map.
+    """
+
+    title: str
+    description: str = ""
+    gate: GateLine | None = None
+    event_date: str | None = None
+    date_from: str = ""
+    date_to: str = ""
+    center_lat: float | None = None
+    center_lon: float | None = None
+    zoom: int | None = None
+    pitch: float = 35.0
+    bearing: float = 0.0
+    trail_length: int = 180
+    speed: float = 21600.0
+    infrastructure: list[InfrastructurePoint] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +503,7 @@ def prepare_events(
 
 
 # ---------------------------------------------------------------------------
-# Animated vessel replay — standalone HTML with deck.gl TripsLayer
+# Shared trip-building helper
 # ---------------------------------------------------------------------------
 
 # Vessel color palette — 10 distinct colors for up to 10 vessels.
@@ -457,7 +527,6 @@ def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
     Handles the little-endian WKB format produced by _encode_wkb_linestring
     in derive/tracks.py. Uses bulk struct.unpack for efficiency.
     """
-    import struct
 
     if wkb is None or len(wkb) < 13:
         return []
@@ -472,6 +541,132 @@ def _decode_wkb_linestring(wkb: bytes) -> list[list[float]]:
         [round(flat[i], 6), round(flat[i + 1], 6)]
         for i in range(0, len(flat), 2)
     ]
+
+
+def _build_trips(
+    tracks: pl.DataFrame,
+) -> tuple[list[dict], dict[int, list[int]], float, int | None]:
+    """Decode tracks into trip dicts for deck.gl.
+
+    Shared by :func:`generate_replay` and :func:`generate_dashboard`.
+
+    Args:
+        tracks: Tracks DataFrame already filtered to rows with
+            ``geometry_wkb`` and ``timestamp_offsets_ms`` present.
+
+    Returns:
+        A 4-tuple of:
+
+        - *trips*: list of ``{path, timestamps, color, mmsi}`` dicts.
+        - *mmsi_to_color*: mapping of MMSI → ``[r, g, b]``.
+        - *max_time*: latest timestamp across all trips (seconds).
+        - *global_start_ms*: epoch millis of the earliest track start,
+          or ``None`` if unavailable.
+    """
+    min_start = tracks[TrackCol.START_TIME].min()
+    global_start_ms: int | None = (
+        int(min_start.timestamp() * 1000) if min_start is not None else None
+    )
+
+    trips: list[dict] = []
+    mmsi_to_color: dict[int, list[int]] = {}
+    color_idx = 0
+
+    for row in tracks.iter_rows(named=True):
+        wkb = row[TrackCol.GEOMETRY_WKB]
+        offsets_ms = row[TrackCol.TIMESTAMP_OFFSETS_MS]
+        mmsi = row[TrackCol.MMSI]
+
+        coords = _decode_wkb_linestring(wkb)
+        if len(coords) < 2 or not offsets_ms or len(offsets_ms) != len(coords):
+            continue
+
+        if mmsi not in mmsi_to_color:
+            mmsi_to_color[mmsi] = PALETTE[color_idx % len(PALETTE)]
+            color_idx += 1
+
+        start_time = row[TrackCol.START_TIME]
+        if start_time is not None and global_start_ms is not None:
+            base_s = (int(start_time.timestamp() * 1000) - global_start_ms) / 1000.0
+            timestamps_s = [base_s + t / 1000.0 for t in offsets_ms]
+        else:
+            timestamps_s = [t / 1000.0 for t in offsets_ms]
+
+        trips.append({
+            "path": coords,
+            "timestamps": timestamps_s,
+            "color": mmsi_to_color[mmsi],
+            "mmsi": mmsi,
+        })
+
+    max_time = max(t["timestamps"][-1] for t in trips) if trips else 0.0
+    return trips, mmsi_to_color, max_time, global_start_ms
+
+
+def _auto_view(
+    tracks: pl.DataFrame,
+) -> tuple[float, float, int]:
+    """Compute map center and zoom from track bounding boxes."""
+    center_lon = float(
+        (tracks[TrackCol.BBOX_WEST].mean() + tracks[TrackCol.BBOX_EAST].mean()) / 2
+    )
+    center_lat = float(
+        (tracks[TrackCol.BBOX_SOUTH].mean() + tracks[TrackCol.BBOX_NORTH].mean()) / 2
+    )
+    lon_spread = float(
+        tracks[TrackCol.BBOX_EAST].max() - tracks[TrackCol.BBOX_WEST].min()
+    )
+    lat_spread = float(
+        tracks[TrackCol.BBOX_NORTH].max() - tracks[TrackCol.BBOX_SOUTH].min()
+    )
+    spread = max(lon_spread, lat_spread, 0.01)
+    if spread > 50:
+        zoom = 3
+    elif spread > 10:
+        zoom = 5
+    elif spread > 2:
+        zoom = 7
+    elif spread > 0.5:
+        zoom = 9
+    else:
+        zoom = 11
+    return center_lat, center_lon, zoom
+
+
+def _validate_track_geometry(
+    tracks: pl.DataFrame | pl.LazyFrame,
+) -> pl.DataFrame:
+    """Collect, validate, and filter tracks to those with geometry."""
+    df = _collect(tracks)
+    required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
+    if not required.issubset(df.columns):
+        raise ValueError(
+            "Tracks must have geometry_wkb and timestamp_offsets_ms columns. "
+            "Use Neptune.tracks(include_geometry=True) to generate them."
+        )
+    df = df.filter(
+        pl.col(TrackCol.GEOMETRY_WKB).is_not_null()
+        & pl.col(TrackCol.TIMESTAMP_OFFSETS_MS).is_not_null()
+    )
+    if len(df) == 0:
+        raise ValueError("No tracks with geometry found.")
+    return df
+
+
+def _safe_json_embed(obj: Any) -> str:
+    """Serialize *obj* to JSON safe for embedding in ``<script>`` tags.
+
+    Escapes sequences that could break out of a ``<script>`` block
+    (``</script>``, ``<!--``) to prevent XSS from untrusted string
+    fields like vessel names or destinations.
+    """
+    s = json.dumps(obj)
+    return s.replace("<", r"\u003c")
+
+
+# ---------------------------------------------------------------------------
+# Animated vessel replay — standalone HTML with deck.gl TripsLayer
+# ---------------------------------------------------------------------------
 
 
 def generate_replay(
@@ -507,93 +702,12 @@ def generate_replay(
     Raises:
         ValueError: If the tracks DataFrame lacks geometry columns.
     """
-    import json
-    from pathlib import Path
-
-    tracks = _collect(tracks)
-
-    # Validate required columns.
-    required = {TrackCol.GEOMETRY_WKB, TrackCol.TIMESTAMP_OFFSETS_MS}
-    if not required.issubset(tracks.columns):
-        raise ValueError(
-            "Tracks must have geometry_wkb and timestamp_offsets_ms columns. "
-            "Use Neptune.tracks(include_geometry=True) to generate them."
-        )
-
-    # Filter to tracks with geometry.
-    tracks = tracks.filter(
-        pl.col(TrackCol.GEOMETRY_WKB).is_not_null()
-        & pl.col(TrackCol.TIMESTAMP_OFFSETS_MS).is_not_null()
-    )
-
-    if len(tracks) == 0:
-        raise ValueError("No tracks with geometry found.")
-
-    # Precompute global start time so all tracks share the same time origin.
-    min_start = tracks[TrackCol.START_TIME].min()
-    global_start_ms = (
-        int(min_start.timestamp() * 1000) if min_start is not None else None
-    )
-
-    # Build trip data for deck.gl in a single pass.
-    trips = []
-    mmsi_to_color: dict[int, list[int]] = {}
-    color_idx = 0
-
-    for row in tracks.iter_rows(named=True):
-        wkb = row[TrackCol.GEOMETRY_WKB]
-        offsets_ms = row[TrackCol.TIMESTAMP_OFFSETS_MS]
-        mmsi = row[TrackCol.MMSI]
-
-        coords = _decode_wkb_linestring(wkb)
-        if len(coords) < 2 or not offsets_ms or len(offsets_ms) != len(coords):
-            continue
-
-        # Assign color per vessel.
-        if mmsi not in mmsi_to_color:
-            mmsi_to_color[mmsi] = PALETTE[color_idx % len(PALETTE)]
-            color_idx += 1
-
-        # Compute timestamps as seconds from global start.
-        start_time = row[TrackCol.START_TIME]
-        if start_time is not None and global_start_ms is not None:
-            base_s = (int(start_time.timestamp() * 1000) - global_start_ms) / 1000.0
-            timestamps_s = [base_s + t / 1000.0 for t in offsets_ms]
-        else:
-            timestamps_s = [t / 1000.0 for t in offsets_ms]
-
-        trips.append({
-            "path": coords,
-            "timestamps": timestamps_s,
-            "color": mmsi_to_color[mmsi],
-            "mmsi": mmsi,
-        })
-
+    tracks_df = _validate_track_geometry(tracks)
+    trips, mmsi_to_color, max_time, _global_start = _build_trips(tracks_df)
     if not trips:
         raise ValueError("No valid trip geometries found.")
 
-    max_time = max(t["timestamps"][-1] for t in trips)
-
-    # Compute map center and zoom from track bounding boxes.
-    center_lon = float(
-        (tracks[TrackCol.BBOX_WEST].mean() + tracks[TrackCol.BBOX_EAST].mean()) / 2
-    )
-    center_lat = float(
-        (tracks[TrackCol.BBOX_SOUTH].mean() + tracks[TrackCol.BBOX_NORTH].mean()) / 2
-    )
-    lon_spread = float(tracks[TrackCol.BBOX_EAST].max() - tracks[TrackCol.BBOX_WEST].min())
-    lat_spread = float(tracks[TrackCol.BBOX_NORTH].max() - tracks[TrackCol.BBOX_SOUTH].min())
-    spread = max(lon_spread, lat_spread, 0.01)
-    if spread > 50:
-        zoom = 3
-    elif spread > 10:
-        zoom = 5
-    elif spread > 2:
-        zoom = 7
-    elif spread > 0.5:
-        zoom = 9
-    else:
-        zoom = 11
+    center_lat, center_lon, zoom = _auto_view(tracks_df)
 
     # Build vessel legend entries.
     legend_entries = [
@@ -602,7 +716,7 @@ def generate_replay(
     ]
 
     # Serialize trip data (drop mmsi field — not needed by deck.gl).
-    trips_json = json.dumps(
+    trips_json = _safe_json_embed(
         [{"path": t["path"], "timestamps": t["timestamps"], "color": t["color"]}
          for t in trips],
     )
@@ -615,7 +729,7 @@ def generate_replay(
         max_time=max_time,
         trail_length=trail_length,
         speed=speed,
-        legend_json=json.dumps(legend_entries),
+        legend_json=_safe_json_embed(legend_entries),
         n_vessels=len(mmsi_to_color),
         n_tracks=len(trips),
     )
@@ -830,3 +944,351 @@ document.getElementById('speed-btn').onclick = () => {{
 </script>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Maritime intelligence dashboard
+# ---------------------------------------------------------------------------
+
+
+def _compute_dashboard_analytics(
+    trips: list[dict],
+    crossings: list[dict],
+    reversals: list[dict],
+    vessels_df: pl.DataFrame | None,
+    config: DashboardConfig,
+    global_start_ms: int | None,
+    total_track_count: int,
+) -> dict:
+    """Pre-compute all analytics for the dashboard.
+
+    Returns a dict of JSON-serializable analytics data.
+    """
+    has_gate = config.gate is not None and len(crossings) > 0
+
+    # -- vessel index from vessels DataFrame ---------------------------------
+    vessel_index: dict[int, dict] = {}
+    if vessels_df is not None:
+        for row in vessels_df.iter_rows(named=True):
+            mmsi = row.get(VesselCol.MMSI)
+            if mmsi is None:
+                continue
+            vessel_index[int(mmsi)] = {
+                "name": row.get(VesselCol.VESSEL_NAME, ""),
+                "type": row.get(VesselCol.SHIP_TYPE, ""),
+                "flag": row.get(VesselCol.FLAG, ""),
+                "imo": row.get(VesselCol.IMO, ""),
+                "length": row.get(VesselCol.LENGTH),
+                "beam": row.get(VesselCol.BEAM),
+            }
+
+    # -- per-trip metadata for filtering -------------------------------------
+    transit_mmsis: set[int] = set()
+    if has_gate:
+        transit_mmsis = {c["mmsi"] for c in crossings}
+
+    # -- flag and type counts ------------------------------------------------
+    flag_counts: dict[str, int] = defaultdict(int)
+    type_counts: dict[str, int] = defaultdict(int)
+    trip_mmsis: set[int] = set()
+    for trip in trips:
+        mmsi = trip["mmsi"]
+        if mmsi in trip_mmsis:
+            continue
+        trip_mmsis.add(mmsi)
+        info = vessel_index.get(mmsi, {})
+        flag = info.get("flag", "")
+        if flag:
+            flag_counts[flag] += 1
+        ship_type = info.get("type", "")
+        if ship_type:
+            type_counts[ship_type] += 1
+
+    # -- daily crossings time-series -----------------------------------------
+    daily_crossings: list[dict] = []
+    if has_gate and global_start_ms is not None:
+        epoch_s = global_start_ms / 1000.0
+        by_day: dict[str, dict] = defaultdict(
+            lambda: {"inbound": 0, "outbound": 0, "mmsis": set()}
+        )
+        for c in crossings:
+            dt = datetime.fromtimestamp(epoch_s + c["timestamp_s"], tz=timezone.utc)
+            day_str = dt.strftime("%Y-%m-%d")
+            rec = by_day[day_str]
+            rec[c["direction"]] += 1
+            rec["mmsis"].add(c["mmsi"])
+
+        for day_str in sorted(by_day):
+            rec = by_day[day_str]
+            daily_crossings.append({
+                "date": day_str,
+                "inbound": rec["inbound"],
+                "outbound": rec["outbound"],
+                "unique_vessels": len(rec["mmsis"]),
+            })
+
+    # -- rolling 7-day averages (sliding window) ------------------------------
+    rolling_7d: list[dict] = []
+    if len(daily_crossings) >= 7:
+        in_sum = sum(d["inbound"] for d in daily_crossings[:7])
+        out_sum = sum(d["outbound"] for d in daily_crossings[:7])
+        rolling_7d.append({
+            "date": daily_crossings[6]["date"],
+            "inbound": round(in_sum / 7, 1),
+            "outbound": round(out_sum / 7, 1),
+        })
+        for i in range(7, len(daily_crossings)):
+            in_sum += daily_crossings[i]["inbound"] - daily_crossings[i - 7]["inbound"]
+            out_sum += daily_crossings[i]["outbound"] - daily_crossings[i - 7]["outbound"]
+            rolling_7d.append({
+                "date": daily_crossings[i]["date"],
+                "inbound": round(in_sum / 7, 1),
+                "outbound": round(out_sum / 7, 1),
+            })
+
+    # -- summary stats -------------------------------------------------------
+    total_crossings = len(crossings)
+    n_days = max(len(daily_crossings), 1)
+    avg_per_day = round(total_crossings / n_days, 1) if has_gate else 0
+
+    # Before/after split using event_date.
+    before_count = 0
+    after_count = 0
+    delta_pct: float | None = None
+    if has_gate and config.event_date and global_start_ms is not None:
+        epoch_s = global_start_ms / 1000.0
+        event_dt = datetime.fromisoformat(config.event_date).replace(
+            tzinfo=timezone.utc
+        )
+        event_s = (event_dt.timestamp() - epoch_s)
+        for c in crossings:
+            if c["timestamp_s"] < event_s:
+                before_count += 1
+            else:
+                after_count += 1
+        if before_count > 0:
+            delta_pct = round(
+                (after_count - before_count) / before_count * 100, 1
+            )
+
+    # -- sparkline (200-bucket histogram) ------------------------------------
+    sparkline: list[int] = []
+    if trips:
+        t_min = min(t["timestamps"][0] for t in trips)
+        t_max = max(t["timestamps"][-1] for t in trips)
+        t_range = t_max - t_min
+        if t_range > 0:
+            n_buckets = 200
+            bucket_size = t_range / n_buckets
+            buckets = [0] * n_buckets
+            for trip in trips:
+                for ts in trip["timestamps"][::max(1, len(trip["timestamps"]) // 20)]:
+                    idx = min(int((ts - t_min) / bucket_size), n_buckets - 1)
+                    buckets[idx] += 1
+            sparkline = buckets
+
+    summary = {
+        "total_tracked": len(trip_mmsis),
+        "total_transit": len(transit_mmsis),
+        "total_crossings": total_crossings,
+        "avg_per_day": avg_per_day,
+        "delta_pct": delta_pct,
+        "before_count": before_count,
+        "after_count": after_count,
+    }
+
+    return {
+        "daily_crossings": daily_crossings,
+        "rolling_7d": rolling_7d,
+        "summary": summary,
+        "vessel_index": {str(k): v for k, v in vessel_index.items()},
+        "transit_mmsis": transit_mmsis,
+        "flag_counts": sorted(
+            [{"flag": k, "count": v} for k, v in flag_counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        ),
+        "type_counts": sorted(
+            [{"type": k, "count": v} for k, v in type_counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        ),
+        "reversals": reversals,
+        "sparkline": sparkline,
+    }
+
+
+def generate_dashboard(
+    tracks: pl.DataFrame | pl.LazyFrame,
+    *,
+    positions: pl.DataFrame | pl.LazyFrame | None = None,
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    events: pl.DataFrame | pl.LazyFrame | None = None,
+    config: DashboardConfig,
+    output: str = "dashboard.html",
+    max_tracks: int | None = 1000,
+) -> str:
+    """Generate a self-contained maritime intelligence dashboard HTML file.
+
+    Produces a standalone HTML file with animated vessel tracks,
+    crossing analytics, filters, and interactive controls. No Python
+    server or Jupyter required — open in any browser.
+
+    Args:
+        tracks: Tracks DataFrame with geometry columns
+            (from ``Neptune.tracks(include_geometry=True)``).
+        positions: Optional positions DataFrame. Enables the density
+            heatmap layer.
+        vessels: Optional vessels DataFrame. Enables vessel detail
+            cards with name, type, flag, and dimensions.
+        events: Optional events DataFrame. Shows event markers on
+            the timeline.
+        config: Dashboard configuration (title, gate, date range, etc.).
+        output: Output file path. Default ``"dashboard.html"``.
+        max_tracks: If set, downsample to at most this many tracks.
+            Default 1000.
+
+    Returns:
+        The absolute path to the generated HTML file.
+    """
+    from neptune_ais._dashboard_template import render_dashboard
+    from neptune_ais.derive.crossings import (
+        detect_gate_crossings,
+        detect_reversals,
+    )
+
+    tracks_df = _validate_track_geometry(tracks)
+    total_track_count = len(tracks_df)
+
+    # Capture the true epoch before downsampling so wall-clock timestamps
+    # remain correct even if the earliest track is dropped by _sample().
+    true_min_start = tracks_df[TrackCol.START_TIME].min()
+    true_global_start_ms: int | None = (
+        int(true_min_start.timestamp() * 1000)
+        if true_min_start is not None
+        else None
+    )
+
+    # Downsample if requested.
+    tracks_df = _sample(tracks_df, max_tracks)
+
+    trips, mmsi_to_color, max_time, _sample_start_ms = _build_trips(tracks_df)
+    global_start_ms = true_global_start_ms
+    if not trips:
+        raise ValueError("No valid trip geometries found.")
+
+    # Gate crossing detection.
+    crossings: list[dict] = []
+    reversals_list: list[dict] = []
+    if config.gate is not None:
+        crossings = detect_gate_crossings(trips, config.gate)
+        reversals_list = detect_reversals(crossings)
+
+    # Collect optional DataFrames.
+    vessels_df = _collect(vessels) if vessels is not None else None
+    events_df = _collect(events) if events is not None else None
+
+    # Pre-compute analytics.
+    analytics = _compute_dashboard_analytics(
+        trips, crossings, reversals_list, vessels_df, config,
+        global_start_ms, total_track_count,
+    )
+
+    # Density data.
+    density_data: list[dict] = []
+    if positions is not None:
+        density_df = prepare_density(_collect(positions), max_points=50_000)
+        density_data = density_df.to_dicts()
+
+    # Event data.
+    event_data: list[dict] = []
+    if events_df is not None:
+        event_data = prepare_events(events_df).to_dicts()
+
+    # Map view.
+    center_lat = config.center_lat
+    center_lon = config.center_lon
+    zoom = config.zoom
+    if center_lat is None or center_lon is None or zoom is None:
+        auto_lat, auto_lon, auto_zoom = _auto_view(tracks_df)
+        if center_lat is None:
+            center_lat = auto_lat
+        if center_lon is None:
+            center_lon = auto_lon
+        if zoom is None:
+            zoom = auto_zoom
+
+    # Gate line for map rendering.
+    gate_coords: list[list[float]] | None = None
+    if config.gate is not None:
+        gate_coords = [
+            [config.gate.point_a[1], config.gate.point_a[0]],
+            [config.gate.point_b[1], config.gate.point_b[0]],
+        ]
+
+    # Infrastructure markers.
+    infra_data = [
+        {"name": p.name, "lat": p.lat, "lon": p.lon, "kind": p.kind}
+        for p in config.infrastructure
+    ]
+
+    # Trip data with metadata for filtering.
+    transit_mmsis = analytics["transit_mmsis"]
+    vessel_index = analytics["vessel_index"]
+    trip_data = []
+    for t in trips:
+        info = vessel_index.get(str(t["mmsi"]), {})
+        trip_data.append({
+            "path": t["path"],
+            "timestamps": t["timestamps"],
+            "color": t["color"],
+            "mmsi": t["mmsi"],
+            "isTransit": t["mmsi"] in transit_mmsis,
+            "flag": info.get("flag", ""),
+            "shipType": info.get("type", ""),
+            "name": info.get("name", ""),
+        })
+
+    # Serialize analytics without vessel_index (embedded separately to
+    # avoid doubling the payload — JS uses the top-level VESSEL_INDEX).
+    analytics_slim = {
+        k: v for k, v in analytics.items()
+        if k not in ("vessel_index", "transit_mmsis")
+    }
+
+    # Assemble template data.
+    data = {
+        "title": config.title,
+        "description": config.description,
+        "has_gate": config.gate is not None and len(crossings) > 0,
+        "gate_name": config.gate.name if config.gate else "",
+        "gate_coords": _safe_json_embed(gate_coords),
+        "event_date": config.event_date or "",
+        "date_from": config.date_from,
+        "date_to": config.date_to,
+        "trips_json": _safe_json_embed(trip_data),
+        "analytics_json": _safe_json_embed(analytics_slim),
+        "density_json": _safe_json_embed(density_data),
+        "events_json": _safe_json_embed(event_data),
+        "infra_json": _safe_json_embed(infra_data),
+        "vessel_index_json": _safe_json_embed(vessel_index),
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "zoom": zoom,
+        "pitch": config.pitch,
+        "bearing": config.bearing,
+        "max_time": max_time,
+        "trail_length": config.trail_length,
+        "default_speed": config.speed,
+        "n_vessels": len(mmsi_to_color),
+        "n_tracks": len(trips),
+        "showing_subset": len(tracks_df) < total_track_count,
+        "total_track_count": total_track_count,
+        "global_start_ms": global_start_ms or 0,
+    }
+
+    html = render_dashboard(data)
+
+    out_path = Path(output).resolve()
+    out_path.write_text(html)
+    return str(out_path)
