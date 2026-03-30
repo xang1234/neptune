@@ -134,6 +134,33 @@ h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
                 font-size: 12px; cursor: pointer; }
 .layer-toggle input { accent-color: #00c8ff; }
 
+/* ── playback badge ─────────────────────────── */
+#playback-badge {
+  display: none; font-size: 10px; text-transform: uppercase;
+  letter-spacing: 1px; color: #32ff82; margin-left: 8px;
+  vertical-align: middle;
+}
+#playback-badge.visible { display: inline; }
+#playback-badge::before {
+  content: ''; display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: #32ff82; margin-right: 5px;
+  vertical-align: middle; animation: pulse-dot 1.5s infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; } 50% { opacity: 0.4; }
+}
+
+/* ── timeline dates ────────────────────────────── */
+.timeline-date { font-size: 10px; color: rgba(255,255,255,0.35);
+                 font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ── position counts ───────────────────────────── */
+.pos-counts { display: flex; gap: 12px; margin-bottom: 10px;
+              padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.pos-count-val { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pos-count-label { font-size: 9px; text-transform: uppercase;
+                   color: rgba(255,255,255,0.4); letter-spacing: 0.3px; }
+
 /* ── no-gate mode ───────────────────────────── */
 body.no-gate .gate-only { display: none !important; }
 
@@ -167,7 +194,7 @@ _HEAD = Template("""\
 
 _LEFT_PANEL = Template("""\
 <div id="left-panel" class="panel">
-  <h1>$title</h1>
+  <h1>$title <span id="playback-badge">Playback</span></h1>
   <p class="desc">$description</p>
 
   <div class="tabs gate-only">
@@ -237,6 +264,21 @@ _TOP_CENTER = Template("""\
 
 _RIGHT_PANEL = Template("""\
 <div id="right-panel" class="panel">
+  <div class="pos-counts gate-only">
+    <div class="metric">
+      <div class="pos-count-val cyan" id="pos-total">—</div>
+      <div class="pos-count-label">Total Positions</div>
+    </div>
+    <div class="metric">
+      <div class="pos-count-val" id="pos-before">—</div>
+      <div class="pos-count-label">Before</div>
+    </div>
+    <div class="metric">
+      <div class="pos-count-val" id="pos-after">—</div>
+      <div class="pos-count-label">After</div>
+    </div>
+  </div>
+
   <h2>Filters</h2>
 
   <div class="gate-only">
@@ -283,12 +325,17 @@ _BOTTOM_BAR = Template("""\
 <div id="bottom-bar" class="panel">
   <button class="btn" id="play-btn" title="Play / Pause (Space)">&#9654;</button>
   <div class="btn-row" id="speed-btns" style="margin:0"></div>
+  <span class="timeline-date" id="date-start"></span>
   <input type="range" id="timeline-slider" min="0" max="10000" value="0">
+  <span class="timeline-date" id="date-end"></span>
   <span id="clock">—</span>
   <span id="active-count"></span>
 </div>
 <div class="panel" style="bottom:50px;left:20px;right:20px;padding:4px 12px;border-radius:6px;">
-  <div class="sparkline-container"><canvas id="sparkline-canvas"></canvas></div>
+  <div class="sparkline-container" style="position:relative">
+    <canvas id="sparkline-canvas"></canvas>
+    <canvas id="event-dots-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
+  </div>
 </div>
 """)
 
@@ -306,6 +353,7 @@ const DENSITY_DATA = $density_json;
 const EVENT_DATA = $events_json;
 const INFRA_DATA = $infra_json;
 const GATE_COORDS = $gate_coords;
+const CROSSING_TIMES = $crossing_times_json;
 const HAS_GATE = $has_gate;
 const MAX_TIME = $max_time;
 const TRAIL_LENGTH = $trail_length;
@@ -423,7 +471,25 @@ function updateLayers() {
   const filtered = getFilteredTrips();
   const layers = [];
 
-  // 1. Trips layer
+  // 1a. Trail glow layer (warm amber bloom underneath)
+  if (state.layers.trips) {
+    layers.push(new deck.TripsLayer({
+      id: 'trips-glow',
+      data: filtered,
+      getPath: d => d.path,
+      getTimestamps: d => d.timestamps,
+      getColor: [255, 140, 20],
+      currentTime: ct,
+      trailLength: TRAIL_LENGTH,
+      widthMinPixels: 8,
+      widthMaxPixels: 20,
+      capRounded: true,
+      jointRounded: true,
+      opacity: 0.15,
+    }));
+  }
+
+  // 1b. Trips layer (foreground, per-vessel colors)
   if (state.layers.trips) {
     layers.push(new deck.TripsLayer({
       id: 'trips',
@@ -513,7 +579,7 @@ function updateLayers() {
     }));
   }
 
-  // 4. Gate line
+  // 4. Gate line + crossing pulse
   if (state.layers.gates && HAS_GATE && GATE_COORDS) {
     layers.push(new deck.LineLayer({
       id: 'gate',
@@ -523,6 +589,27 @@ function updateLayers() {
       getColor: [0, 200, 255, 200],
       widthMinPixels: 3,
     }));
+    // Pulsing ring at gate midpoint when crossings happen nearby in time
+    const gateMid = [(GATE_COORDS[0][0]+GATE_COORDS[1][0])/2, (GATE_COORDS[0][1]+GATE_COORDS[1][1])/2];
+    let recentCrossings = 0;
+    for (const t of CROSSING_TIMES) {
+      if (Math.abs(t - ct) < 300) recentCrossings++;
+    }
+    if (recentCrossings > 0) {
+      const pulseR = 8 + 6 * Math.sin(ct * 3);
+      layers.push(new deck.ScatterplotLayer({
+        id: 'gate-pulse',
+        data: [{position: gateMid}],
+        getPosition: d => d.position,
+        getFillColor: [0, 200, 255, 0],
+        getLineColor: [0, 200, 255, Math.min(200, recentCrossings * 40)],
+        radiusMinPixels: Math.max(4, pulseR),
+        radiusMaxPixels: 30,
+        lineWidthMinPixels: 2,
+        stroked: true,
+        filled: false,
+      }));
+    }
   }
 
   // 5. Infrastructure
@@ -626,13 +713,18 @@ function drawChart() {
 """
 
 _JS_SPARKLINE = """\
-// ── Sparkline ──────────────────────────────────
+// ── Sparkline (dual inbound/outbound lines) ────
 const sparkCanvas = document.getElementById('sparkline-canvas');
 const sparkCtx = sparkCanvas ? sparkCanvas.getContext('2d') : null;
+const dotsCanvas = document.getElementById('event-dots-canvas');
+const dotsCtx = dotsCanvas ? dotsCanvas.getContext('2d') : null;
 
 function drawSparkline() {
   if (!sparkCtx) return;
+  const spIn = ANALYTICS.sparkline_inbound;
+  const spOut = ANALYTICS.sparkline_outbound;
   const sp = ANALYTICS.sparkline;
+  const hasDual = spIn && spOut && spIn.length >= 2 && spOut.length >= 2;
   if (!sp || sp.length < 2) return;
 
   const rect = sparkCanvas.parentElement.getBoundingClientRect();
@@ -641,19 +733,27 @@ function drawSparkline() {
   const ctx = sparkCtx;
   ctx.scale(2, 2);
   const W = rect.width, H = rect.height;
-
   ctx.clearRect(0, 0, W, H);
 
-  const maxVal = Math.max(1, ...sp);
-  ctx.beginPath();
-  ctx.strokeStyle = 'rgba(0,200,255,0.5)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < sp.length; i++) {
-    const x = (i / (sp.length - 1)) * W;
-    const y = H - (sp[i] / maxVal) * (H - 2);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  function drawLine(data, color) {
+    const maxVal = Math.max(1, ...data);
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < data.length; i++) {
+      const x = (i / (data.length - 1)) * W;
+      const y = H - (data[i] / maxVal) * (H - 4) - 1;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
   }
-  ctx.stroke();
+
+  if (hasDual) {
+    drawLine(spIn, 'rgba(50,255,130,0.6)');
+    drawLine(spOut, 'rgba(255,100,50,0.6)');
+  } else {
+    drawLine(sp, 'rgba(0,200,255,0.5)');
+  }
 
   // "Now" indicator
   if (MAX_TIME > 0) {
@@ -665,6 +765,41 @@ function drawSparkline() {
     ctx.moveTo(x, 0);
     ctx.lineTo(x, H);
     ctx.stroke();
+  }
+
+  // Event dots on overlay canvas (#2)
+  drawEventDots(W, H);
+}
+
+function drawEventDots(W, H) {
+  if (!dotsCtx || !HAS_GATE || MAX_TIME <= 0) return;
+  const rect = dotsCanvas.parentElement.getBoundingClientRect();
+  dotsCanvas.width = rect.width * 2;
+  dotsCanvas.height = rect.height * 2;
+  const ctx = dotsCtx;
+  ctx.scale(2, 2);
+  ctx.clearRect(0, 0, W, H);
+
+  const dc = ANALYTICS.daily_crossings;
+  if (!dc || dc.length === 0) return;
+
+  // One dot per day, colored by balance
+  for (const day of dc) {
+    const dayDate = new Date(day.date + 'T12:00:00Z');
+    const dayS = (dayDate.getTime() - GLOBAL_START_MS) / 1000;
+    const frac = dayS / MAX_TIME;
+    if (frac < 0 || frac > 1) continue;
+    const x = frac * W;
+    const total = day.inbound + day.outbound;
+    const r = Math.min(5, 2 + total * 0.15);
+    // Green = more inbound, orange = more outbound, yellow = balanced
+    const inRatio = total > 0 ? day.inbound / total : 0.5;
+    const gr = Math.round(130 + inRatio * 125);
+    const rd = Math.round(255 - inRatio * 155);
+    ctx.beginPath();
+    ctx.arc(x, H / 2, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(' + rd + ',' + gr + ',50,0.8)';
+    ctx.fill();
   }
 }
 """
@@ -738,7 +873,10 @@ function animate(now) {
   const slider = document.getElementById('timeline-slider');
   slider.value = (state.currentTime / MAX_TIME * 10000) | 0;
   document.getElementById('clock').textContent = fmtDate(state.currentTime);
-  document.getElementById('active-count').textContent = countActive() + ' active vessels';
+  const nActive = countActive();
+  const posTotal = ANALYTICS.summary.total_positions;
+  document.getElementById('active-count').textContent =
+    nActive + ' active vessels' + (posTotal ? ' \u00b7 ' + posTotal.toLocaleString() + ' positions' : '');
   updateLiveCounter();
 
   // Redraw sparkline "now" indicator (lightweight)
@@ -756,6 +894,7 @@ document.getElementById('play-btn').onclick = () => {
   const btn = document.getElementById('play-btn');
   btn.innerHTML = state.playing ? '&#9646;&#9646;' : '&#9654;';
   btn.classList.toggle('active', state.playing);
+  document.getElementById('playback-badge').classList.toggle('visible', state.playing);
 };
 
 // Speed buttons
@@ -892,12 +1031,16 @@ function selectVessel(mmsi) {
   details.innerHTML = '';
   const rows = [
     ['MMSI', mmsi],
-    ['IMO', info.imo || '—'],
-    ['Flag', info.flag || '—'],
-    ['Length', info.length ? info.length + ' m' : '—'],
-    ['Beam', info.beam ? info.beam + ' m' : '—'],
+    ['IMO', info.imo],
+    ['Callsign', info.callsign],
+    ['Flag', info.flag],
+    ['Destination', info.destination],
+    ['Length', info.length ? info.length + ' m' : null],
+    ['Beam', info.beam ? info.beam + ' m' : null],
+    ['Draught', info.draught ? info.draught + ' m' : null],
   ];
   rows.forEach(([label, val]) => {
+    if (!val) return;
     const row = document.createElement('div');
     row.className = 'v-row';
     row.innerHTML = '<span class="v-label">' + label + '</span><span>' + val + '</span>';
@@ -962,6 +1105,17 @@ _JS_INIT = Template("""\
     note.textContent = 'Showing ' + $n_tracks + ' of ' + $total_track_count + ' tracks';
   }
 
+  // Position counts (#5)
+  if (S.total_positions > 0) {
+    document.getElementById('pos-total').textContent = S.total_positions.toLocaleString();
+    document.getElementById('pos-before').textContent = S.positions_before ? S.positions_before.toLocaleString() : '—';
+    document.getElementById('pos-after').textContent = S.positions_after ? S.positions_after.toLocaleString() : '—';
+  }
+
+  // Date range labels (#7)
+  if (DATE_FROM) document.getElementById('date-start').textContent = DATE_FROM;
+  if (DATE_TO) document.getElementById('date-end').textContent = DATE_TO;
+
   drawChart();
   drawSparkline();
   updateLayers();
@@ -1003,6 +1157,7 @@ def render_dashboard(data: dict) -> str:
         "events_json": data["events_json"],
         "infra_json": data["infra_json"],
         "gate_coords": data["gate_coords"],
+        "crossing_times_json": data["crossing_times_json"],
         "has_gate": "true" if data["has_gate"] else "false",
         "max_time": data["max_time"],
         "trail_length": data["trail_length"],

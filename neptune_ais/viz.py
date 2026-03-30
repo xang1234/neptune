@@ -956,6 +956,7 @@ def _compute_dashboard_analytics(
     crossings: list[dict],
     reversals: list[dict],
     vessels_df: pl.DataFrame | None,
+    positions_df: pl.DataFrame | None,
     config: DashboardConfig,
     global_start_ms: int | None,
     total_track_count: int,
@@ -964,6 +965,8 @@ def _compute_dashboard_analytics(
 
     Returns a dict of JSON-serializable analytics data.
     """
+    from neptune_ais.datasets.positions import Col as PosCol_
+
     has_gate = config.gate is not None and len(crossings) > 0
 
     # -- vessel index from vessels DataFrame ---------------------------------
@@ -978,9 +981,33 @@ def _compute_dashboard_analytics(
                 "type": row.get(VesselCol.SHIP_TYPE, ""),
                 "flag": row.get(VesselCol.FLAG, ""),
                 "imo": row.get(VesselCol.IMO, ""),
+                "callsign": row.get(VesselCol.CALLSIGN, ""),
                 "length": row.get(VesselCol.LENGTH),
                 "beam": row.get(VesselCol.BEAM),
             }
+
+    # -- enrich vessel index with last-known destination/draught from positions
+    if positions_df is not None:
+        pos_cols = positions_df.columns
+        if PosCol_.DESTINATION in pos_cols or "draught" in pos_cols:
+            agg_exprs = [pl.col(PosCol_.MMSI)]
+            if PosCol_.DESTINATION in pos_cols:
+                agg_exprs.append(pl.col(PosCol_.DESTINATION).drop_nulls().last().alias("_dest"))
+            if "draught" in pos_cols:
+                agg_exprs.append(pl.col("draught").drop_nulls().last().alias("_draught"))
+            last_info = (
+                positions_df.sort(PosCol_.TIMESTAMP)
+                .group_by(PosCol_.MMSI)
+                .agg(*agg_exprs[1:])
+            )
+            for row in last_info.iter_rows(named=True):
+                mmsi = int(row[PosCol_.MMSI])
+                if mmsi not in vessel_index:
+                    vessel_index[mmsi] = {}
+                if "_dest" in row and row["_dest"]:
+                    vessel_index[mmsi]["destination"] = str(row["_dest"])
+                if "_draught" in row and row["_draught"] is not None:
+                    vessel_index[mmsi]["draught"] = row["_draught"]
 
     # -- per-trip metadata for filtering -------------------------------------
     transit_mmsis: set[int] = set()
@@ -1073,12 +1100,14 @@ def _compute_dashboard_analytics(
 
     # -- sparkline (200-bucket histogram) ------------------------------------
     sparkline: list[int] = []
+    sparkline_inbound: list[int] = []
+    sparkline_outbound: list[int] = []
+    n_buckets = 200
     if trips:
         t_min = min(t["timestamps"][0] for t in trips)
         t_max = max(t["timestamps"][-1] for t in trips)
         t_range = t_max - t_min
         if t_range > 0:
-            n_buckets = 200
             bucket_size = t_range / n_buckets
             buckets = [0] * n_buckets
             for trip in trips:
@@ -1086,6 +1115,45 @@ def _compute_dashboard_analytics(
                     idx = min(int((ts - t_min) / bucket_size), n_buckets - 1)
                     buckets[idx] += 1
             sparkline = buckets
+
+    # Directional sparklines from crossings.
+    if has_gate and sparkline:
+        t_min = min(t["timestamps"][0] for t in trips)
+        t_max = max(t["timestamps"][-1] for t in trips)
+        t_range = t_max - t_min
+        if t_range > 0:
+            bucket_size = t_range / n_buckets
+            in_buckets = [0] * n_buckets
+            out_buckets = [0] * n_buckets
+            for c in crossings:
+                idx = min(int((c["timestamp_s"] - t_min) / bucket_size), n_buckets - 1)
+                if idx >= 0:
+                    if c["direction"] == "inbound":
+                        in_buckets[idx] += 1
+                    else:
+                        out_buckets[idx] += 1
+            sparkline_inbound = in_buckets
+            sparkline_outbound = out_buckets
+
+    # -- crossing times for gate pulse animation -----------------------------
+    crossing_times: list[float] = [c["timestamp_s"] for c in crossings]
+
+    # -- position counts -----------------------------------------------------
+    total_positions = 0
+    positions_before = 0
+    positions_after = 0
+    if positions_df is not None:
+        total_positions = len(positions_df)
+        if config.event_date and global_start_ms is not None:
+            from neptune_ais.datasets.positions import Col as PosCol_
+            epoch_s = global_start_ms / 1000.0
+            event_dt = datetime.fromisoformat(config.event_date).replace(
+                tzinfo=timezone.utc
+            )
+            positions_before = len(positions_df.filter(
+                pl.col(PosCol_.TIMESTAMP) < event_dt
+            ))
+            positions_after = total_positions - positions_before
 
     summary = {
         "total_tracked": len(trip_mmsis),
@@ -1095,6 +1163,9 @@ def _compute_dashboard_analytics(
         "delta_pct": delta_pct,
         "before_count": before_count,
         "after_count": after_count,
+        "total_positions": total_positions,
+        "positions_before": positions_before,
+        "positions_after": positions_after,
     }
 
     return {
@@ -1115,6 +1186,9 @@ def _compute_dashboard_analytics(
         ),
         "reversals": reversals,
         "sparkline": sparkline,
+        "sparkline_inbound": sparkline_inbound,
+        "sparkline_outbound": sparkline_outbound,
+        "crossing_times": crossing_times,
     }
 
 
@@ -1186,18 +1260,19 @@ def generate_dashboard(
 
     # Collect optional DataFrames.
     vessels_df = _collect(vessels) if vessels is not None else None
+    positions_df = _collect(positions) if positions is not None else None
     events_df = _collect(events) if events is not None else None
 
     # Pre-compute analytics.
     analytics = _compute_dashboard_analytics(
-        trips, crossings, reversals_list, vessels_df, config,
+        trips, crossings, reversals_list, vessels_df, positions_df, config,
         global_start_ms, total_track_count,
     )
 
     # Density data.
     density_data: list[dict] = []
-    if positions is not None:
-        density_df = prepare_density(_collect(positions), max_points=50_000)
+    if positions_df is not None:
+        density_df = prepare_density(positions_df, max_points=50_000)
         density_data = density_df.to_dicts()
 
     # Event data.
@@ -1272,6 +1347,7 @@ def generate_dashboard(
         "events_json": _safe_json_embed(event_data),
         "infra_json": _safe_json_embed(infra_data),
         "vessel_index_json": _safe_json_embed(vessel_index),
+        "crossing_times_json": _safe_json_embed(analytics.get("crossing_times", [])),
         "center_lat": center_lat,
         "center_lon": center_lon,
         "zoom": zoom,
