@@ -486,8 +486,8 @@ function initPanel(idx) {
   renderer.autoClear = false;
   overlayDiv.appendChild(renderer.domElement);
 
-  // Camera (pixel-space orthographic)
-  const camera = new THREE.OrthographicCamera(0, w, 0, h, -1, 1);
+  // Camera (pixel-space orthographic, Y-down screen convention)
+  const camera = new THREE.OrthographicCamera(0, w, h, 0, -1, 1);
   // Fullscreen quad camera for post-processing
   const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
@@ -649,6 +649,7 @@ function initPanel(idx) {
     headScene, headGeom, headPosArr, headColArr,
     composer, compPass, bloomPass,
     w, h, pw, ph, cfg, binSegCount,
+    _trailCount: 0,
   };
 
   panelCtx.push(panel);

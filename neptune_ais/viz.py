@@ -1553,7 +1553,11 @@ def prepare_timelapse(
         }
 
     # Enrich ship_type from vessels table if available.
-    if vessels is not None and PosCol.SHIP_TYPE in result.columns:
+    if vessels is not None:
+        if PosCol.SHIP_TYPE not in result.columns:
+            result = result.with_columns(
+                pl.lit(None, dtype=pl.String).alias(PosCol.SHIP_TYPE),
+            )
         vessels_df = _collect(vessels)
         if VesselCol.SHIP_TYPE in vessels_df.columns:
             type_lookup = vessels_df.select(
@@ -1712,9 +1716,9 @@ def generate_timelapse(
                 bin_interval_minutes=p_config.bin_interval_minutes,
                 color_by_type=p_config.color_by_type,
             )
-            center_lat = p_config.center_lat or prep["center_lat"]
-            center_lon = p_config.center_lon or prep["center_lon"]
-            zoom = p_config.zoom or prep["zoom"]
+            center_lat = prep["center_lat"] if p_config.center_lat is None else p_config.center_lat
+            center_lon = prep["center_lon"] if p_config.center_lon is None else p_config.center_lon
+            zoom = prep["zoom"] if p_config.zoom is None else p_config.zoom
             panels_data.append({
                 "label": p.get("label", ""),
                 "bins_json": _safe_json_embed(prep["bins"]),
@@ -1771,9 +1775,9 @@ def generate_timelapse(
         if not prep["bins"]:
             raise ValueError("No positions found for timelapse.")
 
-        center_lat = config.center_lat or prep["center_lat"]
-        center_lon = config.center_lon or prep["center_lon"]
-        zoom = config.zoom or prep["zoom"]
+        center_lat = prep["center_lat"] if config.center_lat is None else config.center_lat
+        center_lon = prep["center_lon"] if config.center_lon is None else config.center_lon
+        zoom = prep["zoom"] if config.zoom is None else config.zoom
 
         data = {
             "multi": False,

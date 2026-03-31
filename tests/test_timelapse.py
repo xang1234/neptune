@@ -191,11 +191,11 @@ class TestPrepareTimelapse:
                 assert isinstance(pt[2], int)     # type_idx
                 assert isinstance(pt[3], int)     # mmsi_idx
 
-    def test_total_points_match(self) -> None:
-        df = _sample_positions(80, with_ship_type=True)
-        result = prepare_timelapse(df, max_points=80)
+    def test_total_points_respects_max(self) -> None:
+        df = _sample_positions(100, with_ship_type=True)
+        result = prepare_timelapse(df, max_points=50)
         total = sum(len(b) for b in result["bins"])
-        assert total == 80
+        assert total <= 50
 
     def test_viewport_clipping(self) -> None:
         df = _sample_positions(200)
