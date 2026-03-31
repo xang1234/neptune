@@ -362,7 +362,7 @@ void main() {
   vAlpha = aAlpha;
 }`;
 
-// Corridor accumulation — moderate glow, feeds into persistent layer
+// Corridor accumulation — wide soft glow so overlapping halos merge into bands
 const LINE_FRAG_ACCUM = `
 precision highp float;
 varying float vDist;
@@ -370,10 +370,10 @@ varying vec3 vColor;
 varying float vAlpha;
 void main() {
   float d = abs(vDist);
-  float core = smoothstep(0.3, 0.0, d);
-  float glow = exp(-d * d * 4.0);
-  float intensity = core * 0.8 + glow * 0.3;
-  gl_FragColor = vec4(vColor * intensity * 1.5 * vAlpha, intensity * vAlpha);
+  float core = smoothstep(0.25, 0.0, d);
+  float glow = exp(-d * d * 2.0);
+  float intensity = core * 0.6 + glow * 0.5;
+  gl_FragColor = vec4(vColor * intensity * 1.8 * vAlpha, intensity * vAlpha);
 }`;
 
 // Active trail — brighter, more vivid for moving vessel trails
@@ -526,11 +526,11 @@ function initPanel(idx) {
   lineGeom.setIndex(new THREE.BufferAttribute(idxArr, 1));
   lineGeom.setDrawRange(0, 0);
 
-  // Accumulation line material (moderate glow for corridor traces)
+  // Accumulation line material — wide soft glow for river-like corridor bands
   const lineMat = new THREE.RawShaderMaterial({
     vertexShader: LINE_VERT, fragmentShader: LINE_FRAG_ACCUM,
     uniforms: { uResolution: { value: new THREE.Vector2(w, h) },
-                uLineWidth: { value: Math.max(5.0, cfg.dotRadius * 6.0) } },
+                uLineWidth: { value: Math.max(10.0, cfg.dotRadius * 12.0) } },
     blending: THREE.AdditiveBlending, transparent: true,
     depthTest: false, depthWrite: false,
     glslVersion: THREE.GLSL1,
@@ -632,9 +632,9 @@ function initPanel(idx) {
   composer.addPass(compPass);
   const bloomPass = new UnrealBloomPass(
     new THREE.Vector2(pw, ph),
-    cfg.bloom ? 1.5 : 0.0,
-    0.4,
-    0.1
+    cfg.bloom ? 1.0 : 0.0,
+    0.5,
+    0.15
   );
   composer.addPass(bloomPass);
 

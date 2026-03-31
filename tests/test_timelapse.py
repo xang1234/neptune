@@ -80,7 +80,7 @@ class TestTimelapsConfig:
         assert cfg.dot_alpha == 0.10
         assert cfg.bin_interval_minutes == 30
         assert cfg.speed == 2.0
-        assert cfg.fade_factor == 0.992
+        assert cfg.fade_factor == 0.998
         assert cfg.bloom is True
         assert cfg.color_by_type is True
         assert cfg.layout == "vertical"

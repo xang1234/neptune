@@ -137,7 +137,7 @@ class TimelapsConfig:
     bin_interval_minutes: int = 30
     speed: float = 2.0
     color_by_type: bool = True
-    fade_factor: float = 0.992
+    fade_factor: float = 0.998
     bloom: bool = True
     layout: str = "vertical"
 
