@@ -694,12 +694,14 @@ def export(
             click.echo(f"Using derived polygons: {len(derived_polygons)} zone(s)")
 
     features: list[dict] = []
-    tier2_names: set[str] = set()
+    tier2_wpis: set[int] = set()
 
     if derived_polygons is not None and len(derived_polygons) > 0:
         for row in derived_polygons.iter_rows(named=True):
             geom = shapely.from_wkb(row["geometry_wkb"])
-            tier2_names.add(row["port_name"])
+            wpi = row.get("wpi_number")
+            if wpi is not None:
+                tier2_wpis.add(wpi)
             features.append({
                 "type": "Feature",
                 "properties": {
@@ -712,7 +714,7 @@ def export(
             })
 
     for row in pi.ports.iter_rows(named=True):
-        if row["name"] in tier2_names:
+        if row["wpi_number"] in tier2_wpis:
             continue
         w, s, e, n = row["bbox_west"], row["bbox_south"], row["bbox_east"], row["bbox_north"]
         if any(v is None for v in (w, s, e, n)):
