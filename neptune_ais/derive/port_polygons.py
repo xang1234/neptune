@@ -725,22 +725,29 @@ def derive_port_polygons(
     # Stage 1: assign positions to ports
     assigned = assign_positions_to_ports(positions, port_index, config=config)
 
+    def _finalize(zones: pl.DataFrame) -> pl.DataFrame:
+        """Add metadata columns for consistent output schema."""
+        if "wpi_number" not in zones.columns:
+            zones = zones.with_columns(
+                pl.lit(None).cast(pl.Int64).alias("wpi_number"),
+            )
+        return zones.with_columns(
+            pl.lit(config.config_hash()).alias("config_hash"),
+            pl.lit(datetime.now(timezone.utc)).alias("derived_at"),
+        )
+
     if len(assigned) == 0:
         logger.info("No positions assigned to ports — nothing to derive")
-        return _empty_zone_df()
+        return _finalize(_empty_zone_df())
 
     # Stage 2+3: split zones with hulls + confidence
     zones = split_port_zones(assigned, port_index, config=config)
 
     if len(zones) == 0:
         logger.info("No zones produced — insufficient data")
-        return _empty_zone_df()
+        return _finalize(_empty_zone_df())
 
-    # Add metadata columns
-    zones = zones.with_columns(
-        pl.lit(config.config_hash()).alias("config_hash"),
-        pl.lit(datetime.now(timezone.utc)).alias("derived_at"),
-    )
+    zones = _finalize(zones)
 
     logger.info(
         "Derived %d zones across %d ports (config %s)",
