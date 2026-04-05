@@ -1902,7 +1902,9 @@ def _build_port_polygons(
     all_rows: list[pl.DataFrame] = []
 
     # Tier 2: derived polygons (preferred)
-    tier2_names: set[str] = set()
+    # Use wpi_number (unique) for dedup — port names are not unique
+    # (e.g., "Georgetown" appears 5x in different countries).
+    tier2_wpis: set[int] = set()
     if derived_polygons is not None and len(derived_polygons) > 0:
         t2 = derived_polygons
         if min_confidence > 0:
@@ -1911,13 +1913,15 @@ def _build_port_polygons(
         if viewport is not None:
             t2 = _clip_tracks(t2, viewport)
 
-        if len(t2) > 0:
+        if len(t2) > 0 and "wpi_number" in t2.columns:
             # Use the best zone per port (highest confidence)
             best = (
                 t2.sort("confidence", descending=True)
-                .unique(subset=["port_name"], keep="first")
+                .unique(subset=["wpi_number"], keep="first")
             )
-            tier2_names = set(best["port_name"].to_list())
+            tier2_wpis = set(
+                w for w in best["wpi_number"].to_list() if w is not None
+            )
 
             all_rows.append(
                 best.select(
@@ -1929,8 +1933,7 @@ def _build_port_polygons(
                 )
             )
 
-    # Tier 1: bbox rectangles for ports without derived polygons
-    tier1_ports = ports.filter(~pl.col("name").is_in(tier2_names))
+    tier1_ports = ports.filter(~pl.col("wpi_number").is_in(tier2_wpis))
 
     if len(tier1_ports) > 0:
         tier1_wkb = _bbox_to_wkb_series(tier1_ports)

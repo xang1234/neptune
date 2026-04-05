@@ -296,6 +296,7 @@ class TestPreparePortsIntegration:
         # Mock tier 2 derived polygon for Rotterdam
         derived = pl.DataFrame({
             "port_name": ["Rotterdam"],
+            "wpi_number": [31140],
             "zone_id": ["zone_0"],
             "geometry_wkb": [b"\x01\x00"],
             "confidence": [0.9],

@@ -85,7 +85,7 @@ def _normalize(s: str) -> str:
     Returns empty string for garbage inputs (all symbols, arrows, etc.).
     """
     s = s.strip().upper()
-    s = _STRIP_RE.sub("", s)
+    s = _STRIP_RE.sub(" ", s)
     s = " ".join(s.split())  # collapse whitespace
     return s
 

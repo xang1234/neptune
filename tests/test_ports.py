@@ -354,10 +354,15 @@ class TestNormalize:
 
         assert _normalize("  Rotterdam  ") == "ROTTERDAM"
 
-    def test_strips_punctuation(self):
+    def test_replaces_punctuation_with_space(self):
         from neptune_ais.ports._destination import _normalize
 
-        assert _normalize("ROTT/DAM>>") == "ROTTDAM"
+        assert _normalize("ROTT/DAM>>") == "ROTT DAM"
+
+    def test_preserves_hyphenated_names(self):
+        from neptune_ais.ports._destination import _normalize
+
+        assert _normalize("PORT-AU-PRINCE") == "PORT AU PRINCE"
 
     def test_collapses_whitespace(self):
         from neptune_ais.ports._destination import _normalize
