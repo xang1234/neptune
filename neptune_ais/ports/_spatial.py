@@ -50,9 +50,10 @@ def haversine_distance(
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
 
-    a = (
+    a = min(
         math.sin(dlat / 2) ** 2
-        + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+        + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2,
+        1.0,
     )
     return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 

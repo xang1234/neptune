@@ -646,7 +646,7 @@ def download_eez() -> None:
     try:
         df = load_eez_polygons()
         click.echo(f"EEZ polygons ready: {len(df)} region(s).")
-    except RuntimeError as e:
+    except Exception as e:
         raise click.ClickException(str(e))
 
 
@@ -681,7 +681,10 @@ def export(
     derived_polygons = None
     if derived_dir.exists():
         import polars as pl
-        parquet_files = sorted(derived_dir.glob("*.parquet"))
+        parquet_files = sorted(
+            derived_dir.glob("*.parquet"),
+            key=lambda p: p.stat().st_mtime,
+        )
         if parquet_files:
             derived_polygons = pl.read_parquet(parquet_files[-1])
             if min_confidence > 0:
