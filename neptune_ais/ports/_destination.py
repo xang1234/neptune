@@ -257,7 +257,7 @@ def resolve_destination_column(
             # Confidence: 1.0 for UNLOCODE/exact name, 0.5 for substring/token
             clean = _normalize(dest)
             is_exact = (
-                (result.unlocode is not None and clean == result.unlocode)
+                (result.unlocode is not None and clean.replace(" ", "") == result.unlocode)
                 or clean == result.name.upper()
             )
             conf = 1.0 if is_exact else 0.5
