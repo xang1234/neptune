@@ -90,6 +90,14 @@ notebooks = [
     "nest_asyncio>=1.5",
 ]
 
+# Port index build script (maintainers only, not end users).
+# Required for: scripts/build_port_index.py --only eez (EEZ polygon
+# simplification). WPI and UNLOCODE builds only need core deps.
+ports-build = [
+    "geopandas>=1.0",
+    "shapely>=2.0",
+]
+
 # Development and testing.
 dev = [
     "pytest>=8.0",

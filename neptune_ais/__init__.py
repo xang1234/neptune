@@ -29,6 +29,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Neptune",
     "NeptuneStream",
+    "ports",
     "sources",
     "__version__",
 ]
@@ -50,4 +51,10 @@ def __getattr__(name: str):
 
         globals()["sources"] = sources
         return sources
+    if name == "ports":
+        import importlib
+
+        _ports = importlib.import_module("neptune_ais.ports")
+        globals()["ports"] = _ports
+        return _ports
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

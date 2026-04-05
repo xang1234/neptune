@@ -22,7 +22,7 @@
   <a href="https://pypi.org/project/neptune-ais/"><img src="https://img.shields.io/pypi/v/neptune-ais?color=blue" alt="PyPI"></a>
   <a href="https://pypi.org/project/neptune-ais/"><img src="https://img.shields.io/pypi/pyversions/neptune-ais" alt="Python"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-  <a href="https://github.com/yourorg/neptune-ais/actions"><img src="https://img.shields.io/badge/tests-768%20passing-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/yourorg/neptune-ais/actions"><img src="https://img.shields.io/badge/tests-927%20passing-brightgreen" alt="Tests"></a>
 </p>
 
 <p align="center">
@@ -62,7 +62,8 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 - **Plugin system** — Add custom source adapters via Python entry points
 - **Animated vessel replay** — Generate standalone HTML animations with deck.gl TripsLayer
 - **Timelapse corridor visualization** — Cinematic AIS timelapses that reveal shipping corridors through cumulative dot accumulation with additive blending, bloom, and vessel-type color coding
-- **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, and more
+- **World Port Index** — Built-in dictionary of 3,800+ ports with search, nearby lookup, UNLOCODE resolution, AIS destination matching, and auto-derived port polygons from vessel behavior
+- **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, `neptune ports`, and more
 
 <p align="center">
   <img src="assets/timelapse.gif" alt="Neptune AIS timelapse — Gulf of Mexico vessel corridors" width="960">
@@ -78,10 +79,10 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 
 ## Installation
 
-Neptune's core is lightweight — only [Polars](https://pola.rs/), [Pydantic](https://docs.pydantic.dev/), and [httpx](https://www.python-httpx.org/) are required. Everything else is opt-in.
+Neptune's core is lightweight — only [Polars](https://pola.rs/), [Pydantic](https://docs.pydantic.dev/), [httpx](https://www.python-httpx.org/), and [Click](https://click.palletsprojects.com/) are required. The `neptune` CLI works out of the box. Everything else is opt-in.
 
 ```bash
-# Core (Polars + Pydantic + httpx)
+# Core (Polars + Pydantic + httpx + Click)
 pip install neptune-ais
 
 # With SQL support (DuckDB)
@@ -93,7 +94,7 @@ pip install neptune-ais[geo]
 # With real-time streaming (WebSocket feeds)
 pip install neptune-ais[stream]
 
-# With the CLI (Click + Rich)
+# With richer CLI output (Rich)
 pip install neptune-ais[cli]
 
 # Everything
@@ -112,7 +113,7 @@ pip install neptune-ais[all]
 | `geo` | shapely, geopandas, movingpandas, lonboard, h3, folium, mapclassify, matplotlib | Boundary lookups, GeoDataFrame bridges, maps |
 | `gfw` | gfw-api-python-client | GFW source adapter (events, vessels, fishing effort) |
 | `stream` | websockets, aiomqtt | `NeptuneStream`, live AIS feeds |
-| `cli` | click, rich | `neptune` console commands |
+| `cli` | rich | Richer terminal formatting (click is in core) |
 | `notebooks` | jupyter, ipykernel | Interactive notebook examples |
 | `dev` | pytest, mypy, ruff, coverage, nbstripout | Development and testing |
 | `all` | All of the above (except dev) | Full-featured install |
@@ -325,7 +326,7 @@ Each event includes a deterministic `event_id`, confidence score, timestamps, an
 
 ## CLI
 
-Neptune includes a full command-line interface (requires `pip install neptune-ais[cli]`):
+Neptune includes a full command-line interface (works with the base install — `pip install neptune-ais[cli]` adds richer formatting):
 
 ```bash
 # Download data
@@ -349,6 +350,14 @@ neptune sources --compare noaa dma gfw
 # Event queries
 neptune events --kind port_call --date 2024-06-15
 
+# World Port Index
+neptune ports search "Rotterdam"
+neptune ports near 51.9 4.5
+neptune ports info NLRTM
+neptune ports country NL
+neptune ports derive --date 2024-06-15
+neptune ports export -o ports.geojson
+
 # Health and provenance
 neptune health
 neptune provenance --date 2024-06-15
@@ -363,7 +372,7 @@ Full Sphinx documentation is planned. In the meantime:
 
 | Resource | Description |
 |---|---|
-| [`examples/`](examples/) | Nine narrative examples covering the full workflow |
+| [`examples/`](examples/) | Eleven narrative examples covering the full workflow |
 | [HEURISTICS.md](HEURISTICS.md) | Event detection assumptions, confidence limits, non-goals |
 | [RELEASING.md](RELEASING.md) | Release procedures and checklist |
 | [RC_CHECKLIST.md](RC_CHECKLIST.md) | Release-candidate validation results |
@@ -382,6 +391,7 @@ Full Sphinx documentation is planned. In the meantime:
 | 8 | [Spatial Visualization](examples/08_spatial_visualization.ipynb) | Interactive maps, GeoDataFrames, MovingPandas trajectories |
 | 9 | [Intelligence Dashboard](examples/09_intelligence_dashboard.ipynb) | Gate crossings, live counters, filters, standalone HTML dashboard |
 | 10 | [Timelapse Visualization](examples/10_timelapse_visualization.ipynb) | Cinematic corridor timelapse, vessel-type coloring, multi-panel |
+| 11 | [World Port Index](examples/11_world_port_index.ipynb) | Port dictionary, zero-config port calls, enrichment, polygons, destination resolver |
 
 > **Tip:** Install notebook support with `pip install neptune-ais[notebooks]` to run the interactive examples.
 
@@ -396,7 +406,7 @@ pip install -e ".[all,dev]"
 pytest
 ```
 
-The test suite includes 768 tests covering adapter certification, schema reproducibility, streaming soak tests, and packaging validation.
+The test suite includes 927 tests covering adapter certification, schema reproducibility, streaming soak tests, port intelligence, and packaging validation.
 
 ## License
 
