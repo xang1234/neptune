@@ -567,11 +567,14 @@ def info(identifier: str) -> None:
     click.echo(f"  Harbor size:   {port.harbor_size}")
     click.echo(f"  Harbor type:   {port.harbor_type}")
     click.echo(f"  Shelter:       {port.shelter_quality}")
-    click.echo(f"  Channel depth: {port.channel_depth_m or '—'} m")
-    click.echo(f"  Anchorage:     {port.anchorage_depth_m or '—'} m")
-    click.echo(f"  Cargo pier:    {port.cargo_pier_depth_m or '—'} m")
-    click.echo(f"  Max vessel:    {port.max_vessel_length_m or '—'} m")
-    click.echo(f"  Tide range:    {port.tide_range_m or '—'} m")
+    def _m(v: float | None) -> str:
+        return f"{v} m" if v is not None else "—"
+
+    click.echo(f"  Channel depth: {_m(port.channel_depth_m)}")
+    click.echo(f"  Anchorage:     {_m(port.anchorage_depth_m)}")
+    click.echo(f"  Cargo pier:    {_m(port.cargo_pier_depth_m)}")
+    click.echo(f"  Max vessel:    {_m(port.max_vessel_length_m)}")
+    click.echo(f"  Tide range:    {_m(port.tide_range_m)}")
     click.echo(f"  Pilotage:      {'yes' if port.has_pilotage else 'no'}")
     click.echo(f"  Tugs:          {'yes' if port.has_tugs else 'no'}")
     click.echo(f"  Fuel:          {'yes' if port.has_fuel else 'no'}")
