@@ -145,7 +145,7 @@ def _substring_match(clean: str, port_index: PortIndex) -> Port | None:
     # Cannot use pl.lit(str).str.contains(Expr) — Polars broadcasting bug (#12632).
     if len(combined) == 0:
         port_names_upper = port_index.ports["name"].str.to_uppercase().to_list()
-        reverse_mask = [pn in clean for pn in port_names_upper]
+        reverse_mask = [pn is not None and pn in clean for pn in port_names_upper]
         combined = port_index.ports.filter(pl.Series(reverse_mask))
     if len(combined) == 0:
         return None
