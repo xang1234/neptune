@@ -40,8 +40,5 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
-# Generated replay / timelapse files
+# Generated replay files
 replay.html
-ais_timelapse_d3.html
-ais_timelapse_d3.mp4
-
