@@ -18,6 +18,7 @@ from neptune_ais.viz import (
     _VESSEL_TYPE_ORDER,
     _categorize_vessel_type,
     generate_timelapse,
+    generate_timelapse_d3,
     prepare_timelapse,
 )
 
@@ -434,3 +435,95 @@ class TestGenerateTimelapseMultiPanel:
         )
         html = Path(out).read_text()
         assert "grid-template-columns" in html
+
+
+# ---------------------------------------------------------------------------
+# generate_timelapse_d3 (D3.js + Canvas2D renderer)
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateTimelapseD3:
+    def _panels_fixture(self, n: int = 3) -> list[dict]:
+        df1 = _sample_positions(200, with_ship_type=True)
+        return [
+            {
+                "label": "Panel A", "sea": "North Sea",
+                "bbox": (-118.35, 33.60, -117.95, 33.85),
+                "positions": df1,
+            },
+            {
+                "label": "Panel B", "sea": "South Strait",
+                "bbox": (-118.35, 33.60, -117.95, 33.85),
+                "positions": df1,
+            },
+            {
+                "label": "Panel C", "sea": "East Bay",
+                "bbox": (-118.35, 33.60, -117.95, 33.85),
+                "positions": df1,
+            },
+        ][:n]
+
+    def test_generates_html_file(self, tmp_path: Path) -> None:
+        out = generate_timelapse_d3(
+            panels=self._panels_fixture(),
+            output=str(tmp_path / "d3.html"),
+        )
+        assert Path(out).exists()
+        # With two TopoJSON blobs (land + states) embedded, the file is
+        # always >200 KB even for minimal data.
+        assert Path(out).stat().st_size > 200_000
+
+    def test_contains_expected_structure(self, tmp_path: Path) -> None:
+        out = generate_timelapse_d3(
+            panels=self._panels_fixture(3),
+            title="Test D3",
+            output=str(tmp_path / "d3.html"),
+        )
+        html = Path(out).read_text()
+        # Three panel cells.
+        assert html.count('class="panel-cell"') == 3
+        # Both canvas layers per panel.
+        assert html.count('class="basemap"') == 3
+        assert html.count('class="trails"') == 3
+        # D3 + topojson-client + pako scripts referenced.
+        assert "d3@7" in html
+        assert "topojson-client" in html
+        assert "pako" in html
+        # Title substituted.
+        assert "Test D3" in html
+        # Recorder hook exposed.
+        assert "__timelapse_ready" in html
+        assert "__timelapse_seek" in html
+
+    def test_requires_bbox_and_positions(self, tmp_path: Path) -> None:
+        df = _sample_positions(100, with_ship_type=True)
+        with pytest.raises(ValueError, match="bbox"):
+            generate_timelapse_d3(
+                panels=[{"label": "x", "positions": df}],
+                output=str(tmp_path / "bad.html"),
+            )
+
+    def test_empty_panels_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="at least one panel"):
+            generate_timelapse_d3(panels=[], output=str(tmp_path / "e.html"))
+
+    def test_xss_escape_in_embedded_json(self, tmp_path: Path) -> None:
+        # Verify the < → < escape prevents </script> injection via
+        # any string field that happens to round-trip through the JSON blob.
+        panels = self._panels_fixture(1)
+        panels[0]["label"] = "</script><script>alert(1)</script>"
+        out = generate_timelapse_d3(
+            panels=panels,
+            output=str(tmp_path / "xss.html"),
+        )
+        html = Path(out).read_text()
+        # The user-controlled label appears once in the HTML overlay (via
+        # HTML substitution), but must NOT appear inside any <script>
+        # block payload.
+        script_blocks = html.split("<script")
+        for block in script_blocks[1:]:
+            head, _, body = block.partition(">")
+            if not body:
+                continue
+            inner = body.split("</script>")[0]
+            assert "</script>" not in inner

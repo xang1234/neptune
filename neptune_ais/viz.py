@@ -1812,6 +1812,126 @@ def generate_timelapse(
     return str(out_path)
 
 
+def generate_timelapse_d3(
+    *,
+    panels: list[dict],
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    title: str = "AIS Timelapse",
+    eyebrow: str = "Vessel Movement — AIS Corridors",
+    output: str = "timelapse_d3.html",
+    max_points_per_panel: int | None = 120_000,
+    bin_interval_minutes: int = 30,
+    total_duration_sec: float = 15.0,
+    include_us_states: bool = True,
+    color_by_type: bool = True,
+) -> str:
+    """Generate a standalone D3.js + Canvas2D timelapse HTML file.
+
+    Mirror of :func:`generate_timelapse` that swaps the Three.js
+    renderer for pure D3 + additive Canvas 2D. The output is
+    self-contained (TopoJSON landmasses embedded as base64-gzip) and
+    requires no tile server or API key.
+
+    Each panel is a dict with keys:
+
+    - ``label`` (str): Region display name (e.g., ``"New York"``).
+    - ``sea`` (str): Sub-label (e.g., ``"Hudson / Kill Van Kull"``).
+    - ``bbox`` (tuple): ``(west, south, east, north)`` in degrees —
+      used both to clip positions and to fit the Mercator projection
+      for the panel cell.
+    - ``positions`` (DataFrame): Positions for this panel's bbox. Can
+      be pre-filtered; the function also clips to ``bbox`` as a
+      safety net.
+    - ``daterange`` (str, optional): Date span caption shown in the
+      panel label (e.g., ``"Jun 15–16 2024"``).
+
+    Args:
+        panels: Ordered list of panel specifications.
+        vessels: Optional vessels DataFrame for ship-type enrichment.
+        title: Global title shown centered at the top.
+        eyebrow: Small uppercase caption above the title.
+        output: Output HTML file path. Default ``"timelapse_d3.html"``.
+        max_points_per_panel: Per-panel sampling cap. Default 120K so
+            three dense panels don't balloon the HTML beyond ~10 MB.
+        bin_interval_minutes: Time bin size for the animation steps.
+        total_duration_sec: Playback length for one full loop at 1x.
+        include_us_states: Embed the US states TopoJSON layer. Set
+            False when all panels are outside CONUS to trim file size.
+        color_by_type: Color vessels by type category (cargo, tanker,
+            passenger, fishing, tug, other).
+
+    Returns:
+        The absolute path to the generated HTML file.
+    """
+    from neptune_ais._timelapse_d3_template import render_timelapse_d3
+
+    if not panels:
+        raise ValueError("generate_timelapse_d3 requires at least one panel.")
+
+    panels_data: list[dict] = []
+    palette: list[list[int]] | None = None
+    type_names: list[str] | None = None
+    effective_color_by_type = color_by_type
+
+    for p in panels:
+        if "bbox" not in p or "positions" not in p:
+            raise ValueError(
+                "Each panel dict must include 'bbox' and 'positions' keys."
+            )
+        west, south, east, north = p["bbox"]
+        viewport = Viewport(west=west, south=south, east=east, north=north)
+        prep = prepare_timelapse(
+            p["positions"],
+            vessels=p.get("vessels", vessels),
+            viewport=viewport,
+            max_points=max_points_per_panel,
+            bin_interval_minutes=bin_interval_minutes,
+            color_by_type=color_by_type,
+        )
+        if not prep["bins"]:
+            raise ValueError(
+                f"Panel {p.get('label', '?')!r} has no positions in bbox "
+                f"{p['bbox']}. Widen the bbox or pick a busier time window."
+            )
+        if palette is None:
+            palette = prep["palette"]
+            type_names = prep["type_names"]
+            effective_color_by_type = prep["color_by_type"]
+
+        panels_data.append({
+            "label": p.get("label", ""),
+            "sea": p.get("sea", ""),
+            "daterange": p.get("daterange", ""),
+            "bbox": list(p["bbox"]),
+            "bins": prep["bins"],
+            "cumul_vessels": prep["cumul_vessels"],
+            "bin_timestamps_ms": prep["bin_timestamps_ms"],
+        })
+
+    data = {
+        "title": title,
+        "eyebrow": eyebrow,
+        "panels": panels_data,
+        "palette": palette or [],
+        "type_names": type_names or [],
+        "color_by_type": effective_color_by_type,
+        "bins_per_second": 3.5,
+        "fade_alpha": 0.978,
+        "halo_radius": 5.0,
+        "halo_alpha": 0.18,
+        "core_radius": 1.4,
+        "core_alpha": 0.95,
+        "total_duration_sec": total_duration_sec,
+        "include_us_states": include_us_states,
+        "speed_label": "1x",
+    }
+
+    html = render_timelapse_d3(data)
+    out_path = Path(output).resolve()
+    out_path.write_text(html)
+    return str(out_path)
+
+
 # ---------------------------------------------------------------------------
 # Port boundaries layer
 # ---------------------------------------------------------------------------
