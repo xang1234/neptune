@@ -27,8 +27,13 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
+
+if TYPE_CHECKING:
+    from neptune_ais.derive.events import EEZCrossingConfig, PortCallConfig
+    from neptune_ais.derive.port_polygons import PortPolygonConfig
 
 from neptune_ais.catalog import (
     BBox,
@@ -43,6 +48,7 @@ from neptune_ais.storage import (
     DEFAULT_STORE_ROOT,
     PartitionWriter,
     RawPolicy,
+    StoreLayer,
     raw_partition_path,
     shard_filename,
     SORT_ORDER_POSITIONS,
@@ -799,6 +805,84 @@ class Neptune:
             positions=self.positions(),
             tracks=tracks,
             events=events_lf,
+        )
+
+    def port_calls(
+        self,
+        *,
+        config: PortCallConfig | None = None,
+        enrich: bool = True,
+    ) -> pl.DataFrame:
+        """Detect port calls across the configured scope.
+
+        Auto-loads built-in World Port Index boundaries and uses
+        vectorized spatial matching. No manual boundary loading needed.
+
+        Args:
+            config: ``PortCallConfig`` detection parameters. Uses
+                defaults if None.
+            enrich: If True (default), join port metadata (UNLOCODE,
+                country, facilities) onto the detected events.
+
+        Returns:
+            A DataFrame of port-call events, optionally enriched with
+            port metadata columns.
+        """
+        from neptune_ais.helpers import port_calls
+        return port_calls(
+            self.positions(), config=config, source=",".join(self._sources),
+            enrich=enrich,
+        )
+
+    def eez_crossings(self, *, config: EEZCrossingConfig | None = None) -> pl.DataFrame:
+        """Detect EEZ crossings across the configured scope.
+
+        Auto-loads built-in EEZ metadata boundaries (bbox-only). For
+        polygon-level accuracy, use ``helpers.eez_crossings()`` with
+        a custom ``BoundaryRegistry``.
+
+        Args:
+            config: ``EEZCrossingConfig`` detection parameters. Uses
+                defaults if None.
+
+        Returns:
+            A DataFrame of EEZ-crossing events.
+        """
+        from neptune_ais.helpers import eez_crossings
+        return eez_crossings(
+            self.positions(), config=config, source=",".join(self._sources),
+        )
+
+    def derive_port_polygons(self, *, config: PortPolygonConfig | None = None) -> pl.DataFrame:
+        """Derive port boundary polygons from AIS position data.
+
+        Runs the Tier 2 pipeline: filters low-speed positions, assigns
+        them to nearby WPI ports, computes concave hulls, splits into
+        spatial zones, and scores confidence.
+
+        Results are written to the derived store when ``output_dir``
+        is set (the default). The output path includes a config hash,
+        so different parameters produce separate files.
+
+        Requires the ``[geo]`` extra (``shapely >= 2.0``).
+
+        Args:
+            config: ``PortPolygonConfig`` derivation parameters. Uses
+                defaults if None.
+
+        Returns:
+            A DataFrame with per-zone rows including ``port_name``,
+            ``wpi_number``, ``zone_id``, ``geometry_wkb``, bbox,
+            statistics, and ``confidence``.
+        """
+        from neptune_ais.derive.port_polygons import derive_port_polygons
+        from neptune_ais.ports import index
+
+        return derive_port_polygons(
+            self.positions().collect(),
+            index(),
+            config=config,
+            output_dir=self._store_root / StoreLayer.DERIVED.value,
         )
 
     # --- Inspection surfaces ---

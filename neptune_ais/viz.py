@@ -33,7 +33,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
@@ -42,6 +42,9 @@ from neptune_ais.datasets.positions import Col as PosCol
 from neptune_ais.datasets.tracks import Col as TrackCol
 from neptune_ais.datasets.vessels import Col as VesselCol
 from neptune_ais.derive.crossings import GateLine  # noqa: F401 — re-exported
+
+if TYPE_CHECKING:
+    from neptune_ais.ports._index import PortIndex
 
 # Viz-only derived column name (not part of the tracks schema).
 _TRIP_PROGRESS = "trip_progress"
@@ -1807,3 +1810,178 @@ def generate_timelapse(
     out_path = Path(output).resolve()
     out_path.write_text(html)
     return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Port boundaries layer
+# ---------------------------------------------------------------------------
+
+
+def prepare_ports(
+    port_index: PortIndex | None = None,
+    *,
+    derived_polygons: pl.DataFrame | None = None,
+    viewport: Viewport | None = None,
+    show_centers: bool = True,
+    show_polygons: bool = True,
+    min_confidence: float = 0.0,
+) -> dict[str, pl.DataFrame]:
+    """Prepare port boundaries and centers for map rendering.
+
+    Returns a dict of DataFrames ready for map rendering:
+
+    - ``"centers"``: Port center points with labels (for markers).
+    - ``"polygons"``: Port boundary polygons with tier metadata
+      (for polygon/outline rendering). Includes a ``polygon_source``
+      column: ``"tier2"`` for derived polygons, ``"tier1_bbox"`` for
+      bbox-only ports.
+
+    Tier 2 derived polygons (from ``derive_port_polygons()``) are
+    preferred when available. Remaining ports fall back to Tier 1
+    bbox rectangles (requires ``shapely``).
+
+    Color coding guidance (for rendering):
+
+    - ``tier2`` + confidence >= 0.7 → solid fill (high confidence)
+    - ``tier2`` + confidence < 0.7 → dashed outline (low confidence)
+    - ``tier1_bbox`` → gray outline (no derived data)
+
+    Args:
+        port_index: Optional PortIndex. If None, loads the default
+            singleton.
+        derived_polygons: Optional DataFrame from
+            ``derive_port_polygons()`` with ``port_name``,
+            ``geometry_wkb``, ``confidence``, and bbox columns.
+        viewport: Optional bounding box to clip to.
+        show_centers: Include center points in the result.
+        show_polygons: Include polygon boundaries in the result.
+        min_confidence: Minimum confidence for derived polygons.
+            Polygons below this threshold are excluded from Tier 2
+            (the port falls back to Tier 1 bbox). Default 0.0.
+
+    Returns:
+        A dict with keys ``"centers"`` and ``"polygons"``, each a
+        Polars DataFrame. Either key may be absent if the
+        corresponding ``show_*`` flag is False.
+    """
+    if port_index is None:
+        from neptune_ais.ports import index
+        port_index = index()
+
+    result: dict[str, pl.DataFrame] = {}
+
+    ports = port_index.ports
+
+    if viewport is not None:
+        ports = _clip_positions(ports, viewport)
+
+    if show_centers:
+        result["centers"] = ports.select(
+            "wpi_number", "name", "lat", "lon",
+            "harbor_size", "unlocode", "country_code",
+        )
+
+    if show_polygons:
+        result["polygons"] = _build_port_polygons(
+            ports, derived_polygons,
+            viewport=viewport,
+            min_confidence=min_confidence,
+        )
+
+    return result
+
+
+def _build_port_polygons(
+    ports: pl.DataFrame,
+    derived_polygons: pl.DataFrame | None,
+    *,
+    viewport: Viewport | None,
+    min_confidence: float,
+) -> pl.DataFrame:
+    """Build a unified polygon DataFrame from Tier 2 + Tier 1 sources."""
+    all_rows: list[pl.DataFrame] = []
+
+    # Tier 2: derived polygons (preferred)
+    # Use wpi_number (unique) for dedup — port names are not unique
+    # (e.g., "Georgetown" appears 5x in different countries).
+    tier2_wpis: set[int] = set()
+    if derived_polygons is not None and len(derived_polygons) > 0:
+        t2 = derived_polygons
+        if min_confidence > 0:
+            t2 = t2.filter(pl.col("confidence") >= min_confidence)
+
+        if viewport is not None:
+            t2 = _clip_tracks(t2, viewport)
+
+        if len(t2) > 0 and "wpi_number" in t2.columns:
+            # Use the best zone per port (highest confidence)
+            best = (
+                t2.sort("confidence", descending=True)
+                .unique(subset=["wpi_number"], keep="first")
+            )
+            tier2_wpis = set(
+                w for w in best["wpi_number"].to_list() if w is not None
+            )
+
+            all_rows.append(
+                best.select(
+                    pl.col("port_name").alias("name"),
+                    "geometry_wkb",
+                    "confidence",
+                    "bbox_west", "bbox_south", "bbox_east", "bbox_north",
+                    pl.lit("tier2").alias("polygon_source"),
+                )
+            )
+
+    tier1_ports = ports.filter(~pl.col("wpi_number").is_in(tier2_wpis))
+
+    if len(tier1_ports) > 0:
+        tier1_wkb = _bbox_to_wkb_series(tier1_ports)
+        if tier1_wkb is not None:
+            all_rows.append(
+                tier1_ports.with_columns(
+                    tier1_wkb.alias("geometry_wkb"),
+                    pl.lit(None).cast(pl.Float64).alias("confidence"),
+                    pl.lit("tier1_bbox").alias("polygon_source"),
+                ).select(
+                    "name", "geometry_wkb", "confidence",
+                    "bbox_west", "bbox_south", "bbox_east", "bbox_north",
+                    "polygon_source",
+                )
+            )
+
+    if not all_rows:
+        return pl.DataFrame(
+            schema={
+                "name": pl.String,
+                "geometry_wkb": pl.Binary,
+                "confidence": pl.Float64,
+                "bbox_west": pl.Float64,
+                "bbox_south": pl.Float64,
+                "bbox_east": pl.Float64,
+                "bbox_north": pl.Float64,
+                "polygon_source": pl.String,
+            }
+        )
+
+    return pl.concat(all_rows, how="vertical_relaxed")
+
+
+def _bbox_to_wkb_series(ports: pl.DataFrame) -> pl.Series | None:
+    """Convert port bbox columns to WKB polygon Series (vectorized).
+
+    Uses ``shapely.box()`` (Shapely 2.0+ vectorized ufunc) for
+    fast batch conversion. Returns None if shapely is not available.
+    """
+    try:
+        import shapely
+    except ImportError:
+        return None
+
+    west = ports["bbox_west"].to_numpy()
+    south = ports["bbox_south"].to_numpy()
+    east = ports["bbox_east"].to_numpy()
+    north = ports["bbox_north"].to_numpy()
+    boxes = shapely.box(west, south, east, north)
+    wkb_arr = shapely.to_wkb(boxes)
+    return pl.Series("geometry_wkb", wkb_arr.tolist(), dtype=pl.Binary)

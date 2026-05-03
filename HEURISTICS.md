@@ -96,6 +96,37 @@ clustered in a small area (not inside a port).
   staying in a small operational area.
 - The spatial radius is equirectangular, not geodesic.
 
+## Port Boundaries: Antimeridian Limitation
+
+**Affected ports:** ~20–30 ports near the 180th meridian (Fiji, Tonga,
+Kiribati, Marshall Islands, Russian Far East — e.g., Suva, Nuku'alofa,
+Petropavlovsk-Kamchatsky).
+
+**The problem:** All bbox containment logic uses `west <= lon <= east`.
+For a port like Suva (Fiji), the true bbox crosses the antimeridian:
+`west=177.5, east=-178.0`. The check `177.5 <= lon <= -178.0` is always
+false — no position will ever match.
+
+**What breaks:**
+- **Tier 1 bbox matching** — `vectorized_port_lookup()` and
+  `BoundaryRegistry.lookup_column()` will never assign a position to
+  these ports.
+- **Tier 2 polygon derivation** — `assign_positions_to_ports()` uses
+  the same bbox logic, so no positions are assigned and no polygons
+  are derived.
+- **Port-call detection** — since positions are never assigned to
+  these ports, no port calls are detected there.
+- **EEZ crossings** — EEZ bboxes near the antimeridian have the
+  same issue.
+
+**Workaround:** Users can register custom boundaries with split bboxes
+(two non-wrapping boxes) via `BoundaryRegistry` and pass them to
+`helpers.port_calls(registry=...)`.
+
+**Planned fix:** A future release will add `_bbox_contains_wrapped()`
+that detects `west > east` as an antimeridian-crossing bbox and tests
+`lon >= west OR lon <= east` instead.
+
 ## Confidence Model
 
 All confidence scores are in [0.0, 1.0]:
@@ -126,12 +157,17 @@ Parse with `parse_provenance(token)` to get structured components.
 
 The following are **intentionally not implemented** in the current version:
 
-- **Berth-level resolution** — port calls identify the port, not the berth.
+- **Berth-level resolution** — port calls identify the port, not the
+  individual berth. Zone-level resolution (terminal vs. anchorage vs.
+  approach) is available via Tier 2 derived polygons
+  (`derive_port_polygons()`), but zone labels are heuristic suggestions,
+  not authoritative.
 - **Geodesic distances** — equirectangular is used throughout. Error is
   < 1% at typical AIS scales (< 100 km) but grows at high latitudes.
 - **Probabilistic confidence** — scores are tier-based, not Bayesian.
 - **Antimeridian support** — bbox containment uses `west <= lon <= east`,
-  which fails for regions straddling the 180th meridian.
+  which fails for ~20–30 ports and EEZ regions straddling the 180th
+  meridian. See "Port Boundaries: Antimeridian Limitation" above.
 - **Streaming detection** — all detectors operate on batch DataFrames.
 - **Fishing effort** — listed in the schema vocabulary but no detector exists.
 - **Complete maritime ontology** — Neptune detects 4 event families, not all

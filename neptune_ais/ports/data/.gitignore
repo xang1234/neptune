@@ -1,0 +1,6 @@
+# EEZ polygon data — too large for the wheel (~16 MB).
+# Hosted as a GitHub Release asset, lazy-downloaded at runtime.
+eez_polygons.parquet
+
+# SHA-256 sidecars are build artifacts, not shipped
+*.sha256

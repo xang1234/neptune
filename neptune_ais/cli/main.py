@@ -484,6 +484,263 @@ def promote(
 
 
 # ---------------------------------------------------------------------------
+# ports — World Port Index command group
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def ports() -> None:
+    """World Port Index — search, inspect, and derive port boundaries."""
+
+
+@ports.command()
+@click.argument("query")
+@click.option("--limit", "-n", default=20, show_default=True, help="Max results.")
+def search(query: str, limit: int) -> None:
+    """Full-text search over port names and UNLOCODEs."""
+    from neptune_ais.ports import index
+
+    pi = index()
+    results = pi.search(query, limit=limit)
+
+    if len(results) == 0:
+        click.echo(f"No ports matching '{query}'.")
+        return
+
+    click.echo(f"Found {len(results)} port(s) matching '{query}':\n")
+    for row in results.iter_rows(named=True):
+        unlocode = row.get("unlocode") or ""
+        size = row.get("harbor_size") or "?"
+        click.echo(
+            f"  {row['name']:<30} {unlocode:<8} "
+            f"{row.get('country_code', ''):<4} "
+            f"size={size}  ({row['lat']:.2f}, {row['lon']:.2f})"
+        )
+
+
+@ports.command()
+@click.argument("lat", type=float)
+@click.argument("lon", type=float)
+@click.option("--radius", "-r", default=50.0, show_default=True, help="Search radius in km.")
+@click.option("--limit", "-n", default=10, show_default=True, help="Max results.")
+def near(lat: float, lon: float, radius: float, limit: int) -> None:
+    """Find ports near a coordinate (lat lon)."""
+    from neptune_ais.ports import index
+
+    pi = index()
+    results = pi.near(lat, lon, radius_km=radius, limit=limit)
+
+    if len(results) == 0:
+        click.echo(f"No ports within {radius} km of ({lat}, {lon}).")
+        return
+
+    click.echo(f"Ports within {radius} km of ({lat}, {lon}):\n")
+    for row in results.iter_rows(named=True):
+        dist = row.get("distance_km", 0)
+        unlocode = row.get("unlocode") or ""
+        click.echo(
+            f"  {dist:6.1f} km  {row['name']:<30} {unlocode:<8} "
+            f"{row.get('country_code', '')}"
+        )
+
+
+@ports.command()
+@click.argument("identifier")
+def info(identifier: str) -> None:
+    """Show detailed port card by UNLOCODE, WPI number, or name.
+
+    Examples: neptune ports info NLRTM, neptune ports info 56850
+    """
+    from neptune_ais.ports import index
+
+    pi = index()
+    port = pi.get(identifier)
+
+    if port is None:
+        raise click.ClickException(f"No port found for '{identifier}'.")
+
+    click.echo(f"\n{port.name}")
+    click.echo(f"  WPI number:    {port.wpi_number}")
+    click.echo(f"  UNLOCODE:      {port.unlocode or '—'}")
+    click.echo(f"  Country:       {port.country_name} ({port.country_code})")
+    click.echo(f"  Coordinates:   {port.lat:.4f}, {port.lon:.4f}")
+    click.echo(f"  Harbor size:   {port.harbor_size}")
+    click.echo(f"  Harbor type:   {port.harbor_type}")
+    click.echo(f"  Shelter:       {port.shelter_quality}")
+    def _m(v: float | None) -> str:
+        return f"{v} m" if v is not None else "—"
+
+    click.echo(f"  Channel depth: {_m(port.channel_depth_m)}")
+    click.echo(f"  Anchorage:     {_m(port.anchorage_depth_m)}")
+    click.echo(f"  Cargo pier:    {_m(port.cargo_pier_depth_m)}")
+    click.echo(f"  Max vessel:    {_m(port.max_vessel_length_m)}")
+    click.echo(f"  Tide range:    {_m(port.tide_range_m)}")
+    click.echo(f"  Pilotage:      {'yes' if port.has_pilotage else 'no'}")
+    click.echo(f"  Tugs:          {'yes' if port.has_tugs else 'no'}")
+    click.echo(f"  Fuel:          {'yes' if port.has_fuel else 'no'}")
+    click.echo(f"  Drydock:       {'yes' if port.has_drydock else 'no'}")
+    click.echo(f"  Cranes:        {'yes' if port.has_cranes else 'no'}")
+
+
+@ports.command()
+@click.argument("country_code")
+def country(country_code: str) -> None:
+    """List all ports in a country (ISO alpha-2 code)."""
+    from neptune_ais.ports import index
+
+    pi = index()
+    results = pi.by_country(country_code)
+
+    if len(results) == 0:
+        click.echo(f"No ports found for country '{country_code}'.")
+        return
+
+    click.echo(f"Ports in {country_code.upper()} ({len(results)}):\n")
+    for row in results.iter_rows(named=True):
+        unlocode = row.get("unlocode") or ""
+        size = row.get("harbor_size") or "?"
+        click.echo(
+            f"  {row['name']:<30} {unlocode:<8} size={size}  "
+            f"({row['lat']:.2f}, {row['lon']:.2f})"
+        )
+
+
+@ports.command()
+@click.option("--date", "-d", "date_str", help="Single date (YYYY-MM-DD).")
+@click.option("--start", "start_str", help="Start date.")
+@click.option("--end", "end_str", help="End date.")
+@click.option("--source", "-s", multiple=True, help="Source(s).")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+def derive(
+    date_str: str | None,
+    start_str: str | None,
+    end_str: str | None,
+    source: tuple[str, ...],
+    cache_dir: str | None,
+) -> None:
+    """Derive port polygons from ingested AIS data (Tier 2)."""
+    from neptune_ais.api import Neptune
+
+    dates = _resolve_dates(date_str, start_str, end_str)
+    sources = list(source) if source else None
+
+    n = Neptune(dates, sources=sources, cache_dir=cache_dir)
+    click.echo("Deriving port polygons from AIS positions...")
+    result = n.derive_port_polygons()
+
+    if len(result) == 0:
+        click.echo("No polygons derived (insufficient low-speed positions near ports).")
+        return
+
+    n_ports = result["port_name"].n_unique()
+    click.echo(f"Derived {len(result)} zone(s) across {n_ports} port(s).")
+
+    high_conf = result.filter(result["confidence"] >= 0.7)
+    if len(high_conf) > 0:
+        click.echo(f"  High confidence (>=0.7): {len(high_conf)} zone(s)")
+
+
+@ports.command(name="download")
+def download_eez() -> None:
+    """Pre-download EEZ polygon data for offline use."""
+    from neptune_ais.ports._loader import load_eez_polygons
+
+    click.echo("Downloading EEZ polygon data...")
+    try:
+        df = load_eez_polygons()
+        click.echo(f"EEZ polygons ready: {len(df)} region(s).")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@ports.command()
+@click.option("--format", "fmt", default="geojson", type=click.Choice(["geojson"]), help="Output format.")
+@click.option("--output", "-o", "output_path", default="ports.geojson", show_default=True, help="Output file path.")
+@click.option("--min-confidence", type=float, default=0.0, help="Min polygon confidence.")
+@click.option("--cache-dir", type=click.Path(), help="Override store root.")
+def export(
+    fmt: str,
+    output_path: str,
+    min_confidence: float,
+    cache_dir: str | None,
+) -> None:
+    """Export port polygons as GeoJSON."""
+    try:
+        import shapely
+    except ImportError:
+        raise click.ClickException(
+            "Export requires shapely. Install with: pip install neptune-ais[geo]"
+        )
+
+    from pathlib import Path
+    from shapely.geometry import box, mapping
+    from neptune_ais.ports import index
+    from neptune_ais.storage import StoreLayer
+
+    pi = index()
+
+    store = _resolve_store(cache_dir)
+    derived_dir = store / StoreLayer.DERIVED.value / "port_polygons"
+    derived_polygons = None
+    if derived_dir.exists():
+        import polars as pl
+        parquet_files = sorted(
+            derived_dir.glob("*.parquet"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if parquet_files:
+            derived_polygons = pl.read_parquet(parquet_files[-1])
+            if min_confidence > 0:
+                derived_polygons = derived_polygons.filter(
+                    pl.col("confidence") >= min_confidence
+                )
+            click.echo(f"Using derived polygons: {len(derived_polygons)} zone(s)")
+
+    features: list[dict] = []
+    tier2_wpis: set[int] = set()
+
+    if derived_polygons is not None and len(derived_polygons) > 0:
+        for row in derived_polygons.iter_rows(named=True):
+            geom = shapely.from_wkb(row["geometry_wkb"])
+            wpi = row.get("wpi_number")
+            if wpi is not None:
+                tier2_wpis.add(wpi)
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "name": row["port_name"],
+                    "zone_id": row.get("zone_id", ""),
+                    "confidence": row.get("confidence"),
+                    "source": "tier2_derived",
+                },
+                "geometry": mapping(geom),
+            })
+
+    for row in pi.ports.iter_rows(named=True):
+        if row["wpi_number"] in tier2_wpis:
+            continue
+        w, s, e, n = row["bbox_west"], row["bbox_south"], row["bbox_east"], row["bbox_north"]
+        if any(v is None for v in (w, s, e, n)):
+            continue
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "name": row["name"],
+                "unlocode": row.get("unlocode") or "",
+                "harbor_size": row.get("harbor_size") or "",
+                "source": "tier1_bbox",
+            },
+            "geometry": mapping(box(w, s, e, n)),
+        })
+
+    import json
+    geojson = {"type": "FeatureCollection", "features": features}
+    out = Path(output_path)
+    out.write_text(json.dumps(geojson))
+    click.echo(f"Exported {len(features)} port(s) to {out}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
