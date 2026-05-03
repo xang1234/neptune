@@ -121,6 +121,27 @@ class TimelapsConfig:
         bin_interval_minutes: Time bin size for animation steps. Default 60.
         speed: Animation speed — bins per second of playback. Default 4.
         color_by_type: Color-code dots by vessel type. Default True.
+            Kept for backwards compatibility — prefer ``color_by``.
+        color_by: Color encoding. ``"type"`` (default) uses the vessel
+            type palette. ``"direction"`` splits traffic into cyan
+            (eastbound, COG 0–180°), magenta (westbound, COG 180–360°),
+            and white (stationary, SOG below
+            ``stationary_speed_knots``). ``"none"`` falls back to a
+            single neutral color. When unset (``None``), inherits from
+            ``color_by_type`` for backwards compatibility.
+        stationary_speed_knots: SOG threshold below which a vessel is
+            treated as stationary in ``color_by="direction"`` mode.
+            Default 0.5.
+        style: Renderer mode. ``"trails"`` (default) draws per-vessel
+            polylines + head dots over a fading accumulation buffer —
+            best for analytical readability. ``"phosphor"`` draws only
+            additive points, letting density emerge from overlap —
+            closest to the Kpler reference look.
+        show_clock: When True (default) the HUD shows a ticking
+            timestamp. When False, it shows a static date range built
+            from ``date_from``/``date_to`` (or auto-derived from the
+            data), framing the clip as a composed piece rather than a
+            live feed.
         fade_factor: Per-frame multiplicative fade for the accumulation
             canvas (1.0 = no fade, keep all trails). Default 0.998.
         bloom: Apply gaussian-blur bloom post-processing. Default True.
@@ -140,6 +161,10 @@ class TimelapsConfig:
     bin_interval_minutes: int = 30
     speed: float = 2.0
     color_by_type: bool = True
+    color_by: str | None = None
+    stationary_speed_knots: float = 0.5
+    style: str = "trails"
+    show_clock: bool = True
     fade_factor: float = 0.998
     bloom: bool = True
     layout: str = "vertical"
@@ -582,6 +607,87 @@ VESSEL_TYPE_PALETTE: dict[str, list[int]] = {
 
 # Ordered list for index-based lookups in the JS template.
 _VESSEL_TYPE_ORDER = list(VESSEL_TYPE_PALETTE.keys())
+
+
+# Direction palette — eastbound / westbound / stationary. The two-lane
+# split makes Traffic Separation Schemes (Singapore Strait, Dover, etc.)
+# read as two distinct ribbons; stationary white forms anchorage clusters.
+DIRECTION_PALETTE: dict[str, list[int]] = {
+    "eastbound": [63, 184, 255],     # cyan
+    "westbound": [255, 42, 109],     # magenta
+    "stationary": [200, 210, 220],   # cool white
+}
+_DIRECTION_ORDER = list(DIRECTION_PALETTE.keys())
+
+
+def _build_date_range_label(
+    date_from: str,
+    date_to: str,
+    ts_min_ms: int | None,
+    ts_max_ms: int | None,
+) -> str:
+    """Build a static date-range label (e.g. ``"Mar 06–22 2026"``).
+
+    Prefers explicit ``date_from``/``date_to`` ISO strings; falls back
+    to the min/max of the actual data when those are unset.
+    """
+    from datetime import datetime, timezone
+
+    def _parse(s: str) -> datetime | None:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    d_from = _parse(date_from)
+    d_to = _parse(date_to)
+
+    if d_from is None and ts_min_ms is not None:
+        d_from = datetime.fromtimestamp(ts_min_ms / 1000, tz=timezone.utc)
+    if d_to is None and ts_max_ms is not None:
+        d_to = datetime.fromtimestamp(ts_max_ms / 1000, tz=timezone.utc)
+
+    if d_from is None or d_to is None:
+        return ""
+
+    months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    same_month = d_from.year == d_to.year and d_from.month == d_to.month
+    if same_month:
+        return (
+            f"{months[d_from.month - 1]} {d_from.day:02d}"
+            f"–{d_to.day:02d} {d_from.year}"
+        )
+    same_year = d_from.year == d_to.year
+    if same_year:
+        return (
+            f"{months[d_from.month - 1]} {d_from.day:02d} "
+            f"– {months[d_to.month - 1]} {d_to.day:02d} {d_from.year}"
+        )
+    return (
+        f"{months[d_from.month - 1]} {d_from.day:02d} {d_from.year} "
+        f"– {months[d_to.month - 1]} {d_to.day:02d} {d_to.year}"
+    )
+
+
+def _resolve_color_mode(color_by: str | None, color_by_type: bool) -> str:
+    """Resolve the effective color mode from new + legacy params.
+
+    ``color_by`` takes precedence when set. Otherwise we fall back to
+    the boolean ``color_by_type`` for backwards compatibility.
+    """
+    if color_by is not None:
+        if color_by not in ("type", "direction", "none"):
+            raise ValueError(
+                f"color_by must be 'type', 'direction', or 'none'; "
+                f"got {color_by!r}"
+            )
+        return color_by
+    return "type" if color_by_type else "none"
 
 
 def _categorize_vessel_type(ship_type: str | None) -> str:
@@ -1503,6 +1609,8 @@ def prepare_timelapse(
     max_points: int | None = 200_000,
     bin_interval_minutes: int = 60,
     color_by_type: bool = True,
+    color_by: str | None = None,
+    stationary_speed_knots: float = 0.5,
 ) -> dict:
     """Prepare positions for timelapse corridor rendering.
 
@@ -1517,23 +1625,39 @@ def prepare_timelapse(
         viewport: Optional bounding box to clip to.
         max_points: Max total points. Default 200K.
         bin_interval_minutes: Size of each time bin in minutes.
-        color_by_type: Whether to assign type-based color indices.
+        color_by_type: Legacy boolean for type-based coloring. Kept for
+            backwards compatibility — use ``color_by`` instead.
+        color_by: ``"type"``, ``"direction"``, or ``"none"``. When None,
+            inherits from ``color_by_type``. ``"direction"`` requires
+            ``cog`` (and ideally ``sog``) columns; falls back to
+            ``"type"`` if ``cog`` is missing.
+        stationary_speed_knots: SOG threshold for stationary tagging in
+            ``color_by="direction"`` mode.
 
     Returns:
         A dict with keys:
 
         - ``bins``: list of lists — each inner list contains
-          ``[lat, lon, type_idx]`` triples for one time bin.
+          ``[lat, lon, color_idx, mmsi_idx]`` quads for one time bin.
+          ``color_idx`` indexes into ``palette`` and is either a vessel
+          type or a direction bucket depending on ``color_by``.
         - ``type_counts``: dict mapping type name → count.
         - ``cumul_vessels``: list of cumulative unique vessel counts
           (one per bin).
         - ``bin_timestamps_ms``: list of epoch-millis for each bin start.
         - ``center_lat``, ``center_lon``, ``zoom``: auto-computed view.
         - ``color_by_type``: whether type coloring is active (may be
-          auto-disabled if too few typed positions).
-        - ``palette``: list of ``[r, g, b]`` colors in type-index order.
-        - ``type_names``: list of type names in index order.
+          auto-disabled if too few typed positions). Kept for legacy
+          callers — see ``color_mode`` for the resolved encoding.
+        - ``color_mode``: resolved color mode (``"type"``,
+          ``"direction"``, or ``"none"``) — may differ from the
+          requested mode if data was insufficient.
+        - ``palette``: list of ``[r, g, b]`` colors in index order.
+        - ``type_names``: list of category names in index order
+          (vessel types or direction buckets).
     """
+    mode = _resolve_color_mode(color_by, color_by_type)
+
     result = _collect(df)
 
     if viewport is not None:
@@ -1551,61 +1675,30 @@ def prepare_timelapse(
             "center_lon": 0.0,
             "zoom": 3,
             "color_by_type": False,
+            "color_mode": "none",
             "palette": [c for c in VESSEL_TYPE_PALETTE.values()],
             "type_names": _VESSEL_TYPE_ORDER[:],
         }
 
-    # Enrich ship_type from vessels table if available.
-    if vessels is not None:
-        if PosCol.SHIP_TYPE not in result.columns:
-            result = result.with_columns(
-                pl.lit(None, dtype=pl.String).alias(PosCol.SHIP_TYPE),
-            )
-        vessels_df = _collect(vessels)
-        if VesselCol.SHIP_TYPE in vessels_df.columns:
-            type_lookup = vessels_df.select(
-                pl.col(VesselCol.MMSI), pl.col(VesselCol.SHIP_TYPE).alias("_vtype"),
-            ).unique(VesselCol.MMSI)
-            result = result.join(type_lookup, on=PosCol.MMSI, how="left")
-            result = result.with_columns(
-                pl.coalesce(PosCol.SHIP_TYPE, "_vtype").alias(PosCol.SHIP_TYPE),
-            ).drop("_vtype")
+    # Direction mode silently degrades to type when COG is unavailable —
+    # an analyst running on a feed without COG should get a sensible
+    # picture rather than monochrome stationary dots everywhere.
+    if mode == "direction" and PosCol.COG not in result.columns:
+        mode = "type"
 
-    # Categorize vessel types.
-    ship_type_col = PosCol.SHIP_TYPE if PosCol.SHIP_TYPE in result.columns else None
-    if ship_type_col is not None and color_by_type:
-        type_series = result[ship_type_col].fill_null("").map_elements(
-            _categorize_vessel_type, return_dtype=pl.String,
+    if mode == "direction":
+        cidx_series, palette, names, type_counts, effective_color_by_type = (
+            _encode_direction(result, stationary_speed_knots)
         )
     else:
-        type_series = pl.Series("_vcat", ["other"] * len(result))
+        cidx_series, palette, names, type_counts, effective_color_by_type = (
+            _encode_type(result, vessels, mode == "type")
+        )
+        # Re-resolve mode for the empty-categorical fallback.
+        if mode == "type" and not effective_color_by_type:
+            mode = "none"
 
-    result = result.with_columns(type_series.alias("_vcat"))
-
-    # Auto-fallback: if >60% are "other", disable type coloring.
-    other_frac = (result["_vcat"] == "other").sum() / max(len(result), 1)
-    effective_color_by_type = color_by_type and other_frac <= 0.6
-
-    if not effective_color_by_type:
-        result = result.with_columns(pl.lit("other").alias("_vcat"))
-
-    # Map type names to indices.
-    type_to_idx = {name: i for i, name in enumerate(_VESSEL_TYPE_ORDER)}
-    other_idx = type_to_idx["other"]
-
-    result = result.with_columns(
-        result["_vcat"].fill_null("other").map_elements(
-            lambda v: type_to_idx.get(v, other_idx),
-            return_dtype=pl.Int32,
-        ).alias("_tidx"),
-    )
-
-    # Type counts.
-    type_counts = dict(
-        result.group_by("_vcat")
-        .agg(pl.len().alias("n"))
-        .iter_rows()
-    )
+    result = result.with_columns(cidx_series.alias("_tidx"))
 
     # Round coordinates.
     result = result.with_columns(
@@ -1656,18 +1749,126 @@ def prepare_timelapse(
     # Auto view.
     center_lat, center_lon, zoom = _auto_view_positions(result)
 
+    # Min/max timestamps for static date-range labelling.
+    ts_min_ms = bin_timestamps_ms[0] if bin_timestamps_ms else None
+    ts_max_ms = bin_timestamps_ms[-1] if bin_timestamps_ms else None
+
     return {
         "bins": bins,
         "type_counts": type_counts,
         "cumul_vessels": cumul_vessels,
         "bin_timestamps_ms": bin_timestamps_ms,
+        "ts_min_ms": ts_min_ms,
+        "ts_max_ms": ts_max_ms,
         "center_lat": center_lat,
         "center_lon": center_lon,
         "zoom": zoom,
         "color_by_type": effective_color_by_type,
-        "palette": [VESSEL_TYPE_PALETTE[name] for name in _VESSEL_TYPE_ORDER],
-        "type_names": _VESSEL_TYPE_ORDER[:],
+        "color_mode": mode,
+        "palette": palette,
+        "type_names": names,
     }
+
+
+def _encode_type(
+    result: pl.DataFrame,
+    vessels: pl.DataFrame | pl.LazyFrame | None,
+    color_by_type: bool,
+) -> tuple[pl.Series, list[list[int]], list[str], dict, bool]:
+    """Encode color index by vessel type. Returns (idx_series, palette,
+    names, type_counts, effective_color_by_type)."""
+    # Enrich ship_type from vessels table if available.
+    if vessels is not None:
+        if PosCol.SHIP_TYPE not in result.columns:
+            result = result.with_columns(
+                pl.lit(None, dtype=pl.String).alias(PosCol.SHIP_TYPE),
+            )
+        vessels_df = _collect(vessels)
+        if VesselCol.SHIP_TYPE in vessels_df.columns:
+            type_lookup = vessels_df.select(
+                pl.col(VesselCol.MMSI),
+                pl.col(VesselCol.SHIP_TYPE).alias("_vtype"),
+            ).unique(VesselCol.MMSI)
+            result = result.join(type_lookup, on=PosCol.MMSI, how="left")
+            result = result.with_columns(
+                pl.coalesce(PosCol.SHIP_TYPE, "_vtype").alias(PosCol.SHIP_TYPE),
+            ).drop("_vtype")
+
+    ship_type_col = PosCol.SHIP_TYPE if PosCol.SHIP_TYPE in result.columns else None
+    if ship_type_col is not None and color_by_type:
+        type_series = result[ship_type_col].fill_null("").map_elements(
+            _categorize_vessel_type, return_dtype=pl.String,
+        )
+    else:
+        type_series = pl.Series("_vcat", ["other"] * len(result))
+
+    annotated = result.with_columns(type_series.alias("_vcat"))
+
+    other_frac = (annotated["_vcat"] == "other").sum() / max(len(annotated), 1)
+    effective = color_by_type and other_frac <= 0.6
+
+    if not effective:
+        annotated = annotated.with_columns(pl.lit("other").alias("_vcat"))
+
+    type_to_idx = {name: i for i, name in enumerate(_VESSEL_TYPE_ORDER)}
+    other_idx = type_to_idx["other"]
+
+    idx_series = annotated["_vcat"].fill_null("other").map_elements(
+        lambda v: type_to_idx.get(v, other_idx),
+        return_dtype=pl.Int32,
+    )
+
+    type_counts = dict(
+        annotated.group_by("_vcat").agg(pl.len().alias("n")).iter_rows()
+    )
+
+    palette = [VESSEL_TYPE_PALETTE[name] for name in _VESSEL_TYPE_ORDER]
+    return idx_series, palette, _VESSEL_TYPE_ORDER[:], type_counts, effective
+
+
+def _encode_direction(
+    result: pl.DataFrame,
+    stationary_speed_knots: float,
+) -> tuple[pl.Series, list[list[int]], list[str], dict, bool]:
+    """Encode color index by direction bucket. Returns (idx_series,
+    palette, names, type_counts, effective_color_by_type=True)."""
+    has_sog = PosCol.SOG in result.columns
+
+    # 0 = eastbound (cog ∈ [0, 180)), 1 = westbound (cog ∈ [180, 360)),
+    # 2 = stationary (sog below threshold). Null COG → eastbound (0)
+    # by convention; null SOG is treated as moving.
+    sog_expr = (
+        pl.col(PosCol.SOG).fill_null(stationary_speed_knots + 1.0)
+        if has_sog
+        else pl.lit(stationary_speed_knots + 1.0)
+    )
+    idx_expr = (
+        pl.when(sog_expr < stationary_speed_knots)
+        .then(pl.lit(2, dtype=pl.Int32))
+        .otherwise(
+            pl.when(
+                (pl.col(PosCol.COG).fill_null(0.0) % 360.0) < 180.0,
+            )
+            .then(pl.lit(0, dtype=pl.Int32))
+            .otherwise(pl.lit(1, dtype=pl.Int32))
+        )
+    )
+    idx_series = result.select(idx_expr.alias("_didx"))["_didx"]
+
+    # Counts per direction.
+    counts_df = (
+        result.with_columns(idx_series.alias("_didx"))
+        .group_by("_didx")
+        .agg(pl.len().alias("n"))
+    )
+    raw_counts = dict(counts_df.iter_rows())
+    type_counts = {
+        _DIRECTION_ORDER[i]: int(raw_counts.get(i, 0))
+        for i in range(len(_DIRECTION_ORDER))
+    }
+
+    palette = [DIRECTION_PALETTE[name] for name in _DIRECTION_ORDER]
+    return idx_series, palette, _DIRECTION_ORDER[:], type_counts, True
 
 
 def generate_timelapse(
@@ -1710,6 +1911,8 @@ def generate_timelapse(
     if panels is not None:
         # Multi-panel mode.
         panels_data = []
+        ts_min_global: int | None = None
+        ts_max_global: int | None = None
         for p in panels:
             p_config = p.get("config") or TimelapsConfig()
             prep = prepare_timelapse(
@@ -1718,10 +1921,21 @@ def generate_timelapse(
                 max_points=max_points,
                 bin_interval_minutes=p_config.bin_interval_minutes,
                 color_by_type=p_config.color_by_type,
+                color_by=p_config.color_by,
+                stationary_speed_knots=p_config.stationary_speed_knots,
             )
             center_lat = prep["center_lat"] if p_config.center_lat is None else p_config.center_lat
             center_lon = prep["center_lon"] if p_config.center_lon is None else p_config.center_lon
             zoom = prep["zoom"] if p_config.zoom is None else p_config.zoom
+            if prep["ts_min_ms"] is not None:
+                ts_min_global = (
+                    prep["ts_min_ms"] if ts_min_global is None
+                    else min(ts_min_global, prep["ts_min_ms"])
+                )
+                ts_max_global = (
+                    prep["ts_max_ms"] if ts_max_global is None
+                    else max(ts_max_global, prep["ts_max_ms"])
+                )
             panels_data.append({
                 "label": p.get("label", ""),
                 "bins_json": _safe_json_embed(prep["bins"]),
@@ -1738,6 +1952,7 @@ def generate_timelapse(
                     "dot_alpha": p_config.dot_alpha,
                     "fade_factor": p_config.fade_factor,
                     "bloom": p_config.bloom,
+                    "style": p_config.style,
                 },
             })
 
@@ -1747,6 +1962,8 @@ def generate_timelapse(
             vessels=panels[0].get("vessels", vessels),
             max_points=1,
             color_by_type=config.color_by_type,
+            color_by=config.color_by,
+            stationary_speed_knots=config.stationary_speed_knots,
         )
 
         data = {
@@ -1758,12 +1975,19 @@ def generate_timelapse(
             "palette_json": _safe_json_embed(first_prep["palette"]),
             "type_names_json": _safe_json_embed(first_prep["type_names"]),
             "color_by_type": first_prep["color_by_type"],
+            "color_mode": first_prep["color_mode"],
             "speed": config.speed,
             "layout": config.layout,
             "dot_radius": config.dot_radius,
             "dot_alpha": config.dot_alpha,
             "fade_factor": config.fade_factor,
             "bloom": config.bloom,
+            "style": config.style,
+            "show_clock": config.show_clock,
+            "date_range_label": _build_date_range_label(
+                config.date_from, config.date_to,
+                ts_min_global, ts_max_global,
+            ),
         }
     else:
         # Single-panel mode.
@@ -1773,6 +1997,8 @@ def generate_timelapse(
             max_points=max_points,
             bin_interval_minutes=config.bin_interval_minutes,
             color_by_type=config.color_by_type,
+            color_by=config.color_by,
+            stationary_speed_knots=config.stationary_speed_knots,
         )
 
         if not prep["bins"]:
@@ -1795,6 +2021,7 @@ def generate_timelapse(
             "palette_json": _safe_json_embed(prep["palette"]),
             "type_names_json": _safe_json_embed(prep["type_names"]),
             "color_by_type": prep["color_by_type"],
+            "color_mode": prep["color_mode"],
             "center_lat": center_lat,
             "center_lon": center_lon,
             "zoom": zoom,
@@ -1803,6 +2030,12 @@ def generate_timelapse(
             "dot_alpha": config.dot_alpha,
             "fade_factor": config.fade_factor,
             "bloom": config.bloom,
+            "style": config.style,
+            "show_clock": config.show_clock,
+            "date_range_label": _build_date_range_label(
+                config.date_from, config.date_to,
+                prep["ts_min_ms"], prep["ts_max_ms"],
+            ),
         }
 
     html = render_timelapse(data)

@@ -266,13 +266,17 @@ const BIN_TIMESTAMPS = $bin_timestamps_ms_json;
 const PALETTE = $palette_json;
 const TYPE_NAMES = $type_names_json;
 const COLOR_BY_TYPE = $color_by_type;
+const COLOR_MODE = "$color_mode";
 const CONFIG = {
   dotRadius: $dot_radius,
   dotAlpha: $dot_alpha,
   fadeFactor: $fade_factor,
   bloom: $bloom,
   speed: $speed,
+  style: "$style",
+  showClock: $show_clock,
 };
+const DATE_RANGE_LABEL = "$date_range_label";
 const N_PANELS = 1;
 const PANELS_CFG = [{
   centerLat: $center_lat,
@@ -285,6 +289,7 @@ const PANELS_CFG = [{
   dotAlpha: CONFIG.dotAlpha,
   fadeFactor: CONFIG.fadeFactor,
   bloom: CONFIG.bloom,
+  style: CONFIG.style,
 }];
 """)
 
@@ -293,13 +298,17 @@ _JS_MULTI_DATA = Template("""\
 const PALETTE = $palette_json;
 const TYPE_NAMES = $type_names_json;
 const COLOR_BY_TYPE = $color_by_type;
+const COLOR_MODE = "$color_mode";
 const CONFIG = {
   dotRadius: $dot_radius,
   dotAlpha: $dot_alpha,
   fadeFactor: $fade_factor,
   bloom: $bloom,
   speed: $speed,
+  style: "$style",
+  showClock: $show_clock,
 };
+const DATE_RANGE_LABEL = "$date_range_label";
 const N_PANELS = $n_panels;
 const PANELS_RAW = $panels_json;
 const PANELS_CFG = PANELS_RAW.map(function(p) {
@@ -314,6 +323,7 @@ const PANELS_CFG = PANELS_RAW.map(function(p) {
     dotAlpha: (p.config && p.config.dot_alpha) || CONFIG.dotAlpha,
     fadeFactor: (p.config && p.config.fade_factor) || CONFIG.fadeFactor,
     bloom: (p.config && p.config.bloom !== undefined) ? p.config.bloom : CONFIG.bloom,
+    style: (p.config && p.config.style) || CONFIG.style,
   };
 });
 """)
@@ -616,6 +626,38 @@ function initPanel(idx) {
   const headScene = new THREE.Scene();
   headScene.add(headPoints);
 
+  // ── Phosphor accumulation points ──
+  // Per-bin additive splats drawn straight into the accumulation RT.
+  // No per-vessel polylines, no head dots — the corridor *is* the
+  // density of overlapping fading points (Kpler-reference style).
+  const PHOSPHOR_MAX = BIN_MAX_SEGS;  // points per bin; same budget as segments
+  const accPointPosArr = new Float32Array(PHOSPHOR_MAX * 3);
+  const accPointColArr = new Float32Array(PHOSPHOR_MAX * 3);
+  const accPointGeom = new THREE.BufferGeometry();
+  const appAttr = new THREE.BufferAttribute(accPointPosArr, 3);
+  appAttr.setUsage(THREE.DynamicDrawUsage);
+  accPointGeom.setAttribute('position', appAttr);
+  const apcAttr = new THREE.BufferAttribute(accPointColArr, 3);
+  apcAttr.setUsage(THREE.DynamicDrawUsage);
+  accPointGeom.setAttribute('aHeadColor', apcAttr);
+  accPointGeom.setDrawRange(0, 0);
+
+  // Smaller, dimmer phosphor splats — let density build by overlap,
+  // not by single-dot brightness.
+  const accPointMat = new THREE.RawShaderMaterial({
+    vertexShader: HEAD_VERT, fragmentShader: HEAD_FRAG,
+    uniforms: {
+      uPointSize: { value: Math.max(3.0, cfg.dotRadius * 3.0) * dpr },
+      uResolution: { value: new THREE.Vector2(w, h) },
+    },
+    blending: THREE.AdditiveBlending, transparent: true,
+    depthTest: false, depthWrite: false,
+    glslVersion: THREE.GLSL1,
+  });
+  const accPoints = new THREE.Points(accPointGeom, accPointMat);
+  const accPointScene = new THREE.Scene();
+  accPointScene.add(accPoints);
+
   // ── EffectComposer ──
   // First pass: composite accumulation + active textures
   const compShader = {
@@ -647,9 +689,11 @@ function initPanel(idx) {
     trailScene, trailGeom, trailMat, tStartArr, tEndArr, tQvArr, tColArr, tAlpArr,
     fadeScene, fadeMat,
     headScene, headGeom, headPosArr, headColArr,
+    accPointScene, accPointGeom, accPointPosArr, accPointColArr,
     composer, compPass, bloomPass,
     w, h, pw, ph, cfg, binSegCount,
     _trailCount: 0,
+    style: cfg.style || 'trails',
   };
 
   panelCtx.push(panel);
@@ -800,6 +844,7 @@ function renderActive(pIdx) {
 function renderFrame(pIdx, binIdx) {
   const p = panelCtx[pIdx];
   const bin = p.cfg.bins[binIdx];
+  const phosphor = p.style === 'phosphor';
 
   // Step 1: Fade accumulation rtA → rtB
   p.fadeMat.uniforms.tDiffuse.value = p.rtA.texture;
@@ -808,51 +853,77 @@ function renderFrame(pIdx, binIdx) {
   p.renderer.clear();
   p.renderer.render(p.fadeScene, p.quadCamera);
 
-  // Step 2: Process new bin — update vessel positions/trails, add accumulation lines
+  // Step 2: Process new bin
   if (bin && bin.length > 0) {
-    p.binSegCount = 0;
-    const vpos = state.vesselPos[pIdx];
-    const vtrail = state.vesselTrail[pIdx];
-    const alpha = p.cfg.dotAlpha;
+    if (phosphor) {
+      // Phosphor mode: splat one additive point per ping into rtB.
+      // No vessel-position tracking, no trails — density emerges from
+      // overlap of fading points alone.
+      const n = Math.min(bin.length, p.accPointPosArr.length / 3);
+      for (let i = 0; i < n; i++) {
+        const pt = bin[i];
+        const col = PALETTE[pt[2] || 0] || PALETTE[0];
+        p.accPointPosArr[i*3]     = pt[4];
+        p.accPointPosArr[i*3 + 1] = pt[5];
+        p.accPointPosArr[i*3 + 2] = 0;
+        p.accPointColArr[i*3]     = col[0]/255;
+        p.accPointColArr[i*3 + 1] = col[1]/255;
+        p.accPointColArr[i*3 + 2] = col[2]/255;
+      }
+      p.accPointGeom.setDrawRange(0, n);
+      p.accPointGeom.attributes.position.needsUpdate = true;
+      p.accPointGeom.attributes.aHeadColor.needsUpdate = true;
+      p.renderer.setRenderTarget(p.rtB);
+      p.renderer.render(p.accPointScene, p.camera);
+    } else {
+      // Trails mode: per-vessel polylines + head dots (analytical).
+      p.binSegCount = 0;
+      const vpos = state.vesselPos[pIdx];
+      const vtrail = state.vesselTrail[pIdx];
+      const alpha = p.cfg.dotAlpha;
 
-    for (let i = 0; i < bin.length; i++) {
-      const pt = bin[i];
-      const px = pt[4], py = pt[5];
-      const typeIdx = pt[2] || 0;
-      const mmsiIdx = pt[3] || 0;
-      const col = PALETTE[typeIdx] || PALETTE[0];
-      const r = col[0]/255, g = col[1]/255, b = col[2]/255;
+      for (let i = 0; i < bin.length; i++) {
+        const pt = bin[i];
+        const px = pt[4], py = pt[5];
+        const typeIdx = pt[2] || 0;
+        const mmsiIdx = pt[3] || 0;
+        const col = PALETTE[typeIdx] || PALETTE[0];
+        const r = col[0]/255, g = col[1]/255, b = col[2]/255;
 
-      // Add accumulation line segment (dim, persistent corridor trace)
-      const prev = vpos.get(mmsiIdx);
-      if (prev) {
-        const dx = px - prev.px, dy = py - prev.py;
-        const dist = Math.sqrt(dx*dx + dy*dy);
-        if (dist > 0.5 && dist < MAX_TRAIL_DIST) {
-          addSegment(p, prev.px, prev.py, px, py, r, g, b, alpha);
+        const prev = vpos.get(mmsiIdx);
+        if (prev) {
+          const dx = px - prev.px, dy = py - prev.py;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist > 0.5 && dist < MAX_TRAIL_DIST) {
+            addSegment(p, prev.px, prev.py, px, py, r, g, b, alpha);
+          }
         }
+
+        vpos.set(mmsiIdx, { px, py, typeIdx });
+
+        let trail = vtrail.get(mmsiIdx);
+        if (!trail) { trail = []; vtrail.set(mmsiIdx, trail); }
+        trail.push({ px, py, typeIdx });
+        if (trail.length > TRAIL_LENGTH) trail.shift();
       }
 
-      // Update vessel position
-      vpos.set(mmsiIdx, { px, py, typeIdx });
-
-      // Update vessel trail (ring buffer of last TRAIL_LENGTH positions)
-      let trail = vtrail.get(mmsiIdx);
-      if (!trail) { trail = []; vtrail.set(mmsiIdx, trail); }
-      trail.push({ px, py, typeIdx });
-      if (trail.length > TRAIL_LENGTH) trail.shift();
+      flushSegments(p);
+      p.renderer.setRenderTarget(p.rtB);
+      p.renderer.render(p.lineScene, p.camera);
     }
-
-    flushSegments(p);
-    p.renderer.setRenderTarget(p.rtB);
-    p.renderer.render(p.lineScene, p.camera);
   }
 
   // Step 3: Swap render targets
   const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
 
-  // Step 4: Render active layer (vessel trails + heads)
-  renderActive(pIdx);
+  // Step 4: Render active layer (skipped in phosphor mode — corridor
+  // is the subject, no separate "now" overlay).
+  if (phosphor) {
+    p.renderer.setRenderTarget(p.rtActive);
+    p.renderer.clear();
+  } else {
+    renderActive(pIdx);
+  }
 
   // Step 5: Composite + bloom → screen
   p.compPass.uniforms.tAccum.value = p.rtA.texture;
@@ -871,8 +942,12 @@ function renderIdle(pIdx) {
   p.renderer.render(p.fadeScene, p.quadCamera);
   const tmp = p.rtA; p.rtA = p.rtB; p.rtB = tmp;
 
-  // Still render active trails + heads
-  renderActive(pIdx);
+  if (p.style === 'phosphor') {
+    p.renderer.setRenderTarget(p.rtActive);
+    p.renderer.clear();
+  } else {
+    renderActive(pIdx);
+  }
 
   p.compPass.uniforms.tAccum.value = p.rtA.texture;
   p.compPass.uniforms.tActive.value = p.rtActive.texture;
@@ -915,6 +990,13 @@ const tsEl = document.getElementById('timestamp');
 const vcEl = document.getElementById('vessel-count');
 const sliderEl = document.getElementById('slider');
 
+// When showClock is false, render the date range as a static caption
+// once and never touch the DOM again. This re-frames the clip from
+// "live feed" to "composed piece" — and is also a tiny perf win.
+if (tsEl && !CONFIG.showClock) {
+  tsEl.textContent = DATE_RANGE_LABEL || '\\u2014';
+}
+
 function animate(now) {
   if (state.playing) {
     const dt = (now - lastFrame) / 1000;
@@ -951,9 +1033,11 @@ function animate(now) {
     }
 
     sliderEl.value = Math.floor((targetBin / Math.max(MB - 1, 1)) * 1000);
-    const ts0 = PANELS_CFG[0].binTimestamps;
-    const tIdx = Math.min(targetBin, ts0.length - 1);
-    if (tIdx >= 0) tsEl.textContent = formatTimestamp(ts0[tIdx]);
+    if (CONFIG.showClock) {
+      const ts0 = PANELS_CFG[0].binTimestamps;
+      const tIdx = Math.min(targetBin, ts0.length - 1);
+      if (tIdx >= 0) tsEl.textContent = formatTimestamp(ts0[tIdx]);
+    }
     if (vcEl && N_PANELS === 1) {
       const cv = PANELS_CFG[0].cumulVessels;
       const vIdx = Math.min(targetBin, cv.length - 1);
@@ -1113,11 +1197,15 @@ def render_timelapse(data: dict) -> str:
             palette_json=data["palette_json"],
             type_names_json=data["type_names_json"],
             color_by_type=js_bool(data["color_by_type"]),
+            color_mode=data.get("color_mode", "type"),
             dot_radius=data["dot_radius"],
             dot_alpha=data["dot_alpha"],
             fade_factor=data["fade_factor"],
             bloom=js_bool(data["bloom"]),
             speed=data["speed"],
+            style=data.get("style", "trails"),
+            show_clock=js_bool(data.get("show_clock", True)),
+            date_range_label=_js_string_escape(data.get("date_range_label", "")),
             n_panels=n,
             panels_json=data["panels_json"],
         )
@@ -1138,14 +1226,29 @@ def render_timelapse(data: dict) -> str:
             palette_json=data["palette_json"],
             type_names_json=data["type_names_json"],
             color_by_type=js_bool(data["color_by_type"]),
+            color_mode=data.get("color_mode", "type"),
             dot_radius=data["dot_radius"],
             dot_alpha=data["dot_alpha"],
             fade_factor=data["fade_factor"],
             bloom=js_bool(data["bloom"]),
             speed=data["speed"],
+            style=data.get("style", "trails"),
+            show_clock=js_bool(data.get("show_clock", True)),
+            date_range_label=_js_string_escape(data.get("date_range_label", "")),
             center_lat=data["center_lat"],
             center_lon=data["center_lon"],
             zoom=data["zoom"],
         )
 
     return html_section + "\n" + js_data + "\n" + _JS_ENGINE
+
+
+def _js_string_escape(s: str) -> str:
+    """Escape a string for safe interpolation inside a JS double-quoted literal."""
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace("<", "\\u003c")
+    )
