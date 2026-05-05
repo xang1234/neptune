@@ -1063,9 +1063,11 @@ sliderEl.addEventListener('input', function(e) {
   for (let i = 0; i < N_PANELS; i++) {
     renderUpTo(i, Math.min(target, PANELS_CFG[i].bins.length - 1));
   }
-  const ts0 = PANELS_CFG[0].binTimestamps;
-  const tIdx = Math.min(target, ts0.length - 1);
-  if (tIdx >= 0) tsEl.textContent = formatTimestamp(ts0[tIdx]);
+  if (CONFIG.showClock) {
+    const ts0 = PANELS_CFG[0].binTimestamps;
+    const tIdx = Math.min(target, ts0.length - 1);
+    if (tIdx >= 0) tsEl.textContent = formatTimestamp(ts0[tIdx]);
+  }
   if (vcEl && N_PANELS === 1) {
     const cv = PANELS_CFG[0].cumulVessels;
     const vIdx = Math.min(target, cv.length - 1);

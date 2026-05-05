@@ -636,6 +636,31 @@ class TestShowClock:
         assert "Jun" in html
         assert "DATE_RANGE_LABEL" in html
 
+    def test_slider_scrub_respects_show_clock(self, tmp_path: Path) -> None:
+        """Every site that writes formatTimestamp(...) into tsEl must be
+        gated on CONFIG.showClock; otherwise scrubbing the slider would
+        overwrite the static date-range caption."""
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(df, output=str(tmp_path / "scrub.html"))
+        html = Path(out).read_text()
+
+        # Find every line that assigns formatTimestamp(...) to tsEl.
+        sites = [
+            line.strip() for line in html.split("\n")
+            if "tsEl.textContent" in line and "formatTimestamp" in line
+        ]
+        assert sites, "expected at least one formatTimestamp DOM write site"
+        # Each one must live inside an `if (CONFIG.showClock)` block —
+        # we verify by looking at the preceding ~5 lines.
+        lines = html.split("\n")
+        for i, line in enumerate(lines):
+            if "tsEl.textContent" in line and "formatTimestamp" in line:
+                window = "\n".join(lines[max(0, i - 5):i])
+                assert "CONFIG.showClock" in window, (
+                    f"unguarded formatTimestamp write at line {i + 1}: "
+                    f"{line.strip()}"
+                )
+
 
 # ---------------------------------------------------------------------------
 # Combined Kpler-style preset
