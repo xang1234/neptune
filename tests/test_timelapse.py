@@ -12,11 +12,15 @@ import polars as pl
 import pytest
 
 from neptune_ais.viz import (
+    DIRECTION_PALETTE,
     VESSEL_TYPE_PALETTE,
     TimelapsConfig,
     Viewport,
+    _DIRECTION_ORDER,
     _VESSEL_TYPE_ORDER,
+    _build_date_range_label,
     _categorize_vessel_type,
+    _resolve_color_mode,
     generate_timelapse,
     generate_timelapse_d3,
     prepare_timelapse,
@@ -29,7 +33,13 @@ from neptune_ais.viz import (
 # ---------------------------------------------------------------------------
 
 
-def _sample_positions(n: int = 100, *, with_ship_type: bool = False) -> pl.DataFrame:
+def _sample_positions(
+    n: int = 100,
+    *,
+    with_ship_type: bool = False,
+    with_cog: bool = False,
+    cog_seed: int | None = None,
+) -> pl.DataFrame:
     """Generate *n* synthetic position rows."""
     import random
     from datetime import datetime, timedelta, timezone
@@ -55,6 +65,10 @@ def _sample_positions(n: int = 100, *, with_ship_type: bool = False) -> pl.DataF
     if with_ship_type:
         types = ["70", "80", "60", "30", None]
         data["ship_type"] = [rng.choice(types) for _ in range(n)]
+
+    if with_cog:
+        cog_rng = random.Random(cog_seed if cog_seed is not None else 7)
+        data["cog"] = [cog_rng.uniform(0.0, 360.0) for _ in range(n)]
 
     return pl.DataFrame(data)
 
@@ -617,3 +631,241 @@ class TestGenerateTimelapseD3:
                 continue
             inner = body.split("</script>")[0]
             assert "</script>" not in inner
+
+
+# ---------------------------------------------------------------------------
+# Color modes — type vs direction
+# ---------------------------------------------------------------------------
+
+
+class TestResolveColorMode:
+    def test_explicit_color_by_wins(self) -> None:
+        assert _resolve_color_mode("direction", True) == "direction"
+        assert _resolve_color_mode("none", True) == "none"
+        assert _resolve_color_mode("type", False) == "type"
+
+    def test_falls_back_to_legacy_bool(self) -> None:
+        assert _resolve_color_mode(None, True) == "type"
+        assert _resolve_color_mode(None, False) == "none"
+
+    def test_invalid_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="color_by"):
+            _resolve_color_mode("rainbow", True)
+
+
+class TestDirectionEncoding:
+    def test_direction_palette_used(self) -> None:
+        df = _sample_positions(80, with_cog=True)
+        result = prepare_timelapse(df, color_by="direction")
+        assert result["color_mode"] == "direction"
+        assert result["palette"] == [
+            DIRECTION_PALETTE[n] for n in _DIRECTION_ORDER
+        ]
+        assert result["type_names"] == _DIRECTION_ORDER
+
+    def test_color_idx_in_direction_range(self) -> None:
+        df = _sample_positions(80, with_cog=True)
+        result = prepare_timelapse(df, color_by="direction")
+        # Each point's color idx should be one of {0, 1, 2}.
+        all_idx = set()
+        for bin_points in result["bins"]:
+            for pt in bin_points:
+                all_idx.add(pt[2])
+        assert all_idx.issubset({0, 1, 2})
+
+    def test_eastbound_below_180(self) -> None:
+        # Construct a frame where every COG ∈ [0, 180) → all idx == 0.
+        df = _sample_positions(40, with_cog=True)
+        df = df.with_columns(pl.lit(45.0).alias("cog"))
+        result = prepare_timelapse(df, color_by="direction")
+        for bin_points in result["bins"]:
+            for pt in bin_points:
+                assert pt[2] == 0  # eastbound
+
+    def test_westbound_above_180(self) -> None:
+        df = _sample_positions(40, with_cog=True)
+        df = df.with_columns(pl.lit(225.0).alias("cog"))
+        result = prepare_timelapse(df, color_by="direction")
+        for bin_points in result["bins"]:
+            for pt in bin_points:
+                assert pt[2] == 1  # westbound
+
+    def test_stationary_when_low_sog(self) -> None:
+        df = _sample_positions(40, with_cog=True)
+        # Force COG to a moving direction but SOG to anchored.
+        df = df.with_columns(
+            pl.lit(45.0).alias("cog"),
+            pl.lit(0.0).alias("sog"),
+        )
+        result = prepare_timelapse(
+            df, color_by="direction", stationary_speed_knots=0.5,
+        )
+        for bin_points in result["bins"]:
+            for pt in bin_points:
+                assert pt[2] == 2  # stationary
+
+    def test_falls_back_to_type_when_cog_missing(self) -> None:
+        df = _sample_positions(40, with_ship_type=True)  # no cog column
+        result = prepare_timelapse(df, color_by="direction")
+        # Silent fallback to type encoding.
+        assert result["color_mode"] == "type"
+        assert result["type_names"] == _VESSEL_TYPE_ORDER
+
+    def test_legacy_color_by_type_still_works(self) -> None:
+        df = _sample_positions(60, with_ship_type=True)
+        result = prepare_timelapse(df, color_by_type=True)
+        assert result["color_mode"] == "type"
+
+
+# ---------------------------------------------------------------------------
+# Style — phosphor vs trails
+# ---------------------------------------------------------------------------
+
+
+class TestRendererStyle:
+    def test_default_style_is_trails(self, tmp_path: Path) -> None:
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(df, output=str(tmp_path / "t.html"))
+        html = Path(out).read_text()
+        # CONFIG.style is embedded as a JS string literal.
+        assert 'style: "trails"' in html
+
+    def test_phosphor_style_emitted(self, tmp_path: Path) -> None:
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(
+            df,
+            config=TimelapsConfig(style="phosphor"),
+            output=str(tmp_path / "p.html"),
+        )
+        html = Path(out).read_text()
+        assert 'style: "phosphor"' in html
+        # Phosphor branch in the renderer must be present.
+        assert "phosphor" in html
+
+    def test_phosphor_style_in_multi_panel(self, tmp_path: Path) -> None:
+        df = _sample_positions(40, with_ship_type=True)
+        panels = [
+            {"positions": df, "config": TimelapsConfig(style="phosphor"),
+             "label": "A"},
+            {"positions": df, "config": TimelapsConfig(style="phosphor"),
+             "label": "B"},
+        ]
+        out = generate_timelapse(
+            df,
+            config=TimelapsConfig(style="phosphor"),
+            panels=panels,
+            output=str(tmp_path / "mp.html"),
+        )
+        html = Path(out).read_text()
+        # Each panel config must carry its own style.
+        assert html.count('"style": "phosphor"') >= 2
+
+
+# ---------------------------------------------------------------------------
+# Static date range / show_clock
+# ---------------------------------------------------------------------------
+
+
+class TestDateRangeLabel:
+    def test_same_month_compact_format(self) -> None:
+        label = _build_date_range_label(
+            "2026-03-06", "2026-03-22", None, None,
+        )
+        assert label == "Mar 06–22 2026"
+
+    def test_same_year_different_months(self) -> None:
+        label = _build_date_range_label(
+            "2026-03-06", "2026-04-10", None, None,
+        )
+        assert "Mar 06" in label and "Apr 10" in label and "2026" in label
+
+    def test_cross_year(self) -> None:
+        label = _build_date_range_label(
+            "2025-12-20", "2026-01-05", None, None,
+        )
+        assert "2025" in label and "2026" in label
+
+    def test_falls_back_to_data_timestamps(self) -> None:
+        # 2024-06-15 00:00 UTC → 1718409600 s → 1718409600000 ms
+        ts = 1718409600000
+        label = _build_date_range_label("", "", ts, ts + 86400_000 * 3)
+        assert "Jun" in label and "2024" in label
+
+    def test_empty_when_no_info(self) -> None:
+        assert _build_date_range_label("", "", None, None) == ""
+
+
+class TestShowClock:
+    def test_show_clock_default_true(self, tmp_path: Path) -> None:
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(df, output=str(tmp_path / "t.html"))
+        html = Path(out).read_text()
+        assert "showClock: true" in html
+
+    def test_show_clock_false_emits_static_label(self, tmp_path: Path) -> None:
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(
+            df,
+            config=TimelapsConfig(
+                show_clock=False,
+                date_from="2024-06-01",
+                date_to="2024-06-30",
+            ),
+            output=str(tmp_path / "static.html"),
+        )
+        html = Path(out).read_text()
+        assert "showClock: false" in html
+        # Date range label should be embedded.
+        assert "Jun" in html
+        assert "DATE_RANGE_LABEL" in html
+
+    def test_slider_scrub_respects_show_clock(self, tmp_path: Path) -> None:
+        """Every site that writes formatTimestamp(...) into tsEl must be
+        gated on CONFIG.showClock; otherwise scrubbing the slider would
+        overwrite the static date-range caption."""
+        df = _sample_positions(60, with_ship_type=True)
+        out = generate_timelapse(df, output=str(tmp_path / "scrub.html"))
+        html = Path(out).read_text()
+
+        # Find every line that assigns formatTimestamp(...) to tsEl.
+        sites = [
+            line.strip() for line in html.split("\n")
+            if "tsEl.textContent" in line and "formatTimestamp" in line
+        ]
+        assert sites, "expected at least one formatTimestamp DOM write site"
+        # Each one must live inside an `if (CONFIG.showClock)` block —
+        # we verify by looking at the preceding ~5 lines.
+        lines = html.split("\n")
+        for i, line in enumerate(lines):
+            if "tsEl.textContent" in line and "formatTimestamp" in line:
+                window = "\n".join(lines[max(0, i - 5):i])
+                assert "CONFIG.showClock" in window, (
+                    f"unguarded formatTimestamp write at line {i + 1}: "
+                    f"{line.strip()}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Combined Kpler-style preset
+# ---------------------------------------------------------------------------
+
+
+class TestKplerStylePreset:
+    def test_phosphor_plus_direction_plus_static_range(self, tmp_path: Path) -> None:
+        df = _sample_positions(80, with_cog=True)
+        out = generate_timelapse(
+            df,
+            config=TimelapsConfig(
+                style="phosphor",
+                color_by="direction",
+                show_clock=False,
+                date_from="2024-06-15",
+                date_to="2024-06-22",
+            ),
+            output=str(tmp_path / "kpler.html"),
+        )
+        html = Path(out).read_text()
+        assert 'style: "phosphor"' in html
+        assert "showClock: false" in html
+        # Direction palette colors must appear in the embedded palette.
+        assert "63" in html and "184" in html and "255" in html  # cyan
