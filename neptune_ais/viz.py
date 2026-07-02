@@ -1813,6 +1813,294 @@ def generate_timelapse(
 
 
 # ---------------------------------------------------------------------------
+# D3 timelapse (cinematic long-exposure renderer)
+# ---------------------------------------------------------------------------
+
+
+# Cinematic palette tuned for additive Canvas blending. Hues are kept
+# near-pure (secondary channels ~0) so repeated accumulation saturates
+# TO the hue instead of clipping to white — only dense cores go white.
+# Blue+red overlap sums to purple naturally. Keys follow
+# ``_VESSEL_TYPE_ORDER``.
+D3_TIMELAPSE_PALETTE: dict[str, list[int]] = {
+    "cargo": [0, 90, 255],         # electric blue
+    "tanker": [255, 20, 70],       # crimson
+    "passenger": [130, 165, 255],  # pale blue-white
+    "fishing": [110, 145, 235],    # pale blue
+    "tug": [75, 100, 185],         # dim steel
+    "other": [80, 105, 195],       # dim steel blue
+}
+
+
+def prepare_timelapse_tracks(
+    df: pl.DataFrame | pl.LazyFrame,
+    *,
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    viewport: Viewport | None = None,
+    max_points: int | None = 150_000,
+    gap_minutes: int = 45,
+) -> dict:
+    """Prepare per-vessel tracks for the D3 long-exposure timelapse.
+
+    Unlike :func:`prepare_timelapse` (which buckets positions into time
+    bins for dot-stamping), this preserves per-vessel track continuity
+    so the renderer can interpolate positions between samples and draw
+    continuous trail segments.
+
+    Positions are deduped, sorted, uniformly decimated per vessel to
+    respect ``max_points`` (random sampling would tear tracks apart),
+    split into separate track segments at reporting gaps longer than
+    ``gap_minutes``, and quantized to uint16 over the viewport bbox and
+    time window for compact JSON embedding.
+
+    Returns:
+        A dict with keys:
+
+        - ``tracks``: list of flat lists ``[type_idx, t,x,y, t,x,y, …]``
+          with ``t, x, y`` quantized to 0–65535 over the time window and
+          bbox (west→east, south→north).
+        - ``bbox``: ``[west, south, east, north]`` quantization frame.
+        - ``t0_ms`` / ``t1_ms``: epoch-millis time window.
+        - ``n_vessels``: unique vessel count.
+        - ``palette`` / ``type_names``: cinematic colors in type-index
+          order.
+    """
+    result = _collect(df)
+    if viewport is not None:
+        result = _clip_positions(result, viewport)
+
+    palette = [D3_TIMELAPSE_PALETTE[n] for n in _VESSEL_TYPE_ORDER]
+    empty = {
+        "tracks": [],
+        "bbox": (
+            [viewport.west, viewport.south, viewport.east, viewport.north]
+            if viewport is not None else [0, 0, 0, 0]
+        ),
+        "t0_ms": 0,
+        "t1_ms": 0,
+        "n_vessels": 0,
+        "palette": palette,
+        "type_names": _VESSEL_TYPE_ORDER[:],
+    }
+    if len(result) == 0:
+        return empty
+
+    # Enrich ship_type from vessels table if available.
+    if vessels is not None:
+        if PosCol.SHIP_TYPE not in result.columns:
+            result = result.with_columns(
+                pl.lit(None, dtype=pl.String).alias(PosCol.SHIP_TYPE),
+            )
+        vessels_df = _collect(vessels)
+        if VesselCol.SHIP_TYPE in vessels_df.columns:
+            type_lookup = vessels_df.select(
+                pl.col(VesselCol.MMSI),
+                pl.col(VesselCol.SHIP_TYPE).alias("_vtype"),
+            ).unique(VesselCol.MMSI)
+            result = result.join(type_lookup, on=PosCol.MMSI, how="left")
+            result = result.with_columns(
+                pl.coalesce(PosCol.SHIP_TYPE, "_vtype").alias(PosCol.SHIP_TYPE),
+            ).drop("_vtype")
+
+    # Categorize vessel types → palette indices.
+    type_to_idx = {name: i for i, name in enumerate(_VESSEL_TYPE_ORDER)}
+    if PosCol.SHIP_TYPE in result.columns:
+        cats = result[PosCol.SHIP_TYPE].fill_null("").map_elements(
+            _categorize_vessel_type, return_dtype=pl.String,
+        )
+    else:
+        cats = pl.Series("_vcat", ["other"] * len(result))
+    result = result.with_columns(
+        cats.replace_strict(type_to_idx, default=type_to_idx["other"])
+        .cast(pl.Int64)
+        .alias("_tidx"),
+    )
+
+    result = (
+        result.drop_nulls(subset=[PosCol.MMSI, PosCol.TIMESTAMP, PosCol.LAT, PosCol.LON])
+        .unique(subset=[PosCol.MMSI, PosCol.TIMESTAMP])
+        .sort([PosCol.MMSI, PosCol.TIMESTAMP])
+    )
+    if len(result) == 0:
+        return empty
+
+    # Uniform per-vessel decimation to the point cap. Every k-th report
+    # per vessel keeps tracks intact; interpolation smooths the rest.
+    if max_points is not None and len(result) > max_points:
+        k = -(-len(result) // max_points)  # ceil division
+        result = result.filter(
+            (pl.int_range(pl.len()).over(PosCol.MMSI) % k) == 0,
+        )
+
+    # Split tracks at reporting gaps so the renderer never strokes a
+    # segment across a data hole (vessel left the bbox, AIS dropout).
+    gap_s = float(gap_minutes) * 60.0
+    dt_s = (
+        pl.col(PosCol.TIMESTAMP).diff().over(PosCol.MMSI)
+        .dt.total_seconds().fill_null(0.0)
+    )
+    result = result.with_columns((dt_s > gap_s).alias("_gap"))
+    result = result.with_columns(
+        pl.col("_gap").cum_sum().over(PosCol.MMSI).alias("_seg"),
+    )
+
+    # Quantization frame: the viewport bbox (must match the projection
+    # frame in the JS renderer) and the data time window.
+    if viewport is not None:
+        west, south, east, north = (
+            viewport.west, viewport.south, viewport.east, viewport.north,
+        )
+    else:
+        west, east = result[PosCol.LON].min(), result[PosCol.LON].max()
+        south, north = result[PosCol.LAT].min(), result[PosCol.LAT].max()
+    t0_ms = int(result[PosCol.TIMESTAMP].min().timestamp() * 1000)
+    t1_ms = int(result[PosCol.TIMESTAMP].max().timestamp() * 1000)
+    t_span = max(t1_ms - t0_ms, 1)
+
+    result = result.with_columns(
+        ((pl.col(PosCol.TIMESTAMP).dt.epoch("ms") - t0_ms) * 65535 // t_span)
+        .clip(0, 65535).alias("_qt"),
+        ((pl.col(PosCol.LON) - west) / max(east - west, 1e-9) * 65535)
+        .round(0).clip(0, 65535).cast(pl.Int64).alias("_qx"),
+        ((pl.col(PosCol.LAT) - south) / max(north - south, 1e-9) * 65535)
+        .round(0).clip(0, 65535).cast(pl.Int64).alias("_qy"),
+    )
+
+    grouped = result.group_by([PosCol.MMSI, "_seg"], maintain_order=True).agg(
+        pl.col("_tidx").first(),
+        pl.col("_qt"),
+        pl.col("_qx"),
+        pl.col("_qy"),
+        pl.len().alias("_n"),
+    )
+
+    tracks: list[list[int]] = []
+    for row in grouped.iter_rows(named=True):
+        if row["_n"] < 2:
+            continue  # a single point can't form a trail segment
+        flat: list[int] = [row["_tidx"]]
+        for t, x, y in zip(row["_qt"], row["_qx"], row["_qy"]):
+            flat.extend((t, x, y))
+        tracks.append(flat)
+
+    if not tracks:
+        return empty
+
+    return {
+        "tracks": tracks,
+        "bbox": [west, south, east, north],
+        "t0_ms": t0_ms,
+        "t1_ms": t1_ms,
+        "n_vessels": result[PosCol.MMSI].n_unique(),
+        "palette": palette,
+        "type_names": _VESSEL_TYPE_ORDER[:],
+    }
+
+
+def generate_timelapse_d3(
+    *,
+    panels: list[dict],
+    vessels: pl.DataFrame | pl.LazyFrame | None = None,
+    title: str = "Shipping corridors",
+    eyebrow: str = "VESSEL MOVEMENT — AIS TIMELAPSE",
+    watermark: str = "neptune",
+    output: str = "timelapse_d3.html",
+    max_points_per_panel: int | None = 150_000,
+    total_duration_sec: float = 15.0,
+    fps: int = 60,
+    fade_half_life_sec: float = 6.0,
+    gap_minutes: int = 45,
+    include_us_states: bool = True,
+) -> str:
+    """Generate a standalone cinematic D3 + Canvas2D timelapse HTML file.
+
+    Long-exposure corridor renderer: per-vessel tracks are interpolated
+    every frame and stroked as additive neon segments accumulating on a
+    slow-fading canvas. Layout is selected by panel count — one panel
+    produces the framed single-map look (live clock, city labels, scale
+    bar); two or more produce the stacked-panels look (big city name,
+    red sea label, static date range per panel).
+
+    Each panel is a dict with keys:
+
+    - ``label`` (str): Region display name (e.g., ``"Los Angeles"``).
+    - ``sea`` (str): Sub-label in red (e.g., ``"San Pedro Bay"``).
+    - ``bbox`` (tuple): ``(west, south, east, north)`` degrees; clips
+      positions and fits the panel's Mercator projection.
+    - ``positions`` (DataFrame): Positions for this panel.
+    - ``daterange`` (str, optional): Static date caption (panels mode).
+    - ``cities`` (list, optional): ``[{"name", "lat", "lon",
+      "anchor"?}]`` map labels; ``anchor`` is ``"left"`` (default,
+      text left of the point) or ``"right"``.
+
+    The HTML exposes ``window.__tl_set_manual(true)`` and
+    ``window.__tl_render_frame(i)`` so an external recorder can step
+    the animation clock deterministically (exactly ``1/fps`` per frame)
+    for perfectly smooth encoded video.
+
+    Returns:
+        The absolute path to the generated HTML file.
+    """
+    from neptune_ais._timelapse_d3_template import render_timelapse_d3
+
+    if not panels:
+        raise ValueError("generate_timelapse_d3 requires at least one panel.")
+
+    panels_data: list[dict] = []
+    palette: list[list[int]] | None = None
+
+    for p in panels:
+        if "bbox" not in p or "positions" not in p:
+            raise ValueError(
+                "Each panel dict must include 'bbox' and 'positions' keys."
+            )
+        west, south, east, north = p["bbox"]
+        viewport = Viewport(west=west, south=south, east=east, north=north)
+        prep = prepare_timelapse_tracks(
+            p["positions"],
+            vessels=p.get("vessels", vessels),
+            viewport=viewport,
+            max_points=max_points_per_panel,
+            gap_minutes=gap_minutes,
+        )
+        if not prep["tracks"]:
+            raise ValueError(
+                f"Panel {p.get('label', '?')!r} has no usable tracks in bbox "
+                f"{p['bbox']}. Widen the bbox or pick a busier time window."
+            )
+        if palette is None:
+            palette = prep["palette"]
+
+        panels_data.append({
+            "label": p.get("label", ""),
+            "sea": p.get("sea", ""),
+            "daterange": p.get("daterange", ""),
+            "cities": p.get("cities", []),
+            "bbox": list(p["bbox"]),
+            "tracks": prep["tracks"],
+            "t0_ms": prep["t0_ms"],
+            "t1_ms": prep["t1_ms"],
+        })
+
+    data = {
+        "title": title,
+        "eyebrow": eyebrow,
+        "watermark": watermark,
+        "panels": panels_data,
+        "palette": palette or [],
+        "fps": fps,
+        "total_duration_sec": total_duration_sec,
+        "fade_half_life_sec": fade_half_life_sec,
+        "include_us_states": include_us_states,
+    }
+
+    html = render_timelapse_d3(data)
+    out_path = Path(output).resolve()
+    out_path.write_text(html)
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
 # Port boundaries layer
 # ---------------------------------------------------------------------------
 

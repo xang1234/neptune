@@ -42,3 +42,7 @@ htmlcov/
 
 # Generated replay files
 replay.html
+
+# Generated D3 timelapse files
+ais_timelapse_d3_*.html
+ais_timelapse_d3_*.mp4

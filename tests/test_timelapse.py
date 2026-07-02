@@ -18,7 +18,9 @@ from neptune_ais.viz import (
     _VESSEL_TYPE_ORDER,
     _categorize_vessel_type,
     generate_timelapse,
+    generate_timelapse_d3,
     prepare_timelapse,
+    prepare_timelapse_tracks,
 )
 
 
@@ -434,3 +436,184 @@ class TestGenerateTimelapseMultiPanel:
         )
         html = Path(out).read_text()
         assert "grid-template-columns" in html
+
+
+# ---------------------------------------------------------------------------
+# D3 timelapse (cinematic long-exposure renderer)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareTimelapseTracks:
+    _VIEWPORT = Viewport(west=-118.35, south=33.55, east=-118.05, north=33.85)
+
+    def test_basic_structure(self) -> None:
+        df = _sample_positions(200, with_ship_type=True)
+        prep = prepare_timelapse_tracks(df, viewport=self._VIEWPORT)
+        assert prep["tracks"], "expected at least one track"
+        assert prep["t0_ms"] < prep["t1_ms"]
+        assert len(prep["palette"]) == len(_VESSEL_TYPE_ORDER)
+        for track in prep["tracks"]:
+            # Flat wire format: [type_idx, t,x,y, t,x,y, ...]
+            assert (len(track) - 1) % 3 == 0
+            assert len(track) >= 7  # type idx + at least 2 points
+            assert 0 <= track[0] < len(_VESSEL_TYPE_ORDER)
+            assert all(0 <= v <= 65535 for v in track[1:])
+            # Timestamps quantized in nondecreasing order.
+            ts = track[1::3]
+            assert ts == sorted(ts)
+
+    def test_gap_splitting(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
+        df = pl.DataFrame({
+            "mmsi": pl.Series([111] * 5, dtype=pl.Int64),
+            "timestamp": pl.Series(
+                [
+                    base,
+                    base + timedelta(minutes=10),
+                    # 3-hour gap — must split the track here.
+                    base + timedelta(hours=3, minutes=10),
+                    base + timedelta(hours=3, minutes=20),
+                    base + timedelta(hours=3, minutes=30),
+                ],
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "lat": [33.70, 33.71, 33.75, 33.76, 33.77],
+            "lon": [-118.20, -118.21, -118.25, -118.26, -118.27],
+        })
+        prep = prepare_timelapse_tracks(df, viewport=self._VIEWPORT, gap_minutes=45)
+        # One vessel, one gap → two tracks (2 points + 3 points).
+        assert len(prep["tracks"]) == 2
+        sizes = sorted((len(t) - 1) // 3 for t in prep["tracks"])
+        assert sizes == [2, 3]
+
+    def test_single_point_tracks_dropped(self) -> None:
+        from datetime import datetime, timezone
+
+        df = pl.DataFrame({
+            "mmsi": pl.Series([111], dtype=pl.Int64),
+            "timestamp": pl.Series(
+                [datetime(2024, 6, 15, tzinfo=timezone.utc)],
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "lat": [33.70],
+            "lon": [-118.20],
+        })
+        prep = prepare_timelapse_tracks(df, viewport=self._VIEWPORT)
+        assert prep["tracks"] == []
+
+    def test_decimation_respects_cap(self) -> None:
+        df = _sample_positions(500, with_ship_type=True)
+        prep = prepare_timelapse_tracks(df, viewport=self._VIEWPORT, max_points=100)
+        total_pts = sum((len(t) - 1) // 3 for t in prep["tracks"])
+        # Uniform per-vessel decimation lands at or below the cap
+        # (± one point per vessel from rounding).
+        assert total_pts <= 100 + 10
+
+    def test_null_positions_dropped(self) -> None:
+        df = _sample_positions(50, with_ship_type=True)
+        df = df.with_columns(
+            pl.when(pl.int_range(pl.len()) % 5 == 0)
+            .then(None)
+            .otherwise(pl.col("lat"))
+            .alias("lat"),
+        )
+        prep = prepare_timelapse_tracks(df, viewport=self._VIEWPORT)
+        for track in prep["tracks"]:
+            assert all(v is not None for v in track)
+
+
+class TestGenerateTimelapseD3:
+    def _panels_fixture(self, n: int = 3) -> list[dict]:
+        df = _sample_positions(200, with_ship_type=True)
+        bbox = (-118.35, 33.55, -118.05, 33.85)
+        return [
+            {"label": "Panel A", "sea": "North Sea", "bbox": bbox, "positions": df},
+            {"label": "Panel B", "sea": "South Strait", "bbox": bbox, "positions": df},
+            {"label": "Panel C", "sea": "East Bay", "bbox": bbox, "positions": df},
+        ][:n]
+
+    def test_generates_html_file(self, tmp_path: Path) -> None:
+        out = generate_timelapse_d3(
+            panels=self._panels_fixture(),
+            output=str(tmp_path / "d3.html"),
+        )
+        assert Path(out).exists()
+        # Embedded TopoJSON blobs make even minimal files >200 KB.
+        assert Path(out).stat().st_size > 200_000
+
+    def test_panels_layout_structure(self, tmp_path: Path) -> None:
+        out = generate_timelapse_d3(
+            panels=self._panels_fixture(3),
+            title="Test D3",
+            output=str(tmp_path / "d3.html"),
+        )
+        html = Path(out).read_text()
+        assert 'class="layout-panels"' in html
+        assert html.count('class="panel-cell"') == 3
+        assert html.count('class="basemap"') == 3
+        assert html.count('class="trails"') == 3
+        assert html.count('class="heads"') == 3
+        assert "d3@7" in html
+        assert "topojson-client" in html
+        assert "Test D3" in html
+        # Deterministic recorder hooks.
+        assert "__tl_ready" in html
+        assert "__tl_render_frame" in html
+        assert "__tl_set_manual" in html
+
+    def test_single_layout_structure(self, tmp_path: Path) -> None:
+        panels = self._panels_fixture(1)
+        panels[0]["cities"] = [
+            {"name": "San Pedro", "lat": 33.73, "lon": -118.29},
+        ]
+        out = generate_timelapse_d3(
+            panels=panels,
+            output=str(tmp_path / "d3_single.html"),
+        )
+        html = Path(out).read_text()
+        assert 'class="layout-single"' in html
+        assert 'id="scalebar"' in html
+        assert 'id="clock"' in html
+        assert "San Pedro" in html
+
+    def test_requires_bbox_and_positions(self, tmp_path: Path) -> None:
+        df = _sample_positions(100, with_ship_type=True)
+        with pytest.raises(ValueError, match="bbox"):
+            generate_timelapse_d3(
+                panels=[{"label": "x", "positions": df}],
+                output=str(tmp_path / "bad.html"),
+            )
+
+    def test_empty_panels_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="at least one panel"):
+            generate_timelapse_d3(panels=[], output=str(tmp_path / "e.html"))
+
+    def test_empty_bbox_raises(self, tmp_path: Path) -> None:
+        df = _sample_positions(100, with_ship_type=True)
+        with pytest.raises(ValueError, match="no usable tracks"):
+            generate_timelapse_d3(
+                panels=[{
+                    "label": "x",
+                    "bbox": (0.0, 0.0, 1.0, 1.0),  # nowhere near the data
+                    "positions": df,
+                }],
+                output=str(tmp_path / "empty.html"),
+            )
+
+    def test_xss_escape_in_embedded_json(self, tmp_path: Path) -> None:
+        panels = self._panels_fixture(1)
+        panels[0]["label"] = "</script><script>alert(1)</script>"
+        out = generate_timelapse_d3(
+            panels=panels,
+            output=str(tmp_path / "xss.html"),
+        )
+        html = Path(out).read_text()
+        script_blocks = html.split("<script")
+        for block in script_blocks[1:]:
+            head, _, body = block.partition(">")
+            if not body:
+                continue
+            inner = body.split("</script>")[0]
+            assert "</script>" not in inner
