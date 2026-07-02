@@ -29,6 +29,13 @@
   <img src="assets/dashboard.gif" alt="Neptune AIS Intelligence Dashboard — Port of Los Angeles" width="960">
 </p>
 
+<p align="center">
+  <a href="assets/timelapse_corridors.mp4"><img src="assets/timelapse_corridors.gif" alt="Cinematic AIS timelapse — US shipping corridors (New York, Los Angeles, Houston)" width="470"></a>
+  <a href="assets/timelapse_gulf.mp4"><img src="assets/timelapse_gulf.gif" alt="Cinematic AIS timelapse — Gulf of Mexico, all vessels" width="470"></a>
+  <br>
+  <em>Cinematic long-exposure AIS timelapses (D3 + Canvas 2D) — click either preview for the 60&nbsp;fps MP4</em>
+</p>
+
 ---
 
 ## What is Neptune?
@@ -61,15 +68,9 @@ result = n.sql("SELECT mmsi, count(*) as n FROM positions GROUP BY mmsi ORDER BY
 - **Interactive maps** — Visualize positions, tracks, and events with lonboard
 - **Plugin system** — Add custom source adapters via Python entry points
 - **Animated vessel replay** — Generate standalone HTML animations with deck.gl TripsLayer
-- **Timelapse corridor visualization** — Cinematic AIS timelapses that reveal shipping corridors through cumulative dot accumulation with additive blending, bloom, and vessel-type color coding
+- **Timelapse corridor visualization** — Cinematic long-exposure timelapses (D3 + Canvas 2D) that render shipping corridors as accumulating neon trails, plus the classic dot-accumulation renderer — colored by vessel type or direction
 - **World Port Index** — Built-in dictionary of 3,800+ ports with search, nearby lookup, UNLOCODE resolution, AIS destination matching, and auto-derived port polygons from vessel behavior
 - **CLI included** — `neptune download`, `neptune inventory`, `neptune sql`, `neptune ports`, and more
-
-<p align="center">
-  <img src="assets/timelapse.gif" alt="Neptune AIS timelapse — Gulf of Mexico vessel corridors" width="960">
-  <br>
-  <em>Timelapse corridor visualization — 6,778 vessels in the Gulf of Mexico, colored by type</em>
-</p>
 
 <p align="center">
   <img src="docs/replay_screenshot.png" alt="Neptune AIS vessel replay — animated deck.gl visualization" width="800">
