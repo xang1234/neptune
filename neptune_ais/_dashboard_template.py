@@ -21,18 +21,18 @@ _CSS = """\
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-  background: #0a0a1a; color: #e0e0e0; overflow: hidden;
+  background: #060708; color: #dfe7ec; overflow: hidden;
 }
 #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
 
 /* ── panels ─────────────────────────────────── */
 .panel {
   position: absolute; z-index: 10;
-  background: rgba(10, 10, 30, 0.92);
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 10px; padding: 16px;
+  background: rgba(8, 10, 14, 0.92);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px; padding: 16px;
   backdrop-filter: blur(14px);
-  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  box-shadow: 0 6px 30px rgba(0,0,0,0.6);
 }
 #left-panel {
   top: 16px; left: 16px; width: 320px;
@@ -50,35 +50,41 @@ body {
   bottom: 0; left: 0; right: 0;
   border-radius: 0; display: flex; align-items: center;
   gap: 12px; padding: 10px 20px;
+  background: rgba(6, 8, 10, 0.96);
+  border: none; border-top: 1px solid rgba(255,255,255,0.08);
 }
 
 /* ── typography ─────────────────────────────── */
-h1 { font-size: 18px; font-weight: 700; letter-spacing: 1px; margin-bottom: 4px; }
-h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
-     letter-spacing: 1px; color: rgba(255,255,255,0.5); margin-bottom: 8px; }
+h1 { font-size: 17px; font-weight: 700; letter-spacing: 2px;
+     text-transform: uppercase; margin-bottom: 4px; }
+h2 { font-size: 9px; font-weight: 600; text-transform: uppercase;
+     letter-spacing: 1.5px; color: rgba(255,255,255,0.35); margin-bottom: 8px; }
 .desc { font-size: 12px; color: rgba(255,255,255,0.55); line-height: 1.5;
         margin-bottom: 12px; font-family: -apple-system, sans-serif; }
 .big-num { font-size: 48px; font-weight: 700; line-height: 1;
-           font-variant-numeric: tabular-nums; }
-.metric { text-align: center; }
-.metric-val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.metric-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
-                color: rgba(255,255,255,0.45); margin-top: 2px; }
-.metrics-row { display: flex; gap: 16px; margin: 10px 0; }
-.cyan { color: #00c8ff; }
-.orange { color: #ff6432; }
+           color: #fff; font-variant-numeric: tabular-nums; }
+.metric { text-align: center; flex: 1;
+          border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;
+          padding: 8px 6px; background: rgba(255,255,255,0.02); }
+.metric-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.metric-label { font-size: 8px; text-transform: uppercase; letter-spacing: 1px;
+                color: rgba(255,255,255,0.4); margin-top: 3px; }
+.metrics-row { display: flex; gap: 8px; margin: 10px 0; }
+.cyan { color: #43d3ff; }
+.orange { color: #ffa03c; }
 .green { color: #32ff82; }
 .red { color: #ff6464; }
 
 /* ── buttons ────────────────────────────────── */
 .btn {
-  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18);
-  color: #ccc; padding: 5px 12px; border-radius: 5px; cursor: pointer;
-  font-size: 12px; font-family: inherit; transition: all 0.15s;
+  background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.16);
+  color: rgba(255,255,255,0.6); padding: 5px 10px; border-radius: 4px;
+  cursor: pointer; font-size: 10px; font-family: inherit;
+  text-transform: uppercase; letter-spacing: 0.8px; transition: all 0.15s;
 }
-.btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
-.btn.active { background: rgba(0,200,255,0.25); border-color: rgba(0,200,255,0.5);
-              color: #00c8ff; }
+.btn:hover { border-color: rgba(255,255,255,0.4); color: #fff; }
+.btn.active { background: rgba(67,211,255,0.10); border-color: rgba(67,211,255,0.7);
+              color: #43d3ff; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 
 /* ── chart canvas ───────────────────────────── */
@@ -89,15 +95,15 @@ h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
 /* ── mode tabs ──────────────────────────────── */
 .tabs { display: flex; gap: 0; margin: 10px 0; border-radius: 6px; overflow: hidden; }
 .tab {
-  flex: 1; padding: 6px 8px; text-align: center; font-size: 10px;
-  text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer;
-  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
-  color: rgba(255,255,255,0.5); transition: all 0.15s;
+  flex: 1; padding: 6px 8px; text-align: center; font-size: 9px;
+  text-transform: uppercase; letter-spacing: 0.8px; cursor: pointer;
+  background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.45); transition: all 0.15s;
 }
-.tab:first-child { border-radius: 6px 0 0 6px; }
-.tab:last-child { border-radius: 0 6px 6px 0; }
-.tab.active { background: rgba(0,200,255,0.2); border-color: rgba(0,200,255,0.4);
-              color: #00c8ff; }
+.tab:first-child { border-radius: 4px 0 0 4px; }
+.tab:last-child { border-radius: 0 4px 4px 0; }
+.tab.active { background: rgba(67,211,255,0.10); border-color: rgba(67,211,255,0.7);
+              color: #43d3ff; }
 
 /* ── vessel detail card ─────────────────────── */
 #vessel-card { display: none; margin-top: 12px; padding-top: 12px;
@@ -119,31 +125,39 @@ h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
   margin: 6px 0;
 }
 #search-input::placeholder { color: rgba(255,255,255,0.3); }
-#search-input:focus { border-color: rgba(0,200,255,0.5); }
+#search-input:focus { border-color: rgba(67,211,255,0.5); }
 
 /* ── timeline ───────────────────────────────── */
-#timeline-slider { flex: 1; accent-color: #00c8ff; height: 4px; }
+#timeline-slider {
+  flex: 1; -webkit-appearance: none; appearance: none; height: 3px;
+  background: rgba(255,255,255,0.15); border-radius: 2px; outline: none;
+}
+#timeline-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 12px; height: 12px;
+  border-radius: 50%; background: #43d3ff; cursor: pointer;
+  box-shadow: 0 0 10px rgba(67,211,255,0.9);
+}
+#timeline-slider::-moz-range-thumb {
+  width: 12px; height: 12px; border: none; border-radius: 50%;
+  background: #43d3ff; cursor: pointer;
+}
 #clock { font-variant-numeric: tabular-nums; font-size: 13px;
-         color: #00c8ff; font-weight: 600; min-width: 170px; text-align: right; }
-#active-count { font-size: 11px; color: rgba(255,255,255,0.4); min-width: 140px; }
-.sparkline-container { width: 100%; height: 30px; position: relative; }
+         color: #ffa03c; font-weight: 600; min-width: 170px; text-align: right; }
+#active-count { font-size: 10px; color: rgba(255,255,255,0.4); min-width: 140px;
+                text-transform: uppercase; letter-spacing: 0.5px; }
+.sparkline-container { width: 100%; height: 36px; position: relative; }
 .sparkline-container canvas { width: 100%; height: 100%; }
-
-/* ── layer toggles ──────────────────────────── */
-.layer-toggle { display: flex; align-items: center; gap: 6px; margin: 3px 0;
-                font-size: 12px; cursor: pointer; }
-.layer-toggle input { accent-color: #00c8ff; }
 
 /* ── playback badge ─────────────────────────── */
 #playback-badge {
-  display: none; font-size: 10px; text-transform: uppercase;
-  letter-spacing: 1px; color: #32ff82; margin-left: 8px;
+  display: none; font-size: 9px; text-transform: uppercase;
+  letter-spacing: 1.5px; color: #43d3ff; margin-left: 8px;
   vertical-align: middle;
 }
 #playback-badge.visible { display: inline; }
 #playback-badge::before {
-  content: ''; display: inline-block; width: 7px; height: 7px;
-  border-radius: 50%; background: #32ff82; margin-right: 5px;
+  content: ''; display: inline-block; width: 6px; height: 6px;
+  border-radius: 50%; background: #43d3ff; margin-right: 5px;
   vertical-align: middle; animation: pulse-dot 1.5s infinite;
 }
 @keyframes pulse-dot {
@@ -245,20 +259,23 @@ _LEFT_PANEL = Template("""\
 
 _TOP_CENTER = Template("""\
 <div id="top-center" class="panel gate-only">
-  <div style="font-size:12px;color:rgba(255,255,255,0.5)" id="current-date">—</div>
-  <div class="big-num cyan" id="live-count">0</div>
-  <div style="font-size:11px;color:rgba(255,255,255,0.5);margin:4px 0">Unique Vessels Crossed</div>
-  <div class="metrics-row" style="justify-content:center">
-    <div class="metric">
-      <div class="metric-val green" id="live-inbound">0</div>
-      <div class="metric-label">&uarr; Inbound</div>
+  <div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px">
+    <span style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,0.35)">Live UTC<br>Day</span>
+    <span style="font-size:13px;font-weight:700;letter-spacing:1px" id="current-date">—</span>
+  </div>
+  <div class="big-num" style="text-align:left" id="live-count">0</div>
+  <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.45);margin:4px 0;text-align:left">Unique Vessels Crossed</div>
+  <div class="metrics-row">
+    <div class="metric" style="text-align:left;padding:8px 10px">
+      <div class="metric-label" style="margin:0 0 4px"><span class="cyan">&uarr;</span> Inbound</div>
+      <div class="metric-val" id="live-inbound">0</div>
     </div>
-    <div class="metric">
-      <div class="metric-val orange" id="live-outbound">0</div>
-      <div class="metric-label">&darr; Outbound</div>
+    <div class="metric" style="text-align:left;padding:8px 10px">
+      <div class="metric-label" style="margin:0 0 4px"><span class="orange">&darr;</span> Outbound</div>
+      <div class="metric-val" id="live-outbound">0</div>
     </div>
   </div>
-  <div style="font-size:11px;color:rgba(255,255,255,0.4)" id="live-reversals">0 same-hull reversals today</div>
+  <div style="font-size:10px;letter-spacing:0.5px;text-transform:uppercase;color:rgba(255,255,255,0.4);text-align:left" id="live-reversals">0 same-hull reversals today</div>
 </div>
 """)
 
@@ -304,13 +321,13 @@ _RIGHT_PANEL = Template("""\
   <div class="btn-row" id="type-btns"></div>
 
   <h2 style="margin-top:10px">Layers</h2>
-  <div id="layer-toggles">
-    <label class="layer-toggle"><input type="checkbox" data-layer="trips" checked> Trips</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="heads" checked> Heads</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="tracks"> Tracks</label>
-    <label class="layer-toggle gate-only"><input type="checkbox" data-layer="gates" checked> Gates</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="density"> Density</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="infrastructure" checked> Infrastructure</label>
+  <div class="btn-row" id="layer-toggles">
+    <button class="btn active" data-layer="trips">Trips</button>
+    <button class="btn active" data-layer="heads">Heads</button>
+    <button class="btn" data-layer="tracks">Tracks</button>
+    <button class="btn active gate-only" data-layer="gates">Gates</button>
+    <button class="btn" data-layer="density">Density</button>
+    <button class="btn active" data-layer="infrastructure">Infrastructure</button>
   </div>
 
   <div id="vessel-card">
@@ -323,7 +340,7 @@ _RIGHT_PANEL = Template("""\
 
 _BOTTOM_BAR = Template("""\
 <div id="bottom-bar" class="panel">
-  <button class="btn" id="play-btn" title="Play / Pause (Space)">&#9654;</button>
+  <button class="btn" id="play-btn" title="Play / Pause (Space)">Play</button>
   <div class="btn-row" id="speed-btns" style="margin:0"></div>
   <span class="timeline-date" id="date-start"></span>
   <input type="range" id="timeline-slider" min="0" max="10000" value="0">
@@ -331,7 +348,7 @@ _BOTTOM_BAR = Template("""\
   <span id="clock">—</span>
   <span id="active-count"></span>
 </div>
-<div class="panel" style="bottom:50px;left:20px;right:20px;padding:4px 12px;border-radius:6px;">
+<div class="panel" style="bottom:53px;left:0;right:0;padding:4px 0;border-radius:0;border:none;border-top:1px solid rgba(255,255,255,0.06);background:rgba(6,8,10,0.96);">
   <div class="sparkline-container" style="position:relative">
     <canvas id="sparkline-canvas"></canvas>
     <canvas id="event-dots-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
@@ -366,6 +383,7 @@ const DATE_TO = '$date_to';
 _JS_STATE = Template("""\
 // ── State ──────────────────────────────────────
 const SPEEDS = [
+  {value: 1800, label: '30M/S'},
   {value: 7200, label: '2H/S'},
   {value: 21600, label: '6H/S'},
   {value: 86400, label: '1D/S'},
@@ -430,6 +448,11 @@ const INITIAL_VIEW = {
   bearing: $bearing,
 };
 
+// Uniform palette: amber long-exposure trails, ice-blue live heads.
+const TRAIL_COLOR = [255, 168, 60];
+const HEAD_COLOR = [205, 235, 255];
+const SELECTED_COLOR = [80, 220, 255];
+
 // Arrow icon: draw a small upward-pointing triangle on a canvas, use as icon.
 const ARROW_SIZE = 32;
 const _arrowCanvas = document.createElement('canvas');
@@ -489,7 +512,7 @@ function updateLayers() {
     }));
   }
 
-  // 1b. Trips layer (foreground, per-vessel colors)
+  // 1b. Trips layer (uniform amber "long-exposure" corridors; selection pops cyan)
   if (state.layers.trips) {
     layers.push(new deck.TripsLayer({
       id: 'trips',
@@ -498,9 +521,9 @@ function updateLayers() {
       getTimestamps: d => d.timestamps,
       getColor: d => {
         if (state.selectedMmsi != null) {
-          return d.mmsi === state.selectedMmsi ? d.color : [d.color[0], d.color[1], d.color[2], 60];
+          return d.mmsi === state.selectedMmsi ? SELECTED_COLOR : [...TRAIL_COLOR, 50];
         }
-        return d.color;
+        return TRAIL_COLOR;
       },
       currentTime: ct,
       trailLength: TRAIL_LENGTH,
@@ -534,7 +557,6 @@ function updateLayers() {
       const bearing = (Math.atan2(dlon, dlat) * 180 / Math.PI + 360) % 360;
       return {
         position: [lon, lat],
-        color: d.color,
         mmsi: d.mmsi,
         bearing: bearing,
       };
@@ -549,10 +571,11 @@ function updateLayers() {
       getAngle: d => 360 - d.bearing,
       getSize: 24,
       getColor: d => {
-        if (state.selectedMmsi != null && d.mmsi !== state.selectedMmsi) {
-          return [...d.color, 60];
+        if (state.selectedMmsi != null) {
+          return d.mmsi === state.selectedMmsi
+            ? [...SELECTED_COLOR, 255] : [...HEAD_COLOR, 60];
         }
-        return [...d.color, 255];
+        return [...HEAD_COLOR, 255];
       },
       sizeUnits: 'pixels',
       pickable: true,
@@ -568,9 +591,9 @@ function updateLayers() {
       getColor: d => {
         if (state.selectedMmsi != null) {
           return d.mmsi === state.selectedMmsi
-            ? [...d.color, 200] : [...d.color, 30];
+            ? [...SELECTED_COLOR, 200] : [...TRAIL_COLOR, 25];
         }
-        return [...d.color, 120];
+        return [...TRAIL_COLOR, 90];
       },
       widthMinPixels: 1,
       widthMaxPixels: 3,
@@ -618,10 +641,10 @@ function updateLayers() {
       id: 'infra',
       data: INFRA_DATA,
       getPosition: d => [d.lon, d.lat],
-      getFillColor: [255, 200, 50, 200],
-      getLineColor: [255, 255, 255, 150],
-      radiusMinPixels: 6,
-      radiusMaxPixels: 10,
+      getFillColor: [255, 200, 50, 190],
+      getLineColor: [255, 255, 255, 120],
+      radiusMinPixels: 4,
+      radiusMaxPixels: 7,
       lineWidthMinPixels: 1,
       stroked: true,
       pickable: true,
@@ -685,15 +708,15 @@ function drawChart() {
     ctx.stroke();
   }
 
-  drawLine('inbound', '#32ff82');
-  drawLine('outbound', '#ff6432');
+  drawLine('inbound', '#43d3ff');
+  drawLine('outbound', '#ffa03c');
 
   // "Now" indicator
   if (MAX_TIME > 0) {
     const frac = state.currentTime / MAX_TIME;
     const x = pad.l + frac * cw;
     ctx.beginPath();
-    ctx.strokeStyle = 'rgba(0,200,255,0.6)';
+    ctx.strokeStyle = 'rgba(67,211,255,0.6)';
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     ctx.moveTo(x, pad.t);
@@ -735,7 +758,20 @@ function drawSparkline() {
   const W = rect.width, H = rect.height;
   ctx.clearRect(0, 0, W, H);
 
-  function drawLine(data, color) {
+  // Rolling mean so the band reads as flowing curves, not a spike field
+  function smooth(data, w) {
+    const out = new Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+      let s = 0, n = 0;
+      for (let j = Math.max(0, i - w); j <= Math.min(data.length - 1, i + w); j++) {
+        s += data[j]; n++;
+      }
+      out[i] = s / n;
+    }
+    return out;
+  }
+
+  function drawLine(data, color, fill) {
     const maxVal = Math.max(1, ...data);
     ctx.beginPath();
     ctx.strokeStyle = color;
@@ -746,13 +782,20 @@ function drawSparkline() {
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
+    if (fill) {
+      ctx.lineTo(W, H);
+      ctx.lineTo(0, H);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
   }
 
   if (hasDual) {
-    drawLine(spIn, 'rgba(50,255,130,0.6)');
-    drawLine(spOut, 'rgba(255,100,50,0.6)');
+    drawLine(smooth(spIn, 4), 'rgba(67,211,255,0.8)', 'rgba(67,211,255,0.08)');
+    drawLine(smooth(spOut, 4), 'rgba(255,160,60,0.8)', 'rgba(255,160,60,0.08)');
   } else {
-    drawLine(sp, 'rgba(0,200,255,0.5)');
+    drawLine(smooth(sp, 4), 'rgba(67,211,255,0.6)', 'rgba(67,211,255,0.08)');
   }
 
   // "Now" indicator
@@ -760,7 +803,7 @@ function drawSparkline() {
     const frac = state.currentTime / MAX_TIME;
     const x = frac * W;
     ctx.beginPath();
-    ctx.strokeStyle = 'rgba(0,200,255,0.8)';
+    ctx.strokeStyle = 'rgba(67,211,255,0.8)';
     ctx.lineWidth = 1;
     ctx.moveTo(x, 0);
     ctx.lineTo(x, H);
@@ -792,13 +835,12 @@ function drawEventDots(W, H) {
     const x = frac * W;
     const total = day.inbound + day.outbound;
     const r = Math.min(5, 2 + total * 0.15);
-    // Green = more inbound, orange = more outbound, yellow = balanced
+    // Yellow = balanced flow, red = strongly one-directional
     const inRatio = total > 0 ? day.inbound / total : 0.5;
-    const gr = Math.round(130 + inRatio * 125);
-    const rd = Math.round(255 - inRatio * 155);
+    const skew = Math.abs(inRatio - 0.5) * 2;
     ctx.beginPath();
     ctx.arc(x, H / 2, r, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(' + rd + ',' + gr + ',50,0.8)';
+    ctx.fillStyle = skew > 0.5 ? 'rgba(255,80,80,0.85)' : 'rgba(255,210,60,0.85)';
     ctx.fill();
   }
 }
@@ -892,7 +934,7 @@ function animate(now) {
 document.getElementById('play-btn').onclick = () => {
   state.playing = !state.playing;
   const btn = document.getElementById('play-btn');
-  btn.innerHTML = state.playing ? '&#9646;&#9646;' : '&#9654;';
+  btn.textContent = state.playing ? 'Pause' : 'Play';
   btn.classList.toggle('active', state.playing);
   document.getElementById('playback-badge').classList.toggle('visible', state.playing);
 };
@@ -1007,10 +1049,11 @@ ANALYTICS.type_counts.forEach(tc => {
   typeRow.appendChild(b);
 });
 
-// Layer toggles
-document.querySelectorAll('#layer-toggles input').forEach(cb => {
-  cb.onchange = () => {
-    state.layers[cb.dataset.layer] = cb.checked;
+// Layer toggles (chip buttons)
+document.querySelectorAll('#layer-toggles .btn').forEach(btn => {
+  btn.onclick = () => {
+    btn.classList.toggle('active');
+    state.layers[btn.dataset.layer] = btn.classList.contains('active');
     updateLayers();
   };
 });
