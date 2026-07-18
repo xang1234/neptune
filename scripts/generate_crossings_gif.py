@@ -95,6 +95,13 @@ def categorize(ship_type: str | None) -> str:
     return "other"
 
 
+def _format_date_label(days: list[_date]) -> str:
+    """Format a single date or date range without platform-specific directives."""
+    if len(days) > 1:
+        return f"{days[0].day}–{days[-1].day} {days[-1].strftime('%b %Y')}"
+    return f"{days[0].day} {days[0].strftime('%b %Y')}"
+
+
 # ---------------------------------------------------------------------------
 # TopoJSON land decoding (world-atlas land-50m, quantized delta-encoded arcs)
 # ---------------------------------------------------------------------------
@@ -282,7 +289,7 @@ def render_gif(
     for lat in range(math.ceil(s_lat), math.floor(n_lat) + 1):
         ax.axhline(lat, color=GRID, lw=0.6, zorder=1)
 
-    # land (single even-odd path so lakes stay water-colored)
+    # land (single nonzero-winding path; preserved ring orientation keeps lakes water-colored)
     verts: list[tuple[float, float]] = []
     codes: list[int] = []
     for ring in land_rings:
@@ -612,10 +619,7 @@ def main() -> int:
         day_counts.append((d.strftime("%a").upper(), d.strftime("%d %b").upper(), cnt))
     log.info("Crossings per day: %s", [(dm, c) for _, dm, c in day_counts])
 
-    date_label = (
-        f"{days[0].strftime('%-d')}–{days[-1].strftime('%-d %b %Y')}"
-        if args.days > 1 else days[0].strftime("%-d %b %Y")
-    )
+    date_label = _format_date_label(days)
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     log.info("Rendering %d frames -> %s", n_frames, args.output)

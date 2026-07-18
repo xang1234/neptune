@@ -322,12 +322,12 @@ _RIGHT_PANEL = Template("""\
 
   <h2 style="margin-top:10px">Layers</h2>
   <div class="btn-row" id="layer-toggles">
-    <button class="btn active" data-layer="trips">Trips</button>
-    <button class="btn active" data-layer="heads">Heads</button>
-    <button class="btn" data-layer="tracks">Tracks</button>
-    <button class="btn active gate-only" data-layer="gates">Gates</button>
-    <button class="btn" data-layer="density">Density</button>
-    <button class="btn active" data-layer="infrastructure">Infrastructure</button>
+    <button class="btn active" data-layer="trips" aria-pressed="true">Trips</button>
+    <button class="btn active" data-layer="heads" aria-pressed="true">Heads</button>
+    <button class="btn" data-layer="tracks" aria-pressed="false">Tracks</button>
+    <button class="btn active gate-only" data-layer="gates" aria-pressed="true">Gates</button>
+    <button class="btn" data-layer="density" aria-pressed="false">Density</button>
+    <button class="btn active" data-layer="infrastructure" aria-pressed="true">Infrastructure</button>
   </div>
 
   <div id="vessel-card">
@@ -1053,7 +1053,9 @@ ANALYTICS.type_counts.forEach(tc => {
 document.querySelectorAll('#layer-toggles .btn').forEach(btn => {
   btn.onclick = () => {
     btn.classList.toggle('active');
-    state.layers[btn.dataset.layer] = btn.classList.contains('active');
+    const isActive = btn.classList.contains('active');
+    state.layers[btn.dataset.layer] = isActive;
+    btn.setAttribute('aria-pressed', String(isActive));
     updateLayers();
   };
 });
