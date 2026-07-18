@@ -39,6 +39,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from neptune_ais._date_label import format_date_label as _format_date_label  # noqa: E402
+
 log = logging.getLogger("crossings_gif")
 
 # ---------------------------------------------------------------------------
@@ -93,13 +95,6 @@ def categorize(ship_type: str | None) -> str:
     if code in (36, 37):
         return "pleasure"
     return "other"
-
-
-def _format_date_label(days: list[_date]) -> str:
-    """Format a single date or date range without platform-specific directives."""
-    if len(days) > 1:
-        return f"{days[0].day}–{days[-1].day} {days[-1].strftime('%b %Y')}"
-    return f"{days[0].day} {days[0].strftime('%b %Y')}"
 
 
 # ---------------------------------------------------------------------------

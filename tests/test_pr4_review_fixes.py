@@ -2,35 +2,62 @@
 
 from __future__ import annotations
 
-import importlib.util
 import re
+import subprocess
+import sys
+import textwrap
 from datetime import date
-from pathlib import Path
-from types import ModuleType
 
+from neptune_ais._date_label import format_date_label
 from neptune_ais._dashboard_template import _JS_FILTERS, _RIGHT_PANEL
 
 
-def _load_crossings_gif_script() -> ModuleType:
-    script_path = Path(__file__).parents[1] / "scripts" / "generate_crossings_gif.py"
-    spec = importlib.util.spec_from_file_location("generate_crossings_gif", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_date_label_is_portable_for_single_day() -> None:
-    module = _load_crossings_gif_script()
-
-    assert module._format_date_label([date(2024, 6, 15)]) == "15 Jun 2024"
+    assert format_date_label([date(2024, 6, 15)]) == "15 Jun 2024"
 
 
 def test_date_label_is_portable_for_multiple_days() -> None:
-    module = _load_crossings_gif_script()
-
     days = [date(2024, 6, 15), date(2024, 6, 16)]
-    assert module._format_date_label(days) == "15–16 Jun 2024"
+    assert format_date_label(days) == "15–16 Jun 2024"
+
+
+def test_date_label_includes_month_for_cross_month_range() -> None:
+    days = [date(2024, 6, 30), date(2024, 7, 1)]
+    assert format_date_label(days) == "30 Jun–1 Jul 2024"
+
+
+def test_date_label_includes_year_for_cross_year_range() -> None:
+    days = [date(2024, 12, 31), date(2025, 1, 1)]
+    assert format_date_label(days) == "31 Dec 2024–1 Jan 2025"
+
+
+def test_date_label_helper_import_does_not_require_numpy() -> None:
+    code = textwrap.dedent(
+        """
+        import sys
+        from datetime import date
+
+        class BlockNumpyImports:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "numpy" or fullname.startswith("numpy."):
+                    raise ModuleNotFoundError("numpy blocked for clean-install test")
+                return None
+
+        sys.meta_path.insert(0, BlockNumpyImports())
+
+        from neptune_ais._date_label import format_date_label
+
+        assert format_date_label([date(2024, 6, 15)]) == "15 Jun 2024"
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_layer_toggle_aria_state_matches_initial_active_state() -> None:
