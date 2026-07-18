@@ -36,6 +36,13 @@
   <em>Cinematic long-exposure AIS timelapses (D3 + Canvas 2D) — click either preview for the 60&nbsp;fps MP4</em>
 </p>
 
+<p align="center">
+  <img src="assets/crossings_florida.gif" alt="Strait-crossing timelapse — Straits of Florida vessel crossings with per-day counts" width="640">
+  <br>
+  <em>Strait-crossing timelapse — vessels colored by type, dashed rings mark gate crossings by direction.<br>
+  Generate your own for any strait: <code>python scripts/generate_crossings_gif.py --bbox W,S,E,N --gate lon1,lat1,lon2,lat2 --date 2024-06-15 --days 2</code></em>
+</p>
+
 ---
 
 ## What is Neptune?
