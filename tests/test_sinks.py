@@ -376,8 +376,8 @@ class TestPromoteLanding:
         landing = tmp_path / "landing"
         store = tmp_path / "store"
         msgs = [
-            _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
-            _sample_message(mmsi=2, ts="2024-06-15T00:01:00"),
+            _sample_message(mmsi=367000001, ts="2024-06-15T00:00:00"),
+            _sample_message(mmsi=367000002, ts="2024-06-15T00:01:00"),
         ]
         self._create_landing_files(landing, "test", {"2024-06-15": msgs})
 
@@ -401,8 +401,8 @@ class TestPromoteLanding:
         landing = tmp_path / "landing"
         store = tmp_path / "store"
         msgs = [
-            _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
-            _sample_message(mmsi=2, ts="2024-06-16T00:00:00"),
+            _sample_message(mmsi=367000001, ts="2024-06-15T00:00:00"),
+            _sample_message(mmsi=367000002, ts="2024-06-16T00:00:00"),
         ]
         self._create_landing_files(landing, "test", {"mixed": msgs})
 
@@ -415,7 +415,7 @@ class TestPromoteLanding:
     def test_promote_deduplicates(self, tmp_path):
         landing = tmp_path / "landing"
         store = tmp_path / "store"
-        msg = _sample_message(mmsi=1, ts="2024-06-15T00:00:00")
+        msg = _sample_message(mmsi=367000001, ts="2024-06-15T00:00:00")
         self._create_landing_files(landing, "test", {"2024-06-15": [msg, msg, msg]})
 
         results = promote_landing(landing, store, source="test")
@@ -434,7 +434,7 @@ class TestPromoteLanding:
         landing = tmp_path / "landing"
         store = tmp_path / "store"
         self._create_landing_files(landing, "test", {
-            "2024-06-15": [_sample_message(mmsi=1, ts="2024-06-15T00:00:00")],
+            "2024-06-15": [_sample_message(mmsi=367000001, ts="2024-06-15T00:00:00")],
         })
         assert len(list((landing / "test").glob("*.parquet"))) == 1
 
@@ -449,8 +449,8 @@ class TestPromoteLanding:
         store = tmp_path / "store"
         self._create_landing_files(landing, "test", {
             "2024-06-15": [
-                _sample_message(mmsi=1, ts="2024-06-15T00:00:00", lat=40.0, lon=-74.0),
-                _sample_message(mmsi=2, ts="2024-06-15T00:01:00", lat=41.0, lon=-73.0),
+                _sample_message(mmsi=367000001, ts="2024-06-15T00:00:00", lat=40.0, lon=-74.0),
+                _sample_message(mmsi=367000002, ts="2024-06-15T00:01:00", lat=41.0, lon=-73.0),
             ],
         })
 
@@ -473,8 +473,8 @@ class TestPromoteLanding:
         store = tmp_path / "store"
         self._create_landing_files(landing, "test", {
             "2024-06-15": [
-                _sample_message(mmsi=1, ts="2024-06-15T00:00:00"),
-                _sample_message(mmsi=2, ts="2024-06-15T00:01:00"),
+                _sample_message(mmsi=367000001, ts="2024-06-15T00:00:00"),
+                _sample_message(mmsi=367000002, ts="2024-06-15T00:01:00"),
             ],
         })
 
@@ -483,4 +483,4 @@ class TestPromoteLanding:
         canonical = store / "canonical" / "positions" / "source=test" / "date=2024-06-15"
         df = pl.read_parquet(list(canonical.glob("*.parquet"))[0])
         assert len(df) == 2
-        assert df["mmsi"].to_list() == [1, 2]  # sorted
+        assert df["mmsi"].to_list() == [367000001, 367000002]  # sorted

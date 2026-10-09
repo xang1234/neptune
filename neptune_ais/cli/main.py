@@ -49,14 +49,23 @@ def download(
         overwrite=overwrite,
     )
 
-    written = n.download()
+    result = n.download()
 
-    if written:
-        click.echo(f"Downloaded {len(written)} partition(s):")
-        for key in written:
-            click.echo(f"  {key}")
-    else:
-        click.echo("No partitions written.")
+    for p in result.partitions:
+        line = f"  {p.source}/{p.date}: {p.status.value}"
+        if p.accepted_rows or p.quarantined_rows:
+            line += (
+                f" ({p.accepted_rows:,} accepted, {p.warning_rows:,} flagged,"
+                f" {p.quarantined_rows:,} quarantined)"
+            )
+        if p.error:
+            line += f" — {p.error}"
+        click.echo(line)
+        for key in p.written:
+            click.echo(f"    {key}")
+
+    if not result.complete:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +486,10 @@ def promote(
     total = sum(r.record_count for r in results)
     click.echo(f"Promoted {total:,} rows across {len(results)} date partition(s):")
     for r in results:
-        click.echo(f"  {r.date}: {r.record_count:,} rows → {len(r.shard_files)} shard(s)")
+        click.echo(
+            f"  {r.date}: {r.record_count:,} rows → {len(r.shard_files)} shard(s),"
+            f" {r.quarantined_count:,} quarantined"
+        )
 
     if cleanup:
         click.echo("Landing files cleaned up.")

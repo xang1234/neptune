@@ -155,6 +155,28 @@ top_vessels = n.sql("""
 """)
 ```
 
+### Ingestion results and data quality
+
+`download()` returns an `IngestionResult` with one outcome per source and date,
+so partial downloads are explicit:
+
+```python
+result = n.download()
+for p in result.partitions:
+    # status: ok | no_data | unavailable | failed
+    print(p.source, p.date, p.status.value, p.accepted_rows, p.quarantined_rows, p.error)
+assert result.complete  # False if any partition was unavailable or failed
+
+n.quarantine().collect()   # rows that failed hard checks (e.g. lat=91, MMSI=123); reasons in qc_flags
+n.quality_report()         # counts reconcile: total = ok + warning + error + dropped
+```
+
+Structurally invalid positions (out-of-range lat/lon, malformed MMSI, missing
+required fields) are quarantined. Suspicious but plausible ones (speed > 50 kn,
+out-of-order timestamps, long stationary runs) are kept with
+`qc_severity="warning"` and the failed checks listed in `qc_flags`. Streaming
+promotion (`neptune promote`) applies the same checks.
+
 ### Common operations with helpers
 
 ```python

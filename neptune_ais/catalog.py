@@ -38,6 +38,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from neptune_ais.qc import CheckResult, QCOutcome, Severity
 from neptune_ais.storage import MANIFESTS_DIR, RawPolicy, canonical_partition_path
 
 logger = logging.getLogger(__name__)
@@ -72,18 +73,41 @@ class WriteStatus(str, Enum):
 class QCSummary(BaseModel):
     """Aggregate quality counters for a single partition write."""
 
-    total_rows: int = Field(description="Total rows written (before any drops).")
+    total_rows: int = Field(
+        description="Rows seen by QC: rows_ok + rows_warning + rows_error + rows_dropped.",
+    )
     rows_ok: int = Field(description="Rows with qc_severity = ok.")
     rows_warning: int = Field(description="Rows with qc_severity = warning.")
     rows_error: int = Field(description="Rows with qc_severity = error.")
     rows_dropped: int = Field(
         default=0,
-        description="Hard-invalid rows dropped before writing.",
+        description="Hard-invalid rows quarantined instead of written.",
     )
     checks_applied: list[str] = Field(
         default_factory=list,
         description="Names of QC checks that were executed.",
     )
+    check_results: list[CheckResult] = Field(
+        default_factory=list,
+        description="Per-check row counts from the QC run.",
+    )
+
+    @classmethod
+    def unchecked(cls, n_rows: int) -> QCSummary:
+        """Summary for a dataset with no QC checks: rows pass through."""
+        return cls(total_rows=n_rows, rows_ok=n_rows, rows_warning=0, rows_error=0)
+
+    @classmethod
+    def from_outcome(cls, outcome: QCOutcome) -> QCSummary:
+        return cls(
+            total_rows=outcome.total_rows,
+            rows_ok=outcome.severity_count(Severity.OK),
+            rows_warning=outcome.severity_count(Severity.WARNING),
+            rows_error=outcome.severity_count(Severity.ERROR),
+            rows_dropped=len(outcome.quarantined),
+            checks_applied=[r.check_name for r in outcome.check_results],
+            check_results=outcome.check_results,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +684,7 @@ class CatalogRegistry:
         rows_error = 0
         rows_dropped = 0
         all_checks: set[str] = set()
+        by_check: dict[str, CheckResult] = {}
 
         for m in manifests:
             qc = m.qc_summary
@@ -669,6 +694,12 @@ class CatalogRegistry:
             rows_error += qc.rows_error
             rows_dropped += qc.rows_dropped
             all_checks.update(qc.checks_applied)
+            for r in qc.check_results:
+                agg = by_check.setdefault(
+                    r.check_name, r.model_copy(update={"rows_checked": 0, "rows_flagged": 0})
+                )
+                agg.rows_checked += r.rows_checked
+                agg.rows_flagged += r.rows_flagged
 
         return QualityReport(
             dataset=dataset,
@@ -682,6 +713,7 @@ class CatalogRegistry:
             rows_error=rows_error,
             rows_dropped=rows_dropped,
             checks_applied=sorted(all_checks),
+            check_results=[by_check[k] for k in sorted(by_check)],
         )
 
     def provenance(

@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +46,7 @@ from neptune_ais.catalog import (
     WriteStatus,
     current_schema_version,
 )
+from neptune_ais.qc import BUILTIN_POSITIONS_CHECKS, Severity, run_checks
 from neptune_ais.storage import (
     DEFAULT_STORE_ROOT,
     PartitionWriter,
@@ -58,12 +61,87 @@ from neptune_ais.storage import (
     PARQUET_COMPRESSION,
     PARQUET_COMPRESSION_LEVEL,
     PARQUET_WRITE_STATISTICS,
+    quarantine_path,
+    write_quarantine,
 )
 
 logger = logging.getLogger(__name__)
 
 # Default source list when user doesn't specify.
 DEFAULT_SOURCES = ["noaa"]
+
+
+class PartitionStatus(str, Enum):
+    """Outcome of ingesting one (source, date)."""
+
+    OK = "ok"
+    """At least one dataset was written and nothing failed."""
+
+    NO_DATA = "no_data"
+    """The source was reachable but yielded no accepted observations."""
+
+    UNAVAILABLE = "unavailable"
+    """Fetching from the provider failed."""
+
+    FAILED = "failed"
+    """Fetch succeeded but normalization, QC, or writing failed. Datasets
+    listed in ``written`` before the failure remain committed."""
+
+
+@dataclass
+class PartitionOutcome:
+    """What happened when ingesting one (source, date)."""
+
+    source: str
+    date: str
+    status: PartitionStatus = PartitionStatus.NO_DATA
+    written: list[str] = field(default_factory=list)
+    accepted_rows: int = 0
+    quarantined_rows: int = 0
+    warning_rows: int = 0
+    error: str | None = None
+
+
+@dataclass
+class IngestionResult:
+    """Inspectable result of ``Neptune.download()``.
+
+    One ``PartitionOutcome`` per requested (source, date). ``complete`` is
+    false whenever any partition was unavailable or failed, so callers can
+    tell a partial download from a full one.
+    """
+
+    partitions: list[PartitionOutcome] = field(default_factory=list)
+
+    @property
+    def written(self) -> list[str]:
+        """Partition keys (dataset/source/date) committed by this run."""
+        return [k for p in self.partitions for k in p.written]
+
+    @property
+    def failures(self) -> list[PartitionOutcome]:
+        bad = (PartitionStatus.UNAVAILABLE, PartitionStatus.FAILED)
+        return [p for p in self.partitions if p.status in bad]
+
+    @property
+    def complete(self) -> bool:
+        return not self.failures
+
+    @property
+    def accepted_rows(self) -> int:
+        return sum(p.accepted_rows for p in self.partitions)
+
+    @property
+    def quarantined_rows(self) -> int:
+        return sum(p.quarantined_rows for p in self.partitions)
+
+    @property
+    def warning_rows(self) -> int:
+        return sum(p.warning_rows for p in self.partitions)
+
+
+# Identity columns that make a positions frame a usable vessels source.
+_IDENTITY_COLUMNS = {"vessel_name", "imo", "callsign", "ship_type"}
 
 
 def _parse_dates(dates) -> list[date]:
@@ -186,19 +264,23 @@ class Neptune:
 
     # --- Download / ingest pipeline ---
 
-    def download(self) -> list[str]:
+    def download(self) -> IngestionResult:
         """Download and ingest data for the configured dates and sources.
 
         Executes the full pipeline: fetch → normalize → QC → store → catalog.
+        Hard-invalid positions are quarantined (see ``quarantine()``);
+        suspicious ones are kept with ``qc_flags``.
 
-        Returns a list of partition keys that were written (dataset/source/date).
+        Returns an ``IngestionResult`` with one outcome per (source, date).
+        Failures are recorded there rather than raised, so check
+        ``result.complete`` / ``result.failures``.
         """
         from neptune_ais.adapters.base import FetchSpec
         from neptune_ais.adapters.registry import get_adapter, load_all_adapters
 
         load_all_adapters()
 
-        written: list[str] = []
+        result = IngestionResult()
 
         for source_id in self._sources:
             adapter = get_adapter(source_id)
@@ -209,9 +291,10 @@ class Neptune:
 
             for target_date in self._dates:
                 logger.info("Processing %s/%s", source_id, target_date)
+                outcome = PartitionOutcome(source_id, target_date.isoformat())
+                result.partitions.append(outcome)
 
                 try:
-                    # 1. Fetch raw artifacts.
                     raw_dir = self._store_root / raw_partition_path(
                         source_id, target_date.isoformat()
                     )
@@ -219,70 +302,93 @@ class Neptune:
                     if hasattr(adapter, '_download_dir'):
                         adapter._download_dir = raw_dir
 
-                    spec = FetchSpec(
+                    artifacts = adapter.fetch_raw(FetchSpec(
                         date=target_date,
                         bbox=self._bbox,
                         overwrite=self._overwrite,
+                    ))
+                except Exception as exc:
+                    logger.exception("Failed to fetch %s/%s", source_id, target_date)
+                    outcome.status = PartitionStatus.UNAVAILABLE
+                    outcome.error = f"{type(exc).__name__}: {exc}"
+                    continue
+
+                try:
+                    if artifacts:
+                        self._ingest(adapter, source_id, target_date, artifacts, outcome)
+                    outcome.status = (
+                        PartitionStatus.OK if outcome.written else PartitionStatus.NO_DATA
                     )
-                    artifacts = adapter.fetch_raw(spec)
-
-                    # 2. Normalize to canonical positions (if supported).
-                    positions_df = None
-                    try:
-                        positions_df = adapter.normalize_positions(artifacts)
-                    except NotImplementedError:
-                        logger.info(
-                            "%s does not provide positions, skipping",
-                            source_id,
-                        )
-
-                    if positions_df is not None:
-                        # 3. Add pipeline-generated columns.
-                        ingest_id = str(uuid.uuid4())
-                        positions_df = positions_df.with_columns(
-                            pl.lit(artifacts[0].filename).alias("source_file"),
-                            pl.lit(ingest_id).alias("ingest_id"),
-                            pl.lit("ok").alias("qc_severity"),
-                            pl.lit(f"{source_id}:direct").alias("record_provenance"),
-                        )
-
-                        written.extend(
-                            self._write_partition(
-                                "positions", source_id, target_date,
-                                positions_df, artifacts, adapter,
-                            )
-                        )
-
-                    # 2b. Normalize events (if adapter provides them).
-                    if hasattr(adapter, "normalize_events"):
-                        events_df = adapter.normalize_events(artifacts)
-                        if events_df is not None and len(events_df) > 0:
-                            written.extend(
-                                self._write_partition(
-                                    "events", source_id, target_date,
-                                    events_df, artifacts, adapter,
-                                )
-                            )
-
-                    # 2c. Normalize fishing effort (if adapter provides it).
-                    if hasattr(adapter, "normalize_fishing_effort"):
-                        effort_df = adapter.normalize_fishing_effort(artifacts)
-                        if effort_df is not None and len(effort_df) > 0:
-                            written.extend(
-                                self._write_partition(
-                                    "fishing_effort", source_id, target_date,
-                                    effort_df, artifacts, adapter,
-                                )
-                            )
-
-                except Exception:
-                    logger.exception(
-                        "Failed to process %s/%s", source_id, target_date,
-                    )
+                except Exception as exc:
+                    logger.exception("Failed to process %s/%s", source_id, target_date)
+                    outcome.status = PartitionStatus.FAILED
+                    outcome.error = f"{type(exc).__name__}: {exc}"
 
         # Re-scan catalog after writes.
         self._rescan()
-        return written
+        return result
+
+    def _ingest(
+        self,
+        adapter,
+        source_id: str,
+        target_date: date,
+        artifacts: list,
+        outcome: PartitionOutcome,
+    ) -> None:
+        """Normalize → QC → write every dataset the adapter provides."""
+        from neptune_ais.adapters.base import extract_vessels
+
+        def write(dataset: str, df: pl.DataFrame | None, qc_summary=None) -> None:
+            if df is not None and len(df) > 0:
+                outcome.written.extend(self._write_partition(
+                    dataset, source_id, target_date, df, artifacts, adapter,
+                    qc_summary=qc_summary,
+                ))
+
+        # 1. Positions: normalize, then run built-in + adapter QC checks.
+        accepted = None
+        try:
+            positions_df = adapter.normalize_positions(artifacts)
+        except NotImplementedError:
+            logger.info("%s does not provide positions, skipping", source_id)
+            positions_df = None
+
+        if positions_df is not None and len(positions_df) > 0:
+            positions_df = positions_df.with_columns(
+                pl.lit(artifacts[0].filename).alias("source_file"),
+                pl.lit(str(uuid.uuid4())).alias("ingest_id"),
+                pl.lit(f"{source_id}:direct").alias("record_provenance"),
+            )
+            extra = adapter.qc_rules() if hasattr(adapter, "qc_rules") else []
+            qc = run_checks(positions_df, [*BUILTIN_POSITIONS_CHECKS, *extra])
+            accepted = qc.accepted
+            outcome.accepted_rows = len(accepted)
+            outcome.quarantined_rows = len(qc.quarantined)
+            outcome.warning_rows = qc.severity_count(Severity.WARNING)
+            write_quarantine(
+                self._store_root, "positions", source_id,
+                target_date.isoformat(), qc.quarantined,
+            )
+            write("positions", accepted, QCSummary.from_outcome(qc))
+
+        # 2. Vessels: reuse accepted positions when they carry identity, so
+        # the archive isn't parsed twice and quarantined MMSIs are excluded.
+        caps = getattr(adapter, "capabilities", None)
+        if caps is not None and "vessels" in caps.datasets_provided:
+            if accepted is not None and _IDENTITY_COLUMNS & set(accepted.columns):
+                write("vessels", extract_vessels(accepted, source_id))
+            else:
+                try:
+                    write("vessels", adapter.normalize_vessels(artifacts))
+                except NotImplementedError:
+                    pass
+
+        # 3. Events and fishing effort (if the adapter provides them).
+        if hasattr(adapter, "normalize_events"):
+            write("events", adapter.normalize_events(artifacts))
+        if hasattr(adapter, "normalize_fishing_effort"):
+            write("fishing_effort", adapter.normalize_fishing_effort(artifacts))
 
     def _write_partition(
         self,
@@ -292,6 +398,8 @@ class Neptune:
         df: pl.DataFrame,
         artifacts: list,
         adapter,
+        *,
+        qc_summary: QCSummary | None = None,
     ) -> list[str]:
         """Write a normalized DataFrame to the canonical store.
 
@@ -428,13 +536,7 @@ class Neptune:
                 min_timestamp=min_ts,
                 max_timestamp=max_ts,
                 bbox=bbox,
-                qc_summary=QCSummary(
-                    total_rows=n_rows,
-                    rows_ok=n_rows,
-                    rows_warning=0,
-                    rows_error=0,
-                    rows_dropped=0,
-                ),
+                qc_summary=qc_summary or QCSummary.unchecked(n_rows),
                 write_status=WriteStatus.COMMITTED,
             )
 
@@ -898,6 +1000,23 @@ class Neptune:
         return self._get_registry().provenance(
             dataset, date_from=date_from, date_to=date_to,
         )
+
+    def quarantine(self, dataset: str = "positions") -> pl.LazyFrame:
+        """Rows rejected by hard-invalid QC checks in the configured scope.
+
+        ``qc_flags`` lists the checks each row failed.
+        """
+        files = [
+            path
+            for source_id in self._sources
+            for d in self._dates
+            if (path := self._store_root / quarantine_path(
+                dataset, source_id, d.isoformat()
+            )).exists()
+        ]
+        if not files:
+            return pl.LazyFrame()
+        return pl.scan_parquet(files, missing_columns="insert", extra_columns="ignore")
 
     def quality_report(self, dataset: str = "positions"):
         """Return quality report for a dataset in the configured scope."""

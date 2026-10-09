@@ -1,7 +1,13 @@
 """QC — data quality checks and confidence scoring.
 
-Layered quality model: hard-invalid rows are dropped, suspicious rows are
-flagged with qc_flags/qc_severity, and per-row confidence_score is computed.
+Layered quality model: hard-invalid rows are quarantined (removed from the
+canonical store, kept in a quarantine table with reasons), and suspicious
+rows are retained with ``qc_flags``/``qc_severity``.
+
+QC does not compute ``confidence_score``. Any score here would be a
+heuristic, and storing it in a column that reads like a probability would
+overstate its calibration. Source-provided or fusion-assigned scores pass
+through unchanged.
 
 Module role — cross-cutting infrastructure
 ------------------------------------------
@@ -9,10 +15,9 @@ QC runs after normalization (on adapter output) and can also run after
 fusion. It is invoked by ``api`` as part of the ingest pipeline.
 
 **Owns:**
-- The QC check registry and rule execution engine.
-- Built-in checks: lat/lon range, MMSI format, impossible speed, stale
-  positions, heading sentinels, duplicate detection, timestamp monotonicity.
-- Confidence score computation.
+- The QC check registry and rule execution engine (``run_checks``).
+- Built-in checks: lat/lon range, MMSI format, implausible speed, stale
+  positions, timestamp monotonicity.
 - Dataset-level quality report aggregation.
 - The ``QCRule`` protocol that adapters can implement to supply
   source-specific checks.
@@ -30,9 +35,11 @@ or ``api``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
+import polars as pl
 from pydantic import BaseModel, Field
 
 
@@ -106,18 +113,19 @@ class QCCheck(Protocol):
     """Protocol that all QC checks must satisfy.
 
     Built-in checks and adapter-supplied checks both implement this
-    interface. The QC engine discovers checks via their metadata
-    properties and uses them to:
+    interface. ``run_checks`` uses them to:
     - Build the ``qc_flags`` and ``qc_severity`` columns.
-    - Compute ``confidence_score``.
-    - Decide which rows to drop (for HARD_INVALID checks).
+    - Decide which rows to quarantine (for HARD_INVALID checks).
     - Populate ``QCSummary`` in the manifest.
 
-    Note: the ``apply()`` execution method is not part of this protocol
-    because different check types need different signatures (e.g. range
-    checks operate on a single column, while speed plausibility checks
-    need the full DataFrame sorted by MMSI+timestamp). The QC engine
-    dispatches to checks by type.
+    ``expr(df)`` returns a boolean expression that is true for rows that
+    fail the check (null counts as pass). The engine evaluates it on a
+    frame sorted by ``mmsi``, ``timestamp`` and arrival order, with
+    ``timestamp`` cast to ``Datetime(UTC)`` and an ``_qc_arrival`` column
+    holding each row's original (arrival) index, so order-dependent checks
+    can use ``shift``/``over("mmsi")``. Suspicious checks only see rows
+    that passed every hard-invalid check. SOURCE_QUIRK checks are not
+    executed: quirks are normalized by adapters.
     """
 
     @property
@@ -138,6 +146,10 @@ class QCCheck(Protocol):
     @property
     def description(self) -> str:
         """Human-readable description of what this check tests."""
+        ...
+
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        """Boolean expression, true where a row fails this check."""
         ...
 
 
@@ -173,6 +185,13 @@ class RangeCheck:
         self._description = description or (
             f"{column} must be in [{min_val}, {max_val}]"
         )
+
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        if self.column not in df.columns:
+            return pl.lit(False)
+        c = pl.col(self.column)
+        out = (c < self.min_val) | (c > self.max_val)
+        return out | c.is_nan() if df.schema[self.column].is_float() else out
 
     @property
     def name(self) -> str:
@@ -217,6 +236,12 @@ class NotNullCheck:
     def description(self) -> str:
         return f"{self.column} must not be null"
 
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        if self.column not in df.columns:
+            return pl.lit(True)
+        c = pl.col(self.column)
+        return c.is_null() | c.is_nan() if df.schema[self.column].is_float() else c.is_null()
+
 
 class MMSIFormatCheck:
     """Check that MMSI values are 9-digit positive integers.
@@ -240,12 +265,19 @@ class MMSIFormatCheck:
     def description(self) -> str:
         return "MMSI must be a 9-digit integer in [100000000, 999999999]"
 
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        if "mmsi" not in df.columns:
+            return pl.lit(False)
+        return ~pl.col("mmsi").is_between(100_000_000, 999_999_999)
+
 
 class SpeedPlausibilityCheck:
-    """Check for implausible implied speed between consecutive positions.
+    """Check for implausible speed, reported or implied.
 
-    Vessels reporting positions that imply speeds above the threshold
-    (default 50 knots) are flagged as suspicious.
+    Rows whose reported ``sog`` or whose implied speed from the previous
+    position of the same vessel exceeds the threshold (default 50 knots)
+    are flagged as suspicious. High speed is context-dependent (fast craft,
+    aircraft), so these rows are kept.
     """
 
     def __init__(self, max_knots: float = 50.0) -> None:
@@ -265,7 +297,22 @@ class SpeedPlausibilityCheck:
 
     @property
     def description(self) -> str:
-        return f"Implied speed between consecutive points must be <= {self.max_knots} knots"
+        return f"Reported and implied speed must be <= {self.max_knots} knots"
+
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        out = pl.col("sog") > self.max_knots if "sog" in df.columns else pl.lit(False)
+        if not {"mmsi", "timestamp", "lat", "lon"} <= set(df.columns):
+            return out
+        lat, lon = pl.col("lat").radians(), pl.col("lon").radians()
+        a = ((lat - lat.shift(1)) / 2).sin() ** 2 + lat.cos() * lat.shift(1).cos() * (
+            (lon - lon.shift(1)) / 2
+        ).sin() ** 2
+        nm = 2 * _EARTH_RADIUS_NM * a.sqrt().arcsin()
+        hours = pl.col("timestamp").diff().dt.total_microseconds() / 3.6e9
+        # ponytail: same-timestamp pairs are skipped (hours == 0) rather than
+        # treated as infinite speed; duplicates are fusion's concern.
+        implied = ((hours > 0) & (nm / hours > self.max_knots)).over("mmsi")
+        return out | implied.fill_null(False)
 
 
 class StalePositionCheck:
@@ -295,6 +342,12 @@ class StalePositionCheck:
     def description(self) -> str:
         return f"Flag if same lat/lon repeats > {self.max_repeats} times consecutively"
 
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        if not {"mmsi", "lat", "lon"} <= set(df.columns):
+            return pl.lit(False)
+        run_id = pl.struct("mmsi", "lat", "lon").rle_id()
+        return pl.int_range(1, pl.len() + 1).over(run_id) > self.max_repeats
+
 
 class TimestampMonotonicityCheck:
     """Check for non-monotonic timestamps within a vessel's stream.
@@ -319,6 +372,16 @@ class TimestampMonotonicityCheck:
     @property
     def description(self) -> str:
         return "Timestamps must be non-decreasing within each vessel's stream"
+
+    def expr(self, df: pl.DataFrame) -> pl.Expr:
+        # In time order, a row arrived out of order iff some later-timestamped
+        # row of the same vessel arrived before it.
+        row = pl.col("_qc_arrival")
+        later_min = row.reverse().cum_min().reverse().shift(-1)
+        return (row > later_min).over("mmsi").fill_null(False)
+
+
+_EARTH_RADIUS_NM = 3440.065
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +445,127 @@ class CheckResult(BaseModel):
         default="",
         description="Human-readable description of what this check tests.",
     )
+
+
+# ---------------------------------------------------------------------------
+# QC engine — execute checks, split accepted from quarantined rows
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QCOutcome:
+    """Result of ``run_checks`` on one batch.
+
+    ``accepted`` rows carry ``qc_flags`` (names of suspicious checks they
+    failed) and ``qc_severity``. ``quarantined`` rows failed at least one
+    hard-invalid check; their ``qc_flags`` lists those checks as reasons.
+    """
+
+    accepted: pl.DataFrame
+    quarantined: pl.DataFrame
+    check_results: list[CheckResult]
+
+    @property
+    def total_rows(self) -> int:
+        return len(self.accepted) + len(self.quarantined)
+
+    def severity_count(self, severity: Severity) -> int:
+        return int((self.accepted["qc_severity"] == severity.value).sum())
+
+
+def _flag_columns(df: pl.DataFrame, checks: list[QCCheck]) -> pl.DataFrame:
+    return df.with_columns(
+        c.expr(df).fill_null(False).alias(f"_qc__{c.name}") for c in checks
+    )
+
+
+def _annotate(df: pl.DataFrame, checks: list[QCCheck]) -> pl.DataFrame:
+    """Set ``qc_flags``/``qc_severity`` from the ``_qc__*`` flag columns.
+
+    Rows are encoded as a bitmask of failed checks; flags and severity are
+    built once per distinct mask (few in practice) and joined back, which
+    is much faster than building a list per row.
+    """
+    # ponytail: Int64 mask caps a single run at 63 checks.
+    mask = pl.sum_horizontal(
+        pl.lit(0, pl.Int64),
+        *(pl.col(f"_qc__{c.name}").cast(pl.Int64) * (1 << i) for i, c in enumerate(checks)),
+    )
+    df = df.with_columns(mask.alias("_qc_mask"))
+    masks = df["_qc_mask"].unique().to_list()
+    failed = [[c for i, c in enumerate(checks) if m >> i & 1] for m in masks]
+    lookup = pl.DataFrame(
+        {
+            "_qc_mask": masks,
+            "qc_flags": [[c.name for c in f] for f in failed],
+            "qc_severity": [
+                next(
+                    (s.value for s in (Severity.ERROR, Severity.WARNING)
+                     if any(c.severity == s for c in f)),
+                    Severity.OK.value,
+                )
+                for f in failed
+            ],
+        },
+        schema={"_qc_mask": pl.Int64, "qc_flags": pl.List(pl.String), "qc_severity": pl.String},
+    )
+    df = df.drop([c for c in ("qc_flags", "qc_severity") if c in df.columns])
+    return df.join(lookup, on="_qc_mask", how="left").sort("_qc_row")
+
+
+def _results(df: pl.DataFrame, checks: list[QCCheck]) -> list[CheckResult]:
+    return [
+        CheckResult(
+            check_name=c.name,
+            rows_checked=len(df),
+            rows_flagged=int(df[f"_qc__{c.name}"].sum()),
+            severity=c.severity,
+            description=c.description,
+        )
+        for c in checks
+    ]
+
+
+def run_checks(df: pl.DataFrame, checks: list[QCCheck] | None = None) -> QCOutcome:
+    """Execute QC checks on a positions batch.
+
+    Hard-invalid checks run first; rows failing any of them are quarantined.
+    Suspicious checks then run on the remaining rows, which are retained
+    with flags. Both outputs are sorted by ``mmsi``, ``timestamp``.
+    String timestamps are parsed to ``Datetime(UTC)`` (unparseable → null,
+    which ``timestamp_not_null`` quarantines).
+    """
+    checks = BUILTIN_POSITIONS_CHECKS if checks is None else checks
+    hard = [c for c in checks if c.qc_class == QCClass.HARD_INVALID]
+    soft = [c for c in checks if c.qc_class == QCClass.SUSPICIOUS]
+
+    df = df.with_row_index("_qc_row")
+    if df.schema.get("timestamp") == pl.String:
+        df = df.with_columns(
+            pl.col("timestamp").str.to_datetime(strict=False, time_zone="UTC")
+        )
+    # _qc_arrival: original row index (monotonicity check, sort tie-break).
+    # _qc_row: index in sorted order, which _annotate restores after its join.
+    df = (
+        df.sort([c for c in ("mmsi", "timestamp", "_qc_row") if c in df.columns])
+        .rename({"_qc_row": "_qc_arrival"})
+        .with_row_index("_qc_row")
+    )
+
+    df = _annotate(_flag_columns(df, hard), hard)
+    results = _results(df, hard)
+    invalid = pl.col("qc_flags").list.len() > 0
+    quarantined = df.filter(invalid).with_columns(
+        pl.lit(Severity.ERROR.value).alias("qc_severity")
+    )
+    accepted = _flag_columns(df.filter(~invalid), soft)
+    results += _results(accepted, soft)
+    accepted = _annotate(accepted, soft)
+
+    def clean(frame: pl.DataFrame) -> pl.DataFrame:
+        return frame.drop([c for c in frame.columns if c.startswith("_qc_")])
+
+    return QCOutcome(clean(accepted), clean(quarantined), results)
 
 
 # ---------------------------------------------------------------------------

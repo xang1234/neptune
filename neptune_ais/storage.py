@@ -73,6 +73,9 @@ CATALOG_DIR = "catalog"
 MANIFESTS_DIR = "manifests"
 """Per-partition manifest JSON files."""
 
+QUARANTINE_DIR = "quarantine"
+"""Rows rejected by hard-invalid QC checks, with reasons in ``qc_flags``."""
+
 STAGING_DIR = "_staging"
 """Temporary directory for atomic writes. Files here are in-flight and
 should never be read by queries."""
@@ -214,6 +217,26 @@ def staging_path(
         / f"{PARTITION_KEY_SOURCE}={source}"
         / f"{PARTITION_KEY_DATE}={date}"
     )
+
+
+def quarantine_path(dataset: str, source: str, date: str) -> Path:
+    """Relative path of a partition's quarantine file, e.g.
+    ``quarantine/positions/source=noaa/date=2024-06-15.parquet``."""
+    return Path(QUARANTINE_DIR) / dataset / f"source={source}" / f"date={date}.parquet"
+
+
+def write_quarantine(
+    store_root: Path, dataset: str, source: str, date: str, df
+) -> None:
+    """Replace a partition's quarantine file (removed when *df* is empty)."""
+    path = Path(store_root) / quarantine_path(dataset, source, date)
+    if len(df) == 0:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    df.write_parquet(tmp)
+    tmp.replace(path)
 
 
 def shard_filename(shard_index: int) -> str:

@@ -41,7 +41,7 @@ def _run(coro):
 
 def _msg(mmsi: int, ts: str, lat: float = 40.0, lon: float = -74.0) -> dict[str, Any]:
     return {
-        "mmsi": mmsi,
+        "mmsi": 200_000_000 + mmsi,  # valid 9-digit MMSI (QC)
         "timestamp": ts,
         "lat": lat,
         "lon": lon,

@@ -15,7 +15,8 @@ Module role — separate from stream lifecycle
 - Schema definitions — uses ``datasets``.
 
 **Import rule:** Sinks may import from ``storage`` (constants), ``datasets``
-(schema), and ``stream`` (protocol, compactor). Must not import from
+(schema), ``stream`` (protocol, compactor), and ``qc`` (promotion
+checks). Must not import from
 ``adapters``, ``derive``, ``geometry``, ``viz``, ``helpers``, or ``cli``.
 """
 
@@ -330,6 +331,7 @@ class PromotionResult:
     files_promoted: int
     shard_files: list[str]
     landing_files: list[str]
+    quarantined_count: int = 0
 
 
 def promote_landing(
@@ -344,8 +346,9 @@ def promote_landing(
 
     Reads Parquet files from the landing directory, groups them by date
     (extracted from the ``timestamp`` column), deduplicates, sorts, and
-    writes them as canonical partitions using the same atomic
-    ``PartitionWriter`` protocol used by archival ingestion.
+    runs the same QC checks as archival ingestion, and writes accepted
+    rows as canonical partitions using the same atomic ``PartitionWriter``
+    protocol. Hard-invalid rows go to the quarantine file instead.
 
     Each promoted partition gets a manifest with provenance tracing
     back to the landing files and live source.
@@ -367,11 +370,13 @@ def promote_landing(
         WriteStatus,
         current_schema_version,
     )
+    from neptune_ais.qc import run_checks
     from neptune_ais.storage import (
         DEFAULT_MAX_ROWS_PER_SHARD,
         PartitionWriter,
         PartitionWriteError,
         shard_filename,
+        write_quarantine,
     )
 
     landing_path = Path(landing_dir) / source
@@ -420,15 +425,31 @@ def promote_landing(
         dedup_cols = [c for c in DEDUP_KEY_FIELDS if c in partition_df.columns]
         if dedup_cols:
             # All copies with identical (mmsi, timestamp, lat, lon) are
-            # equivalent observations — keep any.
-            partition_df = partition_df.unique(subset=dedup_cols, keep="any")
+            # equivalent observations — keep any. maintain_order keeps
+            # arrival order deterministic for the monotonicity QC check.
+            partition_df = partition_df.unique(
+                subset=dedup_cols, keep="any", maintain_order=True
+            )
 
-        # Sort for optimal Parquet layout.
-        sort_cols = [c for c in SORT_ORDER_POSITIONS if c in partition_df.columns]
-        if sort_cols:
-            partition_df = partition_df.sort(sort_cols)
+        # QC: quarantine hard-invalid rows, flag suspicious ones. Output
+        # is sorted by mmsi, timestamp for optimal Parquet layout.
+        qc = run_checks(partition_df)
+        write_quarantine(store_path, dataset, source, date_str, qc.quarantined)
+        partition_df = qc.accepted
 
         n_rows = len(partition_df)
+        if n_rows == 0:
+            logger.warning(
+                "All %d rows for %s/%s/%s quarantined; nothing promoted",
+                len(qc.quarantined), dataset, source, date_str,
+            )
+            results.append(PromotionResult(
+                date=date_str, source=source, record_count=0,
+                files_promoted=len(parquet_files), shard_files=[],
+                landing_files=[f.name for f in parquet_files],
+                quarantined_count=len(qc.quarantined),
+            ))
+            continue
 
         # Stage → write shards → validate → commit.
         writer = PartitionWriter(store_path, dataset, source, date_str)
@@ -478,13 +499,7 @@ def promote_landing(
                 east=float(partition_df["lon"].max()),
                 north=float(partition_df["lat"].max()),
             ) if {"lat", "lon"}.issubset(partition_df.columns) else None,
-            qc_summary=QCSummary(
-                total_rows=n_rows,
-                rows_ok=n_rows,
-                rows_warning=0,
-                rows_error=0,
-                rows_dropped=0,
-            ),
+            qc_summary=QCSummary.from_outcome(qc),
             write_status=WriteStatus.COMMITTED,
         )
 
@@ -497,6 +512,7 @@ def promote_landing(
             files_promoted=len(parquet_files),
             shard_files=shard_files,
             landing_files=[f.name for f in parquet_files],
+            quarantined_count=len(qc.quarantined),
         ))
 
         logger.info(
